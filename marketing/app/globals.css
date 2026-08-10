@@ -1,5 +1,11 @@
 :root {
   --font-display: var(--font-body);
+  --surface: #090909;
+  --surface-raised: #111113;
+  --surface-soft: #18181b;
+  --foreground: #f5f6fa;
+  --foreground-muted: #8b8b91;
+  --accent: #625fff;
   --paper: #f8f8f6;
   --paper-bright: #ffffff;
   --paper-deep: #eeeeeb;
@@ -13,7 +19,7 @@
   --failure-dark: #7a1710;
   --failure-ink: #fff8f7;
   --failure-line: rgb(180 35 24 / 26%);
-  --focus: #1266d6;
+  --focus: var(--accent);
   --line-paper: #d9dadc;
   --line-strong: #a9acb1;
   --line-dark: #2a2e33;
@@ -44,8 +50,8 @@ html {
 
 body {
   margin: 0;
-  background: var(--paper);
-  color: var(--ink);
+  background: var(--surface);
+  color: var(--foreground);
   font-family: var(--font-body), Arial, sans-serif;
   text-rendering: optimizeLegibility;
 }
@@ -71,8 +77,8 @@ summary:focus-visible {
 }
 
 ::selection {
-  background: var(--ink);
-  color: var(--paper-bright);
+  background: var(--accent);
+  color: var(--foreground);
 }
 
 .site-shell {
@@ -81,7 +87,7 @@ summary:focus-visible {
 }
 
 .section {
-  padding: clamp(96px, 10vw, 160px) 0;
+  padding: clamp(76px, 8vw, 112px) 0;
 }
 
 .section-index {
@@ -111,25 +117,25 @@ summary:focus-visible {
 }
 
 .button-primary {
-  border: 1px solid var(--ink);
-  background: var(--ink);
-  color: var(--paper);
+  border: 1px solid var(--foreground);
+  background: var(--foreground);
+  color: var(--surface);
 }
 
 .button-primary:hover {
-  border-color: #343638;
-  background: #343638;
-  color: var(--paper-bright);
+  border-color: #d8d8dc;
+  background: #d8d8dc;
+  color: var(--surface);
 }
 
 .button-quiet {
-  border: 1px solid var(--line-strong);
-  color: var(--ink);
+  border: 1px solid var(--line-dark);
+  color: var(--foreground);
 }
 
 .button-quiet:hover {
-  border-color: var(--ink);
-  background: var(--paper-deep);
+  border-color: var(--line-light);
+  background: var(--surface-soft);
 }
 
 .text-link {
@@ -139,14 +145,14 @@ summary:focus-visible {
   gap: 18px;
   border-bottom: 1px solid currentColor;
   padding-bottom: 5px;
-  color: var(--ink);
+  color: var(--foreground);
   font-size: 11px;
   font-weight: 700;
   text-decoration: none;
 }
 
 .text-link-light {
-  color: var(--paper);
+  color: var(--foreground);
 }
 
 .skip-link {
@@ -155,8 +161,8 @@ summary:focus-visible {
   left: 10px;
   z-index: 1000;
   padding: 12px 16px;
-  background: var(--paper-bright);
-  color: var(--ink);
+  background: var(--foreground);
+  color: var(--surface);
   font-weight: 700;
   transform: translateY(-150%);
 }

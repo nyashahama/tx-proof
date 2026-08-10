@@ -82,7 +82,7 @@ describe("publishable site contract", () => {
     expect(provenance.fonts.every((font) => font.source && font.license && font.licenseUrl)).toBe(true);
     expect(provenance.externalImageAssets).toEqual([]);
     expect(provenance.referenceOnly.find((reference) => reference.name === "Polar")?.adoption)
-      .toMatch(/no copy/i);
+      .toMatch(/layout and interaction patterns adapted/i);
     expect(provenance.referenceOnly.map((reference) => reference.name)).toEqual([
       "Polar",
       "Linear",
@@ -90,7 +90,7 @@ describe("publishable site contract", () => {
     ]);
   });
 
-  it("locks the forensic monochrome palette and keeps failure red semantic", () => {
+  it("locks the Polar-aligned dark palette and keeps failure red semantic", () => {
     const globalsPath = path.join(process.cwd(), "app", "globals.css");
     const globals = fs.readFileSync(globalsPath, "utf8");
     const socialCardPath = path.join(
@@ -101,8 +101,10 @@ describe("publishable site contract", () => {
     );
     const socialCard = fs.readFileSync(socialCardPath, "utf8");
 
-    expect(globals).toContain("--paper: #f8f8f6");
-    expect(globals).toContain("--ink: #101112");
+    expect(globals).toContain("--surface: #090909");
+    expect(globals).toContain("--surface-raised: #111113");
+    expect(globals).toContain("--foreground: #f5f6fa");
+    expect(globals).toContain("--accent: #625fff");
     expect(globals).toContain("--failure: #b42318");
     expect(globals).not.toMatch(/#f25534|#b9d98b|#f1eee5/i);
     expect(socialCard).toContain('background: "#08090a"');
@@ -131,6 +133,16 @@ describe("publishable site contract", () => {
         expect(sourceRecords.some((source) => source.id === sourceId)).toBe(true);
       }
     }
+  });
+
+  it("registers the homepage quantified evidence claims", () => {
+    const approvedCopy = claimRecords
+      .filter((claim) => claim.status === "approved")
+      .map((claim) => claim.copy);
+
+    expect(approvedCopy).toContain("The configured product contract uses exactly five approved SQL invariants.");
+    expect(approvedCopy).toContain("The canonical modeled counterexample preserves its failure identity on three of three fresh baselines.");
+    expect(approvedCopy).toContain("The audit handoff includes JSON, Markdown, and JUnit artifacts.");
   });
 
   it.each([

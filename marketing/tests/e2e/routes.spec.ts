@@ -12,6 +12,23 @@ const routes = [
 ] as const;
 
 for (const [path, heading] of routes) {
+  test(`${path} keeps the Polar-aligned dark canvas`, async ({ page }) => {
+    await page.goto(path);
+
+    const canvas = path === "/"
+      ? page.locator("body")
+      : page.locator("#main-content > *").first();
+
+    await expect(canvas).toHaveCSS(
+      "background-color",
+      "rgb(9, 9, 9)",
+    );
+    await expect(page.getByRole("heading", { level: 1, name: heading })).toHaveCSS(
+      "color",
+      "rgb(245, 246, 250)",
+    );
+  });
+
   test(`${path} has its route contract and no serious accessibility finding`, async ({ page }) => {
     await page.goto(path);
 

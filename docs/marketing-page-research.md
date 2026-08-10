@@ -4,11 +4,11 @@ Research date: 2026-08-10
 
 ## Decision
 
-Build a distinct TxProof marketing page from three complementary reference ideas:
+Build a TxProof marketing page on Polar's UI/UX foundation:
 
-- Polar's source architecture and calm financial presentation.
-- Infisical's security seriousness and high-contrast editorial art direction.
-- Inngest's page rhythm and SigNoz's evidence-oriented product storytelling.
+- Preserve Polar's dark canvas, calm financial presentation, spacing, panel system, section rhythm, and responsive behavior.
+- Replace Polar's product content with TxProof's counterexample, safety, evidence, and audit story.
+- Retain TxProof's semantic failure red only where it communicates an invariant violation.
 
 Polar is the local source reference because its current landing page is present in the public repository under Apache-2.0. The other strongest live pages remain visual references only where their equivalent marketing source is not publicly available.
 
@@ -20,7 +20,7 @@ Reference checkout:
 - Sparse paths: `clients/apps/web`, `clients/packages`
 - License: Apache-2.0
 
-The license permits studying and adapting code under its terms. It does not grant rights to Polar's name, marks, customer logos, testimonials, photography, copy, or product screenshots. None of those assets should enter TxProof.
+The license permits adapting the implementation under its terms. It does not grant rights to Polar's name, marks, customer logos, testimonials, photography, copy, or product screenshots. None of those assets should enter TxProof.
 
 ## Evidence matrix
 
@@ -58,7 +58,7 @@ The transferable patterns are:
 
 ## TxProof visual thesis
 
-TxProof should feel like a forensic financial instrument: precise, calm, adversarial, and trustworthy. It should not resemble a generic AI platform, cyberpunk security page, or gradient-heavy SaaS template.
+TxProof should feel like Polar's calm, dark financial product experience applied to an adversarial correctness tool: precise, spacious, restrained, and trustworthy. It should not resemble a generic AI platform, cyberpunk security page, or gradient-heavy SaaS template.
 
 The signature visual is the four-truth schedule:
 
@@ -77,7 +77,7 @@ This is the spectacle. It is also the product explanation.
 
 ### Material and tone
 
-- Near-black ink and warm off-white surfaces, like a high-end technical report.
+- One continuous near-black canvas, light type, muted gray copy, and slightly raised charcoal panels.
 - One contradiction accent in vermilion or signal orange.
 - One restrained proof/recovery accent used only when an invariant holds again.
 - Large editorial grotesk typography paired with a highly legible mono for traces and SQL evidence.
@@ -106,7 +106,7 @@ Working headline: `Find the schedule that makes your database lie about money.`
 
 Support the claim with Stripe, PostgreSQL, webhook, retry, and crash language. Use two actions: `View a failing trace` and `Book a correctness audit`.
 
-The four-truth schedule must appear above the fold on desktop and immediately after the copy on mobile.
+The hero should stay concise. It resolves into three product-specific capability visuals—causal modeling, SQL interrogation, and validity-aware shrinking—before the full interactive trace. On mobile, the product story must precede the dense trace rather than forcing the workbench into the opening viewport.
 
 ### 3. The four truths
 
@@ -159,7 +159,7 @@ The current commercial action is a fixed-scope Money Correctness Audit, not a fi
 
 - Original TxProof identity; no copied brand assets or copy.
 - Visually coherent at 1440 px, 1024 px, 768 px, and 390 px widths.
-- A real counterexample artifact is visible in the first viewport or its immediate continuation.
+- A real counterexample artifact is reached through the first product sequence: hero, three capability visuals, inspectable evidence strip, then the full interactive trace.
 - No false social proof or unsupported security claim.
 - No serious or critical automated accessibility findings.
 - Complete keyboard navigation and visible focus treatment.

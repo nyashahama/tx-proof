@@ -531,6 +531,28 @@
   white-space: nowrap;
 }
 
+/* The product proof sits inside the same raised dark material as Polar's demos. */
+.instrument {
+  border-color: var(--line-dark);
+  border-radius: 0;
+  background-color: var(--surface-raised);
+  box-shadow: none;
+}
+
+.instrument::before {
+  opacity: 0.24;
+}
+
+.tab[aria-selected="true"] {
+  background: var(--foreground);
+  color: var(--surface);
+}
+
+.minimizeButton {
+  background: var(--foreground);
+  color: var(--surface);
+}
+
 @media (max-width: 900px) {
   .scenarioRail {
     grid-template-columns: 1fr;

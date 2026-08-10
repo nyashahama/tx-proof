@@ -1,6 +1,8 @@
 import Link from "next/link";
 
 import { TraceInstrument } from "@/components/hero/trace-instrument";
+import { CapabilityCards } from "@/components/landing/capability-cards";
+import { VisionStatement } from "@/components/landing/vision-statement";
 
 import styles from "./page.module.css";
 
@@ -79,41 +81,69 @@ export default function Home() {
               Counterexample search, not proof.
             </p>
           </div>
-          <div className={styles.instrumentWrap} id="failing-trace">
+        </div>
+      </section>
+
+      <CapabilityCards />
+
+      <aside className={styles.evidenceRail} aria-label="Product evidence">
+        <div className="site-shell">
+          <Link className={`${styles.evidenceItem} ${styles.evidenceLink}`} href="/safety">
+            <span>Execution</span>
+            <strong>Local only</strong>
+          </Link>
+          <Link className={`${styles.evidenceItem} ${styles.evidenceLink}`} href="/product">
+            <span>Initial wedge</span>
+            <strong>Stripe + PostgreSQL</strong>
+          </Link>
+          <Link className={`${styles.evidenceItem} ${styles.evidenceLink}`} href="/method">
+            <span>Business oracle</span>
+            <strong>5 approved SQL invariants</strong>
+          </Link>
+          <Link
+            className={`${styles.evidenceItem} ${styles.evidenceLink}`}
+            href="/counterexamples/commit-then-close"
+          >
+            <span>Replay class</span>
+            <strong>Modeled fixture · 3 / 3</strong>
+          </Link>
+          <Link className={`${styles.evidenceItem} ${styles.evidenceLink}`} href="/audit">
+            <span>Handoff</span>
+            <strong>JSON · Markdown · JUnit</strong>
+          </Link>
+        </div>
+      </aside>
+
+      <section className={`${styles.traceShowcase} section`} id="failing-trace">
+        <div className="site-shell">
+          <header className={styles.traceShowcaseHeader}>
+            <div className={styles.traceLabelBlock}>
+              <p className="section-index">02 / LIVE COUNTEREXAMPLE</p>
+              <span><i aria-hidden="true" /> INTERACTIVE MODELED EVIDENCE</span>
+            </div>
+            <div className={styles.traceStory}>
+              <h2>From one intent to an owned counterexample.</h2>
+              <p>
+                Change the injected boundary, watch durable truth diverge, then remove every
+                action that is not required to reproduce the same invariant failure.
+              </p>
+              <dl>
+                <div><dt>Input</dt><dd>State-valid schedule</dd></div>
+                <div><dt>Oracle</dt><dd>Approved SQL invariant</dd></div>
+                <div><dt>Output</dt><dd>Replayable five-action trace</dd></div>
+              </dl>
+            </div>
+          </header>
+          <div className={styles.instrumentWrap}>
             <TraceInstrument />
           </div>
         </div>
       </section>
 
-      <aside className={styles.evidenceRail} aria-label="Product evidence">
-        <div className="site-shell">
-          <div className={styles.evidenceItem}>
-            <span>Execution</span>
-            <strong>Local only</strong>
-          </div>
-          <Link className={`${styles.evidenceItem} ${styles.evidenceLink}`} href="/product">
-            <span>Initial wedge</span>
-            <strong>Stripe + PostgreSQL</strong>
-          </Link>
-          <div className={styles.evidenceItem}>
-            <span>Business oracle</span>
-            <strong>5 approved SQL invariants</strong>
-          </div>
-          <div className={styles.evidenceItem}>
-            <span>Replay class</span>
-            <strong>Fresh-baseline 3 / 3</strong>
-          </div>
-          <div className={styles.evidenceItem}>
-            <span>Handoff</span>
-            <strong>JSON · Markdown · JUnit</strong>
-          </div>
-        </div>
-      </aside>
-
       <section className={`${styles.truthSection} section`} id="product">
         <div className="site-shell">
           <header className={styles.sectionHeader}>
-            <p className="section-index">01 / THE CONTRADICTION</p>
+            <p className="section-index">03 / THE CONTRADICTION</p>
             <div>
               <h2>Four systems can be individually right. Together, they can still be wrong.</h2>
               <p>
@@ -157,62 +187,11 @@ export default function Home() {
         </div>
       </section>
 
-      <section className={`${styles.methodSection} section`} id="method">
-        <div className="site-shell">
-          <header className={`${styles.sectionHeader} ${styles.sectionHeaderLight}`}>
-            <p className="section-index section-index-light">02 / THE METHOD</p>
-            <div>
-              <h2>Declare the truth. Search the boundary. Keep the regression.</h2>
-              <p>
-                Not another suite of authored happy paths. TxProof compiles state-valid schedules,
-                asks your disposable database a business question, and preserves the smallest
-                counterexample that survives replay.
-              </p>
-            </div>
-          </header>
-
-          <div className={styles.methodRail}>
-            <article>
-              <div className={styles.methodNumber}>01</div>
-              <div className={styles.methodGlyph} aria-hidden="true">
-                <span>SELECT</span><span>0 rows</span>
-              </div>
-              <h3>Declare</h3>
-              <p>Approve exactly five SQL invariants. Zero rows means the property holds; diagnostic rows are the witness.</p>
-              <code>expect = &quot;zero_rows&quot;</code>
-            </article>
-            <article>
-              <div className={styles.methodNumber}>02</div>
-              <div className={`${styles.methodGlyph} ${styles.scheduleGlyph}`} aria-hidden="true">
-                <span /><span /><span /><span /><span />
-              </div>
-              <h3>Search</h3>
-              <p>Sample eligible provider outcomes, retries, deliveries, and one process kill from a seeded causal model.</p>
-              <code>seed = 424242</code>
-            </article>
-            <article>
-              <div className={styles.methodNumber}>03</div>
-              <div className={`${styles.methodGlyph} ${styles.shrinkGlyph}`} aria-hidden="true">
-                <span>14</span><i>→</i><span>5</span>
-              </div>
-              <h3>Shrink</h3>
-              <p>Delete noise only when the same invariant fails at the same checkpoint on fresh baselines.</p>
-              <code>identity preserved</code>
-            </article>
-          </div>
-
-          <div className={styles.methodFooter}>
-            <span>Compiled trace—not the seed—is replay authority.</span>
-            <Link href="/method">Read the execution semantics <span aria-hidden="true">→</span></Link>
-          </div>
-        </div>
-      </section>
-
       <section className={`${styles.faultSection} section`}>
         <div className="site-shell">
           <header className={styles.compactHeader}>
             <div>
-              <p className="section-index">03 / CONTROLLED FAULT MODEL</p>
+              <p className="section-index">04 / CONTROLLED FAULT MODEL</p>
               <h2>Five boundaries. One causal schedule.</h2>
             </div>
             <p>
@@ -241,7 +220,7 @@ export default function Home() {
       <section className={`${styles.artifactSection} section`}>
         <div className="site-shell">
           <header className={`${styles.sectionHeader} ${styles.sectionHeaderLight}`}>
-            <p className="section-index section-index-light">04 / OWNED EVIDENCE</p>
+            <p className="section-index section-index-light">05 / OWNED EVIDENCE</p>
             <div>
               <h2>One failure. Every artifact your team needs.</h2>
               <p>
@@ -293,7 +272,7 @@ export default function Home() {
       <section className={`${styles.safetySection} section`} id="safety">
         <div className="site-shell">
           <header className={styles.sectionHeader}>
-            <p className="section-index">05 / SAFETY BOUNDARY</p>
+            <p className="section-index">06 / SAFETY BOUNDARY</p>
             <div>
               <h2>Destructive by design. Safe by refusal.</h2>
               <p>
@@ -339,10 +318,12 @@ export default function Home() {
         </div>
       </section>
 
+      <VisionStatement />
+
       <section className={`${styles.boundarySection} section`}>
         <div className="site-shell">
           <div className={styles.boundaryLead}>
-            <p className="section-index section-index-light">06 / THE HONEST BOUNDARY</p>
+            <p className="section-index section-index-light">08 / THE HONEST BOUNDARY</p>
             <h2>Know exactly what this is—and what it isn’t.</h2>
             <p>
               Specificity is the trust signal. TxProof is a bounded counterexample search engine for
@@ -365,7 +346,7 @@ export default function Home() {
         <div className="site-shell">
           <div className={styles.auditFrame}>
             <div className={styles.auditCopy}>
-              <p className="section-index">07 / MONEY CORRECTNESS AUDIT</p>
+              <p className="section-index">09 / MONEY CORRECTNESS AUDIT</p>
               <h2>Bring one money flow. Leave with an owned regression.</h2>
               <p>
                 A fixed-scope, local-only engagement for Stripe + PostgreSQL teams. Together we
