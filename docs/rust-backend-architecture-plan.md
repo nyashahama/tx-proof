@@ -1,0 +1,818 @@
+# TxProof Rust backend architecture plan
+
+Status: proposed for review
+
+Date: 2026-08-10
+
+Scope: bounded v0 defined by the execution blueprint
+
+Decision rule: build the truth spike first; fund the six-week implementation only after the commercial and technical gates pass
+
+## Executive decision
+
+TxProof should be built in Rust, but it should not be designed as a conventional web backend.
+
+The product is a local verification control plane with one short-lived CLI, one ephemeral Stripe-compatible fixture service, a disposable PostgreSQL database, and a durable evidence bundle. It starts only for a run, controls Docker Compose and the fixture, searches valid external schedules, checks five repository-owned invariants, writes the evidence, and exits.
+
+Rust is the right choice because the difficult parts are exact state transitions, byte-preserving webhook behavior, bounded process control, explicit error classification, low-level HTTP connection outcomes, and safe handling of destructive database operations. Rust does not make the customer application deterministic and must never be marketed as doing so.
+
+The first implementation should use four physical crates, not the eight crates proposed in the original blueprint. The eight responsibilities remain architectural modules. A physical split is made only when it enforces a valuable dependency boundary, creates an independently shipped process, or has more than one real consumer.
+
+## Product boundary
+
+### What v0 is
+
+- A local CLI for one Docker Compose application.
+- A counterexample search engine for one Stripe PaymentIntent checkout and fulfilment flow.
+- A stateful, fault-oriented Stripe-compatible test fixture.
+- A PostgreSQL-only snapshot oracle with exactly five approved SQL invariants.
+- A seeded compiler of state-valid schedules.
+- A fresh-baseline replay and same-failure shrinker.
+- A producer of redacted JSON, Markdown, JUnit, logs, checksums, and replay instructions.
+
+### What v0 is not
+
+- A hosted service, daemon, dashboard, or multi-tenant platform.
+- A proof system or exhaustive model checker.
+- A full Stripe emulator or Stripe-certified implementation.
+- A generic provider/plugin framework.
+- A production chaos agent or observability product.
+- A controller for arbitrary customer threads, PostgreSQL scheduling, kernel timing, wall clocks, or entropy.
+- A multi-database, Kubernetes, queue, subscription, refund, or payout verifier.
+
+## Architectural principles
+
+1. Safety precedes mutation. A destructive method cannot be called without a process-local capability produced by a fresh identity check.
+2. Decisions precede effects. Every chosen action is persisted before the runtime releases the corresponding external effect.
+3. Pure planning is separate from impure execution. The scheduler owns no sockets, processes, database connections, wall clock, or filesystem.
+4. The trace is authority. A seed is useful for generating the original case; a versioned compiled trace is what replay executes.
+5. Observations do not drive random choices. Async arrival order never consumes random numbers.
+6. One actor owns each mutable model. The fixture, scheduler, and journal each have one writer.
+7. Passing is bounded. A pass always names the adapter, model, seed/cases, budgets, exclusions, and compatibility fingerprint.
+8. Inconclusive is a first-class result. Reset failures, quiescence timeouts, environment drift, and 1/3 reproduction are not money violations.
+9. Artifacts are allowlisted projections. Generic object dumping and regex-only secret redaction are prohibited.
+10. v0 is deliberately serial. `parallelism` accepts only `1` until isolation and performance evidence justify more.
+
+## System shape
+
+```mermaid
+flowchart LR
+    U[Engineer / CI] --> CLI[tiv CLI]
+    CLI --> ENG[Pure schedule and shrink engine]
+    CLI --> RT[Effect runtime]
+    RT --> CMP[Docker Compose CLI]
+    CMP --> APP[Customer app and workers]
+    CMP --> PG[(Disposable PostgreSQL)]
+    CMP --> FX[Ephemeral Stripe PI fixture]
+    APP -->|Stripe API v1| FX
+    FX -->|signed raw webhook bytes| APP
+    RT -->|checkout request and observable cut points| APP
+    RT -->|versioned local control protocol| FX
+    RT -->|identity, reset, quiescence, snapshot| PG
+    PG --> ORA[Five SQL invariants]
+    FX --> ORA
+    RT --> ART[Redacted evidence bundle]
+    ENG --> ART
+    ORA --> ART
+```
+
+There are two planes:
+
+- The control plane is the host `tiv` process. It owns configuration, safety, scheduling, Compose, database lifecycle, classification, shrinking, cleanup, and artifact finalization.
+- The data plane is the customer stack plus the fixture. The fixture exposes a PaymentIntent API to the application and delivers signed webhook attempts to it. A separate control listener accepts only local, run-scoped commands from the CLI.
+
+The proposed topology runs the fixture as a Compose service rather than a host-only server so Linux, macOS, and CI can share the application-to-fixture network path. The truth spike must validate that choice before it becomes a compatibility requirement. Development may use a locally built fixture image; signed host packages and a pinned OCI image remain Phase 5 distribution work. Once distributed, the manifest binds both versions and digests.
+
+## Workspace and dependency direction
+
+```text
+tx-proof/
+  Cargo.toml
+  Cargo.lock
+  rust-toolchain.toml
+  crates/
+    tiv-core/             # pure domain, compiler, validation and shrink transforms
+    tiv-stripe-pi/        # PaymentIntent model, fixture server and control protocol
+    tiv-runtime/          # Compose, PostgreSQL, HTTP driver, execution and artifacts
+    tiv-cli/              # `tiv` binary, command dispatch, output and exit codes
+  schemas/                # checked-in versioned config and trace schemas
+  tests/
+    reference-app/        # synthetic Compose SUT with switchable known bugs
+    contracts/            # Stripe-shaped HTTP and webhook fixtures
+    golden/               # stable config, trace, report and JUnit outputs
+  docs/
+    adr/                   # decisions that materially change safety or compatibility
+```
+
+Dependency direction:
+
+```mermaid
+flowchart BT
+    CORE[tiv-core]
+    STRIPE[tiv-stripe-pi] --> CORE
+    RUNTIME[tiv-runtime] --> CORE
+    RUNTIME --> STRIPE
+    CLI[tiv-cli] --> CORE
+    CLI --> RUNTIME
+```
+
+### Physical crates
+
+| Crate | Owns | Must not own |
+|---|---|---|
+| `tiv-core` | IDs, money types, plan/trace/result schemas, PaymentIntent action vocabulary, seeded compiler, trace validation, failure identity, shrink transforms | Tokio, HTTP, SQL, Compose, filesystem, environment, wall clock |
+| `tiv-stripe-pi` | Single-writer provider model, idempotency cache, immutable events, raw webhook body/signature generation, provider/control HTTP protocols, fixture executable target | Compose, customer schema, campaign policy, final verdict |
+| `tiv-runtime` | Config loading/resolution, safety preflight, command runner, Compose lifecycle, app driver, fixture client, PostgreSQL reset/oracle, execution state machine, observation journal, artifacts | Random schedule selection, provider business truth, CLI presentation |
+| `tiv-cli` | Commands, progress and human output, signal entry point, exact exit-code mapping | Business logic, raw SQL mutation, fixture state |
+
+The original `tiv-config`, `tiv-compose`, `tiv-postgres`, `tiv-http`, and `tiv-artifact` boundaries begin as modules inside `tiv-runtime`. They become crates only when one of these triggers is proven:
+
+- independent release or reuse;
+- dependency weight materially hurts unrelated builds;
+- an enforceable security boundary is otherwise being violated;
+- two teams need independent ownership;
+- a second real consumer exists.
+
+There is no plugin ABI in v0. Internal traits exist only where a pure engine test needs a fake effect boundary. Concrete adapters are preferred elsewhere.
+
+## Core type model
+
+Primitive strings must not cross important boundaries. Newtypes make invalid combinations difficult:
+
+```text
+RunId, CaseId, ActionId, CheckpointId, InvariantId
+Seed, LogicalSequence, FixtureSequence, ObservationSequence
+AmountMinor(i64), Currency(ISO-like validated code)
+EventId, PaymentIntentId, IdempotencyKey
+ConfigFingerprint, CompatibilityFingerprint, TraceHash, WitnessDigest
+ComposeProjectId, DatabaseName, DatabaseOid, DatabaseMarker
+```
+
+Money is always integer minor units plus an explicit currency partition. Floating point and PostgreSQL `money` are rejected from the invariant contract.
+
+### Planning and replay types
+
+```text
+CampaignSpec
+  -> PlannedCase            seed-derived symbolic, state-valid action plan
+  -> CompiledTrace          all external values needed for replay are bound
+  -> ObservedTrace          compiled actions plus append-only observations
+  -> CaseResult             held, violated, or inconclusive
+  -> ReproductionResult     stable 3/3, reproducible 2/3, inconclusive 1/3
+  -> ShrinkResult            original retained, optional minimized trace
+```
+
+`PlannedCase` and `CompiledTrace` are different types. A planned action may refer to “the PaymentIntent produced by action 3”; the compiled trace contains the concrete ID captured when action 3 executed. A trace cannot be marked replayable while an unresolved reference remains.
+
+Every compiled action contains:
+
+- stable action ID and logical sequence;
+- explicit dependencies;
+- action kind and validated parameters;
+- named observable release boundary;
+- fault outcome, delay, or delivery multiplicity;
+- bound dynamic values once known;
+- compatibility-relevant adapter version;
+- canonical content hash.
+
+Replay validates the dependency graph and all bound values, then executes it directly. It does not rerun the RNG.
+
+### Result types
+
+```text
+CaseVerdict = Held | Violated(Violation) | Inconclusive(InconclusiveReason)
+
+FailureIdentity = InvariantId + CheckpointId
+Violation = FailureIdentity + WitnessDigest + bounded evidence
+
+RunErrorClass = Configuration | Safety | Infrastructure | Interrupted
+```
+
+The normalized witness digest is evidence, not the default shrink identity. v0 accepts a shrink candidate only when the same invariant fails at the same named checkpoint in at least two of three fresh-baseline attempts.
+
+## Determinism boundary
+
+The scheduler is a pure state transition:
+
+```text
+(model state, ordered eligible actions, deterministic decision stream)
+  -> (chosen action, next model state, decision record)
+```
+
+Rules:
+
+- `ChaCha20Rng` is the only campaign decision generator.
+- The exact crate/algorithm version and decision count are stored in the trace header.
+- Eligible actions are sorted by a stable semantic key before an index is sampled.
+- One scheduler task owns the RNG.
+- Network, process, database, and journal tasks never receive the RNG.
+- Wall-clock timestamps, task completion order, log arrival, generated OS randomness, and retry timing never affect eligibility or consume decisions.
+- Deterministic fixture object IDs derive from `(adapter version, seed, logical sequence, object kind)` through a domain-separated hash.
+- Random database safety markers and run-control tokens come from the OS and are deliberately not deterministic.
+- Logical model time, monotonic elapsed time, and wall-clock signature time are distinct types.
+
+The fixture regenerates a webhook attempt timestamp and signature on replay while preserving event ID and exact raw JSON body. This is required because stale signatures are normally rejected.
+
+## Runtime execution state machine
+
+```mermaid
+stateDiagram-v2
+    [*] --> Configured
+    Configured --> SafetyVerified: doctor checks
+    SafetyVerified --> BaselineReady: migrate, seed, seal
+    BaselineReady --> CaseReset: exact identity recheck and clone/restore
+    CaseReset --> StackHealthy: start configured clients
+    StackHealthy --> Driving: persist and release actions
+    Driving --> Quiescing: external releases frozen
+    Quiescing --> Snapshotted: stable predicate and one DB snapshot
+    Snapshotted --> Checked: exactly five invariants
+    Checked --> Classified
+    Classified --> Persisted: finalize case evidence
+    Persisted --> CaseReset: next case/replay/shrink candidate
+    Persisted --> Cleaned: campaign complete
+    Cleaned --> [*]
+```
+
+No transition is implicit. Each transition has a timeout, typed observation, error class, and recovery text. A journal record for an action intent is flushed before the effect is issued; an outcome record follows it.
+
+## Component contracts
+
+### Configuration
+
+Configuration has three representations:
+
+1. `RawConfig` is deserialized from versioned TOML with unknown fields denied.
+2. `ResolvedConfig` contains canonical paths, probed capabilities, normalized URLs, validated budgets, and secrets resolved from environment-variable names.
+3. `RedactedConfig` is an allowlisted serializable projection.
+
+`ResolvedConfig` and secret wrappers do not implement `Serialize` or revealing `Debug`. Commands never persist the process environment. Semantic validation runs after deserialization and rejects:
+
+- schema versions the binary cannot migrate;
+- anything other than five unique invariants;
+- non-local or public targets;
+- live/restricted-live Stripe key prefixes;
+- production Stripe hosts;
+- missing or ambiguous Compose services;
+- database names outside an internally generated lowercase ASCII contract;
+- unsafe sizes, timeouts, body limits, or action budgets;
+- unsupported Stripe adapter/API versions;
+- `parallelism != 1` in v0.
+
+`schemars` generates a pinned JSON Schema during development. The checked-in schema is diffed in CI; runtime correctness still comes from Rust deserialization and semantic validation.
+
+### Safety and mutation capabilities
+
+The PostgreSQL API uses type state:
+
+```text
+DatabaseTarget<Unverified>
+  --fresh preflight--> DatabaseTarget<Verified> + single-use MutationPermit
+```
+
+`MutationPermit` is private, process-local, non-cloneable, non-serializable, short-lived, and consumed by the destructive call. `doctor` may persist evidence, but a later `baseline`, `run`, `replay`, `shrink`, or `cleanup` never trusts an earlier attestation. It rechecks immediately before mutation.
+
+The identity tuple is:
+
+```text
+server fingerprint
++ server address/port
++ exact database OID and generated name
++ owner OID
++ marker UUID and marker kind
++ Compose project ID
++ expected application role
+```
+
+The truth spike must determine the strongest portable server fingerprint available to the supported PostgreSQL roles. The preferred candidate is the cluster system identifier; a weaker fallback may not be silently substituted.
+
+Additional controls:
+
+- connect from an admin connection to a separate maintenance database, never through the target database;
+- terminate sessions only where `datid` equals the freshly verified target OID;
+- accept only generated identifiers matching the narrow database-name grammar before quoting;
+- verify database size before baseline/reset;
+- bind the acknowledgement text to the exact identity tuple;
+- never mount the Docker socket inside the fixture or customer service;
+- use argv arrays for every command; shell evaluation is prohibited;
+- clear inherited command environments and pass only an explicit allowlist required by Docker/PostgreSQL plus scoped secrets;
+- serialize campaigns per Compose project with a host lock;
+- attempt cleanup after interruption, then print exact manual recovery commands scoped to the run ID.
+
+### Schedule compiler
+
+The compiler contains the minimal PaymentIntent state machine and enumerates only currently eligible actions. It samples from that ordered set; it never generates invalid actions and rejects invalid externally supplied traces.
+
+The action vocabulary is intentionally closed in v0:
+
+- drive checkout;
+- create, confirm, or retrieve PaymentIntent through the fixture;
+- return normal, pre-execute 429/500, post-execute 500, commit-then-close, or commit-then-delay;
+- generate a provider event;
+- deliver, duplicate, delay, reorder, or drop an event attempt;
+- retry a business request or provider request;
+- issue one SIGKILL at an approved observable boundary;
+- restart and await health;
+- wait for quiescence and check one named checkpoint.
+
+Async outcomes may fill values already reserved by the plan, but do not request new random choices.
+
+### Fixture
+
+The fixture is a single-writer actor. Its state includes:
+
+- PaymentIntent objects and allowed transitions;
+- idempotency entries keyed by route, key, and canonical parameter digest;
+- immutable provider events;
+- webhook delivery attempts;
+- held or delayed HTTP outcomes;
+- a fixture sequence and logical time;
+- run-scoped control authorization.
+
+Idempotency behavior for API v1 is modeled as follows:
+
+- after endpoint execution begins, cache the first status code and response body, including a 500;
+- the same route/key/parameters returns that cached result;
+- changed parameters for the same key fail;
+- validation or conflict before execution begins is not cached.
+
+Webhook behavior:
+
+- event ID and raw JSON bytes are immutable;
+- each delivery attempt receives a fresh timestamp and HMAC-SHA256 signature;
+- signing uses `timestamp + "." + raw_body` exactly;
+- duplicates preserve the same event object;
+- order is controlled at the event-attempt layer, not at packet level;
+- a drop means no delivery before the declared reconciliation horizon.
+
+The proposed fixture topology has separate data and control listeners. The data listener is reachable by the SUT on an internal Compose network. The control listener is published only to loopback and requires an unlogged run token plus a monotonic command sequence. Control DTOs are versioned. The truth spike must prove that this protocol is necessary and portable before it becomes part of trace compatibility.
+
+Normal health/control HTTP can use ordinary request handling. The provider data path uses Hyper's lower-level connection API because `commit_then_close` must mutate the provider model and then end the TCP connection without manufacturing an HTTP response. The truth spike must prove the exact behavior against a real client before the abstraction is generalized.
+
+The fixture is not a byte-for-byte Stripe clone. Unsupported routes, parameters, states, or API versions fail loudly and become configuration/setup failures rather than invented provider behavior.
+
+### Observable cut points and crash injection
+
+Supported cut points are external and honest:
+
+- caller request forwarded;
+- application response observed but designated lost to the logical caller;
+- webhook request forwarded;
+- webhook response observed but designated unacknowledged by the logical sender;
+- customer SQL probe first becomes true.
+
+At a cut point, the responsible driver/fixture task records the observation and blocks on a gate. The orchestrator persists it, invokes:
+
+```text
+docker compose --project-name <exact> ... kill --signal SIGKILL <configured-service>
+```
+
+and then releases or closes the held operation according to the trace. Restart uses an explicit Compose command followed by both Compose-state and application-health checks.
+
+The report calls these “observable external cut points.” It makes no source-line or instruction-level crash claim.
+
+### Docker Compose adapter
+
+The adapter is a typed wrapper over the Docker Compose CLI, not a daemon SDK and not a YAML framework.
+
+Every invocation specifies:
+
+- exact `--project-name`;
+- canonical `--project-directory`;
+- every explicit `--file` in resolved order;
+- non-interactive, bounded output;
+- a command timeout and cancellation behavior;
+- argv-level redaction before journaling.
+
+`doctor` probes the real commands/capabilities used by TxProof and captures `docker compose config` as the resolved, redacted compatibility input. It does not rely only on a version string.
+
+The generated override adds the fixture service, the internal fixture network, loopback control publication, adapter/version labels, and test-only Stripe endpoint environment expected by the customer repository. It does not rewrite unrelated customer services.
+
+The process runner sets `kill_on_drop` as a backstop but still kills and awaits timed-out child processes explicitly. Tokio documents that dropping a child handle does not stop the process by default.
+
+### PostgreSQL baseline and reset
+
+Baseline creation:
+
+1. Create an isolated Compose project and generated case database.
+2. Run the repository's migration and synthetic seed commands.
+3. Stop every configured database client.
+4. Verify no sessions remain on the source.
+5. record a baseline identity marker and compatibility facts.
+6. seal the baseline against application connections.
+
+Preferred reset:
+
+1. acquire a fresh mutation permit;
+2. terminate sessions for the exact verified case OID only;
+3. drop only the generated case database;
+4. clone the sealed baseline with `CREATE DATABASE ... TEMPLATE`;
+5. reapply database-level ownership/privileges;
+6. replace the copied baseline marker with a distinct case marker;
+7. revalidate identity before starting clients.
+
+PostgreSQL requires no connected sessions on the template source while copying. Template cloning is therefore a capability proven by `doctor`, not an assumption.
+
+Fallback reset uses a custom-format `pg_dump` and `pg_restore --single-transaction --exit-on-error`. `doctor` verifies client/server version compatibility. The baseline dump is trusted local test input, mode `0600`, excluded from CI artifacts, and deleted by cleanup.
+
+Transactions, exported snapshots, copied live volumes, and rollback of one connection are not accepted as whole-application reset strategies.
+
+### Quiescence and invariant oracle
+
+Before a checkpoint, the executor:
+
+1. freezes further external action release;
+2. waits for the customer SQL predicate to remain true for the configured stable interval, or uses the narrow synchronous-app stable-period contract;
+3. times out to `Inconclusive`, never `Violated`;
+4. snapshots immutable fixture objects and event-attempt history;
+5. loads those rows into connection-local temporary tables;
+6. starts one `READ ONLY REPEATABLE READ` transaction;
+7. executes exactly five prepared invariant queries against one stable database snapshot;
+8. rolls back and unfreezes only when the trace requires more actions.
+
+Temporary fixture tables are created and populated on the same session before the read-only snapshot transaction. The provider actor remains frozen while the transaction runs.
+
+Invariant files are trusted repository code, but still have a narrow contract. The initial interpreter subset proposed below requires explicit approval during Phase 1; it is not an unstated narrowing of the blueprint. If a real approved repository invariant needs parameters or another read-only form, extend the typed contract deliberately rather than inventing a parser rule.
+
+- initially, exactly one parameter-free `SELECT` or `WITH ... SELECT` statement;
+- zero rows means the invariant holds;
+- returned rows are bounded witnesses;
+- diagnostic columns use supported non-floating types;
+- statement timeout, lock timeout, row cap, per-value byte cap, and total evidence cap are enforced;
+- execution uses the least-privilege invariant role;
+- the transaction is always rolled back.
+
+The five invariant IDs are fixed in v0:
+
+1. provider object uniqueness;
+2. at-most-one business effect per webhook event;
+3. paid-order amount conservation by currency;
+4. terminal success monotonicity;
+5. balanced ledger, or an approved entitlement-safe replacement for non-ledger products.
+
+Full database equality is not an oracle. Generated IDs, timestamps, audit rows, and implementation detail may legitimately differ.
+
+### Observation journal and artifacts
+
+There is one journal writer. Producers send typed observations over a bounded channel; the writer assigns a global observed sequence, preserves producer-local sequence, computes the BLAKE3 link, appends, flushes at effect boundaries, and acknowledges durability.
+
+Each record contains:
+
+```text
+schema version, run/case/action IDs, producer and producer sequence,
+observation kind, monotonic elapsed time, optional wall-clock metadata,
+allowlisted payload or payload digest, previous hash, record hash
+```
+
+The global order means “the order the control plane durably observed,” not a claim about total causality inside the SUT.
+
+Hash inputs have a documented canonical representation: fixed struct field order, `BTreeMap` for maps, explicit enum tags, no floats, and golden normalization tests. Artifact checksums hash the exact bytes written. Ordinary `serde_json` output is not described as canonical JSON merely because it is deterministic in one build.
+
+Artifacts are built in a private staging directory. The journal begins as recoverable append-only NDJSON; finalization compresses bounded logs/journal, writes derived reports, writes checksums, writes the manifest last, and atomically renames the directory. Interrupted partial runs remain inspectable and are never presented as complete.
+
+```text
+.tiv/runs/<run-id>/
+  manifest.json
+  config.redacted.json
+  compose.resolved.redacted.json
+  trace.original.json
+  trace.minimized.json              # only when a valid minimum exists
+  observations.ndjson.zst
+  fixture/final-state.redacted.json
+  invariants/<id>.json
+  logs/<service>.log.zst
+  summary.json
+  summary.md
+  junit.xml
+  checksums.txt
+  replay.txt
+```
+
+The manifest binds tool and adapter versions, trace schema, repository commit and relevant dirty hash, Compose hash, container digests, PostgreSQL facts, invariant hashes, config hash, OS/architecture, database identity, fixture image digest, and safety attestation.
+
+Redaction is structural:
+
+- headers, cookies, URLs, environment names, and payload fields have explicit allowlists;
+- authorization values, keys, passwords, run tokens, and webhook secrets have non-serializable types;
+- raw customer request/response bodies are hashed by default;
+- exact fixture-generated webhook bytes may be stored because the test-data contract is synthetic, but secret-bearing metadata is excluded;
+- truncation is explicit and hashed; silent truncation is prohibited.
+
+### Error, classification, and exit contracts
+
+Internal errors retain class, operation, source, evidence path, and recovery action. The CLI maps only at the outer boundary:
+
+| Exit | Meaning |
+|---:|---|
+| `0` | all completed cases held all five invariants |
+| `2` | invalid configuration or failed safety preflight; no unsafe mutation |
+| `3` | setup/infrastructure failure; no product conclusion |
+| `4` | flaky or inconclusive counterexample |
+| `10` | reproducible invariant violation |
+| `11` | reproducible violation retained; shrink budget exhausted |
+| `130` | interruption; cleanup attempted and recovery emitted |
+
+The command surface remains:
+
+```text
+tiv init
+tiv doctor [--config tiv.toml]
+tiv baseline [--config tiv.toml]
+tiv run [--seed U64] [--cases N] [--ci]
+tiv replay PATH [--attempts N]
+tiv shrink PATH [--max-candidates N] [--max-time 10m]
+tiv inspect PATH
+tiv cleanup --run RUN_ID
+```
+
+`replay` fails before mutation if the compatibility fingerprint is missing or incompatible. `inspect` never executes customer code.
+
+## Concurrency, cancellation, and resource budgets
+
+The runtime is Tokio-based, but deliberately small:
+
+- one root cancellation token and task tracker for a command;
+- one child token per case/replay/shrink candidate;
+- one scheduler task;
+- one fixture model actor;
+- one journal writer;
+- bounded tasks for process I/O, health, HTTP operations, and log capture;
+- no detached task is allowed to own a mutation capability.
+
+`Ctrl-C` cancels the root token, stops new actions, explicitly terminates/awaits owned child processes, attempts scoped cleanup, finalizes partial evidence, and exits 130.
+
+Every boundary has both a timeout and a size/count limit. Tokio timeouts cancel by dropping the future; code must separately handle resources whose cancellation is not drop-safe, especially child processes and partially written artifacts.
+
+Initial budgets come from the blueprint:
+
+- 40 actions per case;
+- one SIGKILL per case;
+- 90 seconds per case;
+- five invariant statements, 2 seconds each, under 5 seconds total;
+- 60 shrink candidates or 10 minutes;
+- 25 MiB final artifact with explicit truncation;
+- bounded HTTP bodies, connections, logs, delays, and evidence rows;
+- one case at a time.
+
+## Dependency policy
+
+The workspace uses Rust edition 2024, Cargo resolver 3, one committed `Cargo.lock`, an explicit `rust-version`, and an exact toolchain in `rust-toolchain.toml`. The exact compiler is selected when scaffolding and verified in CI; “latest” is not a reproducibility policy.
+
+Every owned crate sets `#![forbid(unsafe_code)]`. Necessary transitive unsafe code is reviewed through the dependency and license policy rather than falsely claimed absent.
+
+### Proposed dependencies
+
+| Need | Proposed choice | Decision |
+|---|---|---|
+| Async processes, sockets, signals, timers | `tokio`, `tokio-util` | accept; cancellation/process behavior is central |
+| CLI | `clap` derive | accept; closed typed command surface |
+| TOML/JSON | `serde`, `toml`, `serde_json` | accept |
+| Development JSON Schema | `schemars` | accept as schema-generation path, not runtime validator |
+| Exact provider HTTP path | `hyper`, `hyper-util`, `http-body-util`, `tower` | accept after truth-spike proof of commit-then-close |
+| Ordinary probes and app driving | `reqwest` with Rustls | accept; do not hand-roll routine client behavior |
+| Runtime SQL | `tokio-postgres` with `NoTls` for the isolated local network | accept; queries are repository-owned at runtime |
+| Deterministic decisions | `rand_chacha` | accept; generator is deterministic and portable, but pin version in compatibility data |
+| Webhook signing | RustCrypto `hmac`, `sha2`, `hex` | accept |
+| Evidence hashing | `blake3` | accept |
+| Typed errors | `thiserror` | accept; preserve classification rather than erase it at the CLI |
+| Structured internal diagnostics | `tracing`, `tracing-subscriber` | accept; reports still use product-owned schemas |
+| Private staging and compression | `tempfile`, `zstd` | accept when artifact slice lands |
+| Valid JUnit XML | `quick-xml` | accept when the CI artifact slice lands; do not hand-roll escaping |
+| IDs | `uuid` | accept for random safety/run identities; provider IDs remain derived |
+| Property tests | `proptest` as dev dependency | accept for pure model and transforms, not production shrinking |
+| CLI integration tests | `assert_cmd` as dev dependency | accept |
+
+Dependencies not approved at the start:
+
+- Docker daemon SDK or general Compose YAML parser;
+- `async-trait` without a proven object-safe trait need;
+- generic plugin/ABI framework;
+- OpenSSL/native TLS;
+- ORM or migration framework;
+- `loom` until a small concurrency primitive is important enough to model;
+- `turmoil` until an internal network simulation test has a concrete advantage over real loopback sockets;
+- `tar` until a single-file export is a real customer need.
+
+Before distribution, CI runs formatting, Clippy with warnings denied, all tests, documentation tests, `cargo audit`, `cargo deny`, and release-profile build checks. Dependency versions are locked, licenses allowlisted, sources denied when unexpected, and advisories are reviewed rather than automatically ignored.
+
+## Testing strategy
+
+The production search engine does not use Proptest as its shrinker. TxProof needs dependency-aware, reset/replay-based shrinking with a 2/3 failure-identity predicate. Proptest is used to test TxProof's own pure code.
+
+### Test layers
+
+| Layer | What it proves | Runs |
+|---|---|---|
+| Unit | type validation, state transitions, idempotency cache, eligibility, canonicalization, hashes, redaction | every change |
+| Property | generated plans are valid; transforms preserve dependencies; serialization round-trips; redaction never reveals generated secrets | every change, bounded |
+| Golden contract | stable config, trace schemas, HTTP bodies, signatures, observation chain, summary and JUnit | every change |
+| Loopback integration | real Hyper close/delay behavior, webhook raw bytes, cancellation and bounded bodies | every change where practical |
+| PostgreSQL integration | identity guard, template clone, fallback restore, temp projection, one repeatable-read snapshot, timeouts | CI service job |
+| Compose integration | exact project isolation, health, SIGKILL/restart, log capture, cleanup | Linux CI job |
+| Reference-app E2E | each injected bug is found, classified, minimized, retained, then fixed build passes | release gate |
+| Safety/adversarial | live key, public host, wrong OID/owner/marker/project, path/argv injection, secret canaries, corrupt artifact | release gate |
+
+### Reference application variants
+
+One small synthetic checkout application exposes feature flags for these bugs:
+
+1. duplicate webhook creates two effects;
+2. older event regresses succeeded status;
+3. commit-then-close retry changes idempotency key;
+4. crash and caller retry duplicate the order;
+5. dropped success event never reconciles;
+6. repeated effect creates a one-sided ledger entry.
+
+Each has a paired corrected mode. Acceptance requires the faulty mode to produce the named invariant and checkpoint, the minimized trace to reproduce at least 2/3, and the corrected mode to pass the same compiled regression.
+
+## Implementation sequence
+
+The work is organized as vertical evidence slices, not one large framework build.
+
+### Phase 0 — truth spike, 3–4 days
+
+Build disposable spike code only far enough to prove the riskiest chain:
+
+```text
+real HTTP client
+  -> PaymentIntent create
+  -> provider commits state
+  -> TCP closes without response
+  -> application retries
+  -> duplicate provider/local relation
+  -> one SQL invariant fails
+  -> fresh baseline replay finds the same identity
+```
+
+Also prove:
+
+- one real Compose project can route the SUT to a fixture service;
+- the control listener is loopback-only;
+- template clone works on the reference PostgreSQL setup;
+- the database identity tuple can be observed with the intended roles;
+- exact raw webhook signing round-trips through the reference handler.
+
+Exit: a valuable commit-then-close counterexample on the reference app and one real candidate repository, or an explicit redesign/kill decision. No abstraction from the spike is retained merely because it was written.
+
+### Phase 1 — safe skeleton
+
+Deliver:
+
+- four-crate workspace and pinned toolchain;
+- core IDs, results, budgets, and error classes;
+- typed config plus checked-in schema;
+- `init` and `doctor`;
+- bounded argv-only command runner;
+- Compose compatibility fingerprint;
+- process-local database mutation permit;
+- template baseline/reset and dump/restore fallback;
+- five-query snapshot runner with a single temporary-provider projection.
+
+Exit: every safety canary rejects before mutation; repeated resets return the same semantic baseline; exactly five no-op invariants run in one snapshot.
+
+### Phase 2 — provider and protocol
+
+Deliver:
+
+- fixture actor and control protocol;
+- PaymentIntent create/confirm/get subset;
+- idempotency cache;
+- immutable events and exact signature generation;
+- 429, 500, post-execute 500, close, and delay outcomes;
+- driver/fixture observable gates;
+- bounded observation journal.
+
+Exit: protocol golden tests pass; Stripe-shaped clients see the expected supported subset; commit-then-close is proven on real sockets; unsupported behavior fails loudly.
+
+### Phase 3 — exploration and crashes
+
+Deliver:
+
+- pure valid-plan compiler;
+- compiled-trace materialization;
+- serial campaign executor;
+- duplicate/reorder/delay/drop/retry actions;
+- one observable SIGKILL and health-based restart;
+- quiescence and named checkpoints;
+- original trace artifact.
+
+Exit: 20 unattended cases stay within budgets, no async completion consumes RNG, and the six reference faults are detected by their intended invariants.
+
+### Phase 4 — replay, classification, shrink, and CI
+
+Deliver:
+
+- compatibility-gated fresh-baseline replay;
+- 3/3, 2/3, and 1/3 classification;
+- canonical candidate cache;
+- hierarchical dependency-aware delta debugging;
+- fault, multiplicity, inversion, delay, metadata, and crash transforms;
+- 60-candidate/10-minute budget handling;
+- Markdown, JSON, JUnit, checksums, and replay instructions;
+- exact exit codes.
+
+Exit: each injected fault minimizes to the required shape, original traces are never overwritten, corrupt artifacts fail inspection, secret canaries are absent, and corrected builds pass the generated regression.
+
+### Phase 5 — external hardening and packaging
+
+Deliver only after paid validation:
+
+- signed host CLI packages for the supported Linux/macOS matrix;
+- matching signed fixture OCI image with SBOM and immutable digest;
+- documented supported Docker Compose/PostgreSQL/API versions;
+- three external repository installations;
+- performance and setup measurements;
+- threat model, security contact, retention/deletion guidance.
+
+Exit: the blueprint's setup, replay, false-positive, performance, artifact, safety, and paid-value gates are measured rather than asserted.
+
+## Reviewable pull-request sequence
+
+1. Architecture record: this plan, trace/config contracts, threat model decisions, no runtime code.
+2. Workspace and pure core: IDs, results, validation, serialization fixtures, property tests.
+3. Safety vertical slice: `doctor` through one protected baseline/reset and one invariant.
+4. Fixture truth slice: create/idempotency/commit-then-close plus real-socket tests.
+5. Golden-path executor: one checkout, webhook, quiescence, snapshot, report.
+6. Schedule search: valid compiler and all bounded external fault actions.
+7. Crash slice: observable gate, SIGKILL, restart, recovery evidence.
+8. Replay/classification: fresh baseline and compatibility gates.
+9. Shrinker: same-failure transforms, caching, budgets, original retention.
+10. CI/artifact hardening: JUnit, redaction, corruption, resource and safety canaries.
+11. Release hardening: packages, OCI image, signatures, SBOM, supported matrix.
+
+Each PR begins with failing tests for its behavior, contains one coherent acceptance slice, and ends with fresh focused and workspace verification. No PR may claim completion while its relevant Docker/PostgreSQL/reference-app gate is unrun or red.
+
+## Architecture decisions that must be closed before implementation
+
+| Decision | Proposed default | Proof required |
+|---|---|---|
+| Server fingerprint | PostgreSQL cluster system identifier plus endpoint facts | role/major-version portability spike |
+| Fixture placement | pinned Compose OCI service with loopback control port | Linux, macOS, CI network spike |
+| HTTP close mechanism | Hyper 1 low-level HTTP/1 connection handling | client observes ambiguous network failure after model commit |
+| Initial PostgreSQL matrix | publish only versions exercised by reference and paid repos | template/fallback/oracle test per version |
+| Stripe API version | one explicit adapter version, reject all others | conformance fixtures and real test-mode comparisons |
+| Fifth invariant | balanced journal or customer-approved entitlement replacement | payments-owner sign-off |
+| Quiescence/horizon | repository-owned SQL plus stable interval/horizon | real worker/reconciliation evidence |
+| macOS release timing | required for broad v0 claim; not assumed by Linux-only package | signed host binary and fixture routing test |
+| JUnit serializer | smallest implementation that guarantees valid escaped XML | golden files consumed by at least one CI system |
+| Host campaign lock | OS advisory lock if atomic-file ownership is insufficient | concurrent-run and stale-owner tests |
+| Invariant SQL subset | one parameter-free witness query initially | approval against the first real five invariants; extend only with read-only evidence |
+
+Trademark/name clearance, competitor hands-on benchmarking, legal terms, artifact retention policy, and paid validation remain company gates outside the Rust type system.
+
+## Rejected architecture alternatives
+
+| Alternative | Reason rejected for v0 |
+|---|---|
+| Hosted control plane | expands trust, data handling, isolation, auth, operations, and liability before demand is proven |
+| Long-running local daemon | no product need; creates lifecycle, upgrade, socket, and stale-state problems |
+| Eight crates immediately | conceptual cleanliness without current ownership/reuse evidence; slows vertical proof |
+| One monolithic crate | cannot mechanically keep deterministic core free from ambient async/I/O dependencies |
+| Docker daemon SDK | broad API and dependency surface for a narrow Compose contract |
+| Full Compose YAML editing | merge semantics and extensions are a product of their own; generated override plus resolved config is narrower |
+| SQLx compile-time queries | customer invariant SQL and schemas exist only at runtime |
+| ORM | conflicts with arbitrary customer schema and exact repository-owned SQL |
+| Proptest as production scheduler/shrinker | production acceptance requires state-valid schedules, external reset/replay, named failure identity, and strict budgets |
+| Axum-only provider path | ordinary server responses are easy, but exact commit-then-close needs lower-level connection ownership |
+| Custom deterministic runtime | false scope; TxProof controls external actions, not the customer runtime/kernel/database |
+| Generic provider adapter/plugin ABI | no second provider and no validated stable abstraction |
+| Database snapshot equality | generated IDs, timestamps, and audit implementation details legitimately vary |
+
+## Definition of architecture-ready
+
+Planning is complete enough to start the truth spike when all of the following are agreed:
+
+- the application shape and explicit non-goals are accepted;
+- the four-crate dependency direction is accepted;
+- the trace/replay authority and failure identity are accepted;
+- destructive database type-state and fresh revalidation are non-negotiable;
+- fixture OCI placement and control/data plane separation are accepted for the spike;
+- one reference application schema and all five invariant mappings are selected;
+- the first supported Compose, PostgreSQL, and Stripe adapter versions are named;
+- the quiescence predicate and reconciliation horizon are supplied;
+- Phase 0's kill/redesign condition is accepted.
+
+This plan does not authorize the broad six-week build by itself. It authorizes a small truth spike that can turn the blueprint's hardest assumptions into evidence.
+
+## Primary references
+
+- [Cargo workspaces](https://doc.rust-lang.org/cargo/reference/workspaces.html)
+- [Cargo resolver and Rust-version behavior](https://doc.rust-lang.org/cargo/reference/resolver.html)
+- [Tokio process command and cancellation caveat](https://docs.rs/tokio/latest/tokio/process/struct.Command.html)
+- [Tokio timeout behavior](https://docs.rs/tokio/latest/tokio/time/fn.timeout.html)
+- [Tokio cancellation token](https://docs.rs/tokio-util/latest/tokio_util/sync/struct.CancellationToken.html)
+- [Tokio task tracker](https://docs.rs/tokio-util/latest/tokio_util/task/struct.TaskTracker.html)
+- [Hyper](https://hyper.rs/)
+- [tokio-postgres transaction builder](https://docs.rs/tokio-postgres/latest/tokio_postgres/struct.TransactionBuilder.html)
+- [rand_chacha deterministic and portable generators](https://docs.rs/rand_chacha/latest/rand_chacha/)
+- [Schemars typed schema generation](https://docs.rs/schemars/latest/schemars/trait.JsonSchema.html)
+- [Proptest](https://github.com/proptest-rs/proptest)
+- [Stripe API v1 idempotent requests](https://docs.stripe.com/api/idempotent_requests)
+- [Stripe webhook delivery, ordering, duplicates, and signatures](https://docs.stripe.com/webhooks)
+- [Docker Compose CLI](https://docs.docker.com/reference/cli/docker/compose/)
+- [Docker Compose service health/dependency behavior](https://docs.docker.com/reference/compose-file/services/)
+- [PostgreSQL `CREATE DATABASE` and templates](https://www.postgresql.org/docs/current/sql-createdatabase.html)
+- [PostgreSQL transaction isolation](https://www.postgresql.org/docs/current/transaction-iso.html)
+- [PostgreSQL `pg_dump`](https://www.postgresql.org/docs/current/app-pgdump.html)
+- [PostgreSQL `pg_restore`](https://www.postgresql.org/docs/current/app-pgrestore.html)
+- [BLAKE3 Rust API](https://docs.rs/blake3/latest/blake3/)
+- [quick-xml](https://docs.rs/quick-xml/latest/quick_xml/)
