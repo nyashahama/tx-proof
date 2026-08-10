@@ -1,0 +1,30 @@
+services:
+  postgres:
+    image: postgres:18.4-bookworm
+    command: ["postgres", "-c", "cluster_name=tiv-truth-spike-postgres"]
+    environment:
+      POSTGRES_DB: postgres
+      POSTGRES_INITDB_ARGS: --data-checksums
+      POSTGRES_PASSWORD: tiv-local-only-password
+      POSTGRES_USER: tiv_admin
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "tiv_admin", "-d", "postgres"]
+      interval: 1s
+      timeout: 2s
+      retries: 30
+    labels:
+      io.txproof.purpose: disposable-postgres-truth-spike
+    ports:
+      - "127.0.0.1:15432:5432"
+    stop_grace_period: 5s
+    volumes:
+      - postgres-data:/var/lib/postgresql
+    networks:
+      - internal
+
+networks:
+  internal:
+    name: tiv-truth-spike-postgres-loopback
+
+volumes:
+  postgres-data:
