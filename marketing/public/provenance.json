@@ -1,0 +1,48 @@
+{
+  "schemaVersion": 1,
+  "reviewedAt": "2026-08-10",
+  "externalImageAssets": [],
+  "fonts": [
+    {
+      "family": "Newsreader",
+      "usage": "Editorial display type",
+      "source": "https://github.com/productiontype/Newsreader",
+      "license": "SIL Open Font License 1.1",
+      "licenseUrl": "https://github.com/productiontype/Newsreader/blob/main/OFL.txt"
+    },
+    {
+      "family": "Manrope",
+      "usage": "Interface and body type",
+      "source": "https://github.com/sharanda/manrope",
+      "license": "SIL Open Font License 1.1",
+      "licenseUrl": "https://github.com/google/fonts/blob/main/ofl/manrope/OFL.txt"
+    },
+    {
+      "family": "IBM Plex Mono",
+      "usage": "Evidence, trace, and status type",
+      "source": "https://github.com/IBM/plex",
+      "license": "SIL Open Font License 1.1",
+      "licenseUrl": "https://github.com/IBM/plex/blob/master/LICENSE.txt"
+    }
+  ],
+  "generatedVisuals": [
+    {
+      "name": "Trace instrument and technical diagrams",
+      "origin": "Original repository-native HTML and CSS",
+      "externalInputs": []
+    },
+    {
+      "name": "Route-specific Open Graph cards",
+      "origin": "Original repository-native Next.js image routes",
+      "externalInputs": []
+    }
+  ],
+  "referenceOnly": [
+    {
+      "name": "Polar",
+      "source": "https://github.com/polarsource/polar",
+      "license": "Apache-2.0",
+      "adoption": "Structural study only; no copy, brand, components, assets, or motion choreography reused."
+    }
+  ]
+}
