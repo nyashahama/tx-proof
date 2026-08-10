@@ -15,8 +15,8 @@ export function createOpenGraphCard(card: OpenGraphCard) {
           display: "flex",
           position: "relative",
           overflow: "hidden",
-          background: "#111210",
-          color: "#f2efe6",
+          background: "#08090a",
+          color: "#f8f8f6",
           padding: "58px 64px",
           fontFamily: "Arial, sans-serif",
         }}
@@ -27,7 +27,7 @@ export function createOpenGraphCard(card: OpenGraphCard) {
             inset: 0,
             display: "flex",
             backgroundImage:
-              "linear-gradient(rgba(242,239,230,0.055) 1px, transparent 1px), linear-gradient(90deg, rgba(242,239,230,0.055) 1px, transparent 1px)",
+              "linear-gradient(rgba(255,255,255,0.045) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,0.045) 1px, transparent 1px)",
             backgroundSize: "64px 64px",
           }}
         />
@@ -37,14 +37,14 @@ export function createOpenGraphCard(card: OpenGraphCard) {
               display: "flex",
               alignItems: "center",
               gap: 18,
-              color: "#ff5a36",
+              color: "#a9adb3",
               fontFamily: "monospace",
               fontSize: 17,
               letterSpacing: "0.14em",
             }}
           >
             <span>TXPROOF / {card.sequence}</span>
-            <span style={{ width: 54, height: 1, display: "flex", background: "#ff5a36" }} />
+            <span style={{ width: 54, height: 1, display: "flex", background: "#484d54" }} />
             <span>{card.eyebrow}</span>
           </div>
           <div
@@ -52,10 +52,11 @@ export function createOpenGraphCard(card: OpenGraphCard) {
               display: "flex",
               marginTop: 66,
               maxWidth: 820,
-              fontFamily: "Georgia, serif",
-              fontSize: 70,
-              lineHeight: 0.96,
-              letterSpacing: "-0.045em",
+              fontFamily: "Arial, sans-serif",
+              fontSize: 72,
+              fontWeight: 600,
+              lineHeight: 0.95,
+              letterSpacing: "-0.055em",
             }}
           >
             {card.title}
@@ -65,8 +66,8 @@ export function createOpenGraphCard(card: OpenGraphCard) {
               display: "flex",
               marginTop: "auto",
               paddingTop: 34,
-              borderTop: "1px solid rgba(242,239,230,0.28)",
-              color: "#aeb0a8",
+              borderTop: "1px solid rgba(255,255,255,0.18)",
+              color: "#a9adb3",
               fontFamily: "monospace",
               fontSize: 18,
               letterSpacing: "0.035em",
@@ -81,41 +82,46 @@ export function createOpenGraphCard(card: OpenGraphCard) {
             flexDirection: "column",
             justifyContent: "space-between",
             marginLeft: "auto",
-            width: 212,
+            width: 230,
             paddingLeft: 40,
-            borderLeft: "1px solid rgba(242,239,230,0.28)",
+            borderLeft: "1px solid rgba(255,255,255,0.18)",
           }}
         >
-          <span style={{ fontFamily: "monospace", fontSize: 14, color: "#8f9289" }}>
-            TRACE / MINIMAL
+          <span style={{ fontFamily: "monospace", fontSize: 14, color: "#858a91" }}>
+            COUNTEREXAMPLE / RECEIPT
           </span>
           <span
             style={{
               display: "flex",
-              color: "#ff5a36",
-              fontFamily: "Georgia, serif",
-              fontSize: 144,
+              color: "#f8f8f6",
+              fontFamily: "Arial, sans-serif",
+              fontSize: 132,
+              fontWeight: 600,
               lineHeight: 0.8,
               letterSpacing: "-0.08em",
             }}
           >
-            {card.sequence}
+            {card.sequence.padStart(2, "0")}
           </span>
           <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
-            {["COMPILE", "REPLAY 3/3", "SHRINK 05"].map((label, index) => (
+            {[
+              ["MODEL", "BOUND"],
+              ["REPLAY", "3 / 3"],
+              ["EXIT", "10"],
+            ].map(([label, status], index) => (
               <div
                 key={label}
                 style={{
                   display: "flex",
                   justifyContent: "space-between",
                   paddingTop: 10,
-                  borderTop: "1px solid rgba(242,239,230,0.22)",
-                  color: index === 2 ? "#ff5a36" : "#aeb0a8",
+                  borderTop: "1px solid rgba(255,255,255,0.16)",
+                  color: index === 2 ? "#e05449" : "#a9adb3",
                   fontFamily: "monospace",
                   fontSize: 13,
                 }}
               >
-                <span>{label}</span><span>OK</span>
+                <span>{label}</span><span>{status}</span>
               </div>
             ))}
           </div>

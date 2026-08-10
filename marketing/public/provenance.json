@@ -4,15 +4,8 @@
   "externalImageAssets": [],
   "fonts": [
     {
-      "family": "Newsreader",
-      "usage": "Editorial display type",
-      "source": "https://github.com/productiontype/Newsreader",
-      "license": "SIL Open Font License 1.1",
-      "licenseUrl": "https://github.com/productiontype/Newsreader/blob/main/OFL.txt"
-    },
-    {
       "family": "Manrope",
-      "usage": "Interface and body type",
+      "usage": "Display, interface, and body type",
       "source": "https://github.com/sharanda/manrope",
       "license": "SIL Open Font License 1.1",
       "licenseUrl": "https://github.com/google/fonts/blob/main/ofl/manrope/OFL.txt"
@@ -43,6 +36,18 @@
       "source": "https://github.com/polarsource/polar",
       "license": "Apache-2.0",
       "adoption": "Structural study only; no copy, brand, components, assets, or motion choreography reused."
+    },
+    {
+      "name": "Linear",
+      "source": "https://linear.app/",
+      "license": "Reference only",
+      "adoption": "Visual-principle study only; no copy, brand, components, screenshots, assets, or motion choreography reused."
+    },
+    {
+      "name": "Notion",
+      "source": "https://www.notion.com/product",
+      "license": "Reference only",
+      "adoption": "Visual-principle study only; no copy, brand, components, screenshots, assets, or motion choreography reused."
     }
   ]
 }

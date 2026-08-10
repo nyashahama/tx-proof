@@ -76,7 +76,6 @@ describe("publishable site contract", () => {
     };
 
     expect(provenance.fonts.map((font) => font.family)).toEqual([
-      "Newsreader",
       "Manrope",
       "IBM Plex Mono",
     ]);
@@ -84,6 +83,31 @@ describe("publishable site contract", () => {
     expect(provenance.externalImageAssets).toEqual([]);
     expect(provenance.referenceOnly.find((reference) => reference.name === "Polar")?.adoption)
       .toMatch(/no copy/i);
+    expect(provenance.referenceOnly.map((reference) => reference.name)).toEqual([
+      "Polar",
+      "Linear",
+      "Notion",
+    ]);
+  });
+
+  it("locks the forensic monochrome palette and keeps failure red semantic", () => {
+    const globalsPath = path.join(process.cwd(), "app", "globals.css");
+    const globals = fs.readFileSync(globalsPath, "utf8");
+    const socialCardPath = path.join(
+      process.cwd(),
+      "components",
+      "metadata",
+      "open-graph-card.tsx",
+    );
+    const socialCard = fs.readFileSync(socialCardPath, "utf8");
+
+    expect(globals).toContain("--paper: #f8f8f6");
+    expect(globals).toContain("--ink: #101112");
+    expect(globals).toContain("--failure: #b42318");
+    expect(globals).not.toMatch(/#f25534|#b9d98b|#f1eee5/i);
+    expect(socialCard).toContain('background: "#08090a"');
+    expect(socialCard).toContain('"#e05449"');
+    expect(socialCard).not.toMatch(/#ff5a36|#f2efe6|Georgia/i);
   });
 
   it("gives an unknown route a deliberate recovery path", () => {

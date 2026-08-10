@@ -11,7 +11,7 @@
   background-image:
     linear-gradient(var(--line-paper) 1px, transparent 1px),
     linear-gradient(90deg, var(--line-paper) 1px, transparent 1px),
-    radial-gradient(circle at 75% 20%, rgb(242 85 52 / 10%), transparent 28%);
+    radial-gradient(circle at 75% 20%, rgb(16 17 18 / 5%), transparent 28%);
   background-size: 72px 72px, 72px 72px, auto;
 }
 
@@ -21,7 +21,7 @@
   background-image:
     linear-gradient(var(--grid-line) 1px, transparent 1px),
     linear-gradient(90deg, var(--grid-line) 1px, transparent 1px),
-    radial-gradient(circle at 76% 22%, rgb(242 85 52 / 16%), transparent 30%);
+    radial-gradient(circle at 76% 22%, rgb(255 255 255 / 4%), transparent 30%);
   color: var(--paper);
 }
 
@@ -30,14 +30,14 @@
   background-image:
     linear-gradient(var(--line-paper) 1px, transparent 1px),
     linear-gradient(90deg, var(--line-paper) 1px, transparent 1px),
-    radial-gradient(circle at 80% 48%, rgb(242 85 52 / 18%), transparent 24%);
+    radial-gradient(circle at 80% 48%, rgb(255 255 255 / 4%), transparent 24%);
 }
 
 .auditHero {
   background-color: var(--danger);
   background-image:
-    linear-gradient(rgb(37 16 11 / 8%) 1px, transparent 1px),
-    linear-gradient(90deg, rgb(37 16 11 / 8%) 1px, transparent 1px);
+    linear-gradient(rgb(16 17 18 / 4%) 1px, transparent 1px),
+    linear-gradient(90deg, rgb(16 17 18 / 4%) 1px, transparent 1px);
 }
 
 .kicker {
@@ -307,7 +307,7 @@
 .nodeAccent {
   min-height: 238px;
   border-color: var(--danger);
-  box-shadow: 9px 9px 0 rgb(242 85 52 / 15%);
+  box-shadow: 0 18px 54px rgb(0 0 0 / 8%);
 }
 
 .systemStack {
@@ -446,7 +446,7 @@
 .hashLine {
   padding: 17px 18px;
   background: var(--proof);
-  color: #203017;
+  color: var(--ink);
   font: 650 9px/1 var(--font-mono), monospace;
 }
 
@@ -583,7 +583,7 @@
   margin-top: 28px;
   border: 1px solid var(--danger);
   padding: 22px;
-  background: rgb(242 85 52 / 6%);
+  background: var(--paper);
 }
 
 .decisionStatement strong {
@@ -609,11 +609,11 @@
 
 .controlMatrix > div:first-child {
   border-right: 1px solid var(--line-light);
-  background: rgb(185 217 139 / 5%);
+  background: var(--inverse-panel);
 }
 
 .controlMatrix > div:last-child {
-  background: rgb(242 85 52 / 5%);
+  background: var(--inverse-panel);
 }
 
 .controlMatrix > div > span {
@@ -703,12 +703,12 @@
 
 .finalShrink {
   background: var(--proof);
-  color: #203017;
+  color: var(--ink);
 }
 
 .finalShrink > span,
 .finalShrink small {
-  color: #365026;
+  color: var(--muted);
 }
 
 .lockCard {
@@ -730,7 +730,7 @@
   border: 1px solid var(--danger);
   border-radius: 50%;
   color: var(--danger);
-  box-shadow: 0 0 0 14px rgb(242 85 52 / 7%);
+  box-shadow: 0 0 0 14px var(--paper-deep);
 }
 
 .lockIcon span {
@@ -839,7 +839,7 @@
 .safeResult {
   padding: 20px 24px;
   background: var(--proof);
-  color: #203017;
+  color: var(--ink);
 }
 
 .safeResult span,
@@ -1073,7 +1073,7 @@
 
 .statusPrimary { color: var(--paper); }
 .statusEvidence { color: var(--proof); }
-.statusHypothesis { color: #f1c66d; }
+.statusHypothesis { color: var(--ink-subtle); }
 .statusProhibited { color: var(--danger-light); }
 
 .benchmarkGrid,
@@ -1125,7 +1125,7 @@
   padding: 30px;
   background: var(--danger);
   color: var(--danger-ink);
-  box-shadow: 14px 14px 0 rgb(37 16 11 / 12%);
+  box-shadow: 0 18px 54px rgb(0 0 0 / 10%);
   transform: rotate(1deg);
 }
 
@@ -1209,7 +1209,7 @@
 }
 
 .oracleSplit tbody {
-  background: rgb(242 85 52 / 10%);
+  background: rgb(180 35 24 / 10%);
   color: var(--danger-dark);
 }
 
@@ -1278,11 +1278,11 @@
 
 .beforeRepair {
   border-right: 1px solid var(--line-strong);
-  background: rgb(242 85 52 / 8%);
+  background: rgb(180 35 24 / 8%);
 }
 
 .afterRepair {
-  background: rgb(185 217 139 / 16%);
+  background: var(--paper-deep);
 }
 
 .repairCompare span,
@@ -1661,5 +1661,472 @@
   .intakeNote {
     grid-template-columns: 1fr;
     gap: 12px;
+  }
+}
+
+/* Direction B: one monochrome system across every supporting route. */
+.hero {
+  padding: clamp(96px, 9vw, 142px) 0;
+  background-color: var(--paper);
+  background-image:
+    linear-gradient(rgb(16 17 18 / 4%) 1px, transparent 1px),
+    linear-gradient(90deg, rgb(16 17 18 / 4%) 1px, transparent 1px),
+    radial-gradient(circle at 77% 28%, rgb(16 17 18 / 5%), transparent 30%);
+  background-size: 64px 64px, 64px 64px, auto;
+}
+
+.heroDark,
+.counterHero {
+  border-bottom-color: var(--line-dark);
+  background-color: var(--inverse);
+  background-image:
+    linear-gradient(var(--grid-line) 1px, transparent 1px),
+    linear-gradient(90deg, var(--grid-line) 1px, transparent 1px);
+  color: var(--paper-bright);
+}
+
+.auditHero {
+  background-color: var(--paper-bright);
+  background-image:
+    linear-gradient(rgb(16 17 18 / 4%) 1px, transparent 1px),
+    linear-gradient(90deg, rgb(16 17 18 / 4%) 1px, transparent 1px);
+}
+
+.heroGrid {
+  grid-template-columns: minmax(0, 1.08fr) minmax(380px, 0.72fr);
+}
+
+.heroCopy h1 {
+  font: 560 clamp(4rem, 6.5vw, 6.75rem)/0.94 var(--font-display), Arial, sans-serif;
+  letter-spacing: -0.065em;
+}
+
+.heroCopy > p,
+.auditHero .heroCopy > p {
+  padding-left: 0;
+  border-left: 0;
+  color: var(--muted);
+  font-size: 15px;
+}
+
+.heroDark .heroCopy > p,
+.counterHero .heroCopy > p {
+  color: var(--ink-subtle);
+}
+
+.heroDark .heroLinks :global(.button-primary),
+.counterHero .heroLinks :global(.button-primary) {
+  border-color: var(--paper-bright);
+  background: var(--paper-bright);
+  color: var(--inverse);
+}
+
+.commandCard,
+.scheduleCard,
+.claimCard,
+.scopeReceipt,
+.fingerprintCard,
+.caseStamp,
+.lockCard,
+.preflightCard {
+  overflow: hidden;
+  border-color: var(--line-dark);
+  border-radius: 16px;
+  background: var(--inverse);
+  color: var(--paper-bright);
+  box-shadow: 0 24px 70px rgb(0 0 0 / 10%);
+  transform: none;
+}
+
+.commandResult,
+.scheduleDecision {
+  border-top: 2px solid var(--failure);
+  background: var(--inverse-panel);
+  color: var(--paper-bright);
+}
+
+.sectionHeading h2 {
+  font: 560 clamp(2.9rem, 5vw, 5.2rem)/0.98 var(--font-display), Arial, sans-serif;
+  letter-spacing: -0.058em;
+}
+
+.darkSection,
+.traceSection {
+  background: var(--inverse);
+  color: var(--paper-bright);
+}
+
+.systemMap > i {
+  color: var(--muted);
+}
+
+.systemNode {
+  border-color: var(--line-paper);
+  border-radius: 12px;
+  background: var(--paper-bright);
+}
+
+.nodeAccent {
+  border-color: var(--ink);
+  box-shadow: 0 18px 54px rgb(0 0 0 / 8%);
+}
+
+.invariantList article > strong,
+.boundaryCallout {
+  border-color: var(--line-light);
+  color: var(--paper-bright);
+}
+
+.fingerprintCard {
+  box-shadow: 0 24px 70px rgb(0 0 0 / 9%);
+}
+
+.hashLine,
+.safeResult,
+.finalShrink {
+  border-top: 1px solid var(--line-dark);
+  background: var(--paper-deep);
+  color: var(--ink);
+}
+
+.artifactCopy h3,
+.stageGrid h3,
+.decisionStatement strong,
+.lockCard > strong,
+.preflightTarget strong,
+.refusalGrid h3,
+.claimClasses h3,
+.qualificationGrid h3,
+.localCircle > strong,
+.externalCircle > strong,
+.claimCard blockquote,
+.benchmarkGrid strong,
+.deliverableGrid strong,
+.caseStamp > strong,
+.shrinkHistory strong,
+.repairCompare strong,
+.scopeReceipt dd,
+.auditTimeline h3 {
+  font-family: var(--font-display), Arial, sans-serif;
+  font-weight: 600;
+}
+
+.routeCta {
+  border-top-color: var(--line-dark);
+  background: var(--inverse);
+  color: var(--paper-bright);
+}
+
+.routeCta div > span {
+  color: var(--ink-muted);
+}
+
+.routeCta h2 {
+  color: var(--paper-bright);
+  font: 560 clamp(2rem, 3.5vw, 3.7rem)/1 var(--font-display), Arial, sans-serif;
+}
+
+.routeCta :global(.button-primary) {
+  border-color: var(--paper-bright);
+  background: var(--paper-bright);
+  color: var(--inverse);
+}
+
+.scheduleRows div:first-child {
+  border-left-color: var(--paper-bright);
+  background: #1b1d1f;
+}
+
+.scheduleRows div:first-child code {
+  color: var(--paper-bright);
+}
+
+.stageGrid article,
+.shrinkSteps li,
+.auditTimeline li,
+.benchmarkGrid > div,
+.deliverableGrid > div {
+  background: var(--paper-bright);
+}
+
+.stageGrid article > span,
+.shrinkSteps li > span,
+.benchmarkGrid span,
+.deliverableGrid span,
+.auditTimeline li > span {
+  color: var(--muted);
+}
+
+.decisionStatement,
+.researchNote,
+.intakeNote {
+  border-color: var(--line-paper);
+  border-radius: 12px;
+  background: var(--paper);
+}
+
+.controlMatrix {
+  overflow: hidden;
+  border-radius: 14px;
+  background: var(--inverse-panel);
+}
+
+.controlMatrix > div:first-child,
+.controlMatrix > div:last-child {
+  background: var(--inverse-panel);
+}
+
+.controlMatrix > div > span,
+.controlMatrix li::before {
+  color: var(--paper-bright);
+}
+
+.controlMatrix > div:last-child > span,
+.controlMatrix > div:last-child li::before {
+  color: var(--failure-light);
+}
+
+.shrinkSteps li:not(:last-child)::after {
+  border-color: var(--muted);
+}
+
+.lockCard,
+.preflightCard {
+  border-color: var(--line-paper);
+  background: var(--paper-bright);
+  color: var(--ink);
+}
+
+.lockIcon {
+  border-color: var(--ink);
+  border-radius: 14px;
+  color: var(--ink);
+  box-shadow: 0 0 0 14px var(--paper-deep);
+}
+
+.gateList em,
+.localCircle > small {
+  color: var(--ink);
+}
+
+.refusalGrid,
+.claimClasses,
+.qualificationGrid {
+  overflow: hidden;
+  border-radius: 14px;
+  background: var(--inverse-panel);
+}
+
+.localCircle,
+.externalCircle {
+  border-color: var(--line-strong);
+}
+
+.blockedArrow,
+.externalCircle > small {
+  color: var(--failure);
+}
+
+.sourceLedger {
+  overflow: hidden;
+  border-radius: 12px;
+  background: var(--paper-bright);
+}
+
+.sourceLedger article > code,
+.sourceLedger article > a:hover strong,
+.intakeNote > span {
+  color: var(--ink);
+}
+
+.sourceLedger article > span {
+  color: var(--muted);
+}
+
+.statusEvidence {
+  color: var(--ink-subtle);
+}
+
+.statusHypothesis {
+  color: var(--ink-subtle);
+}
+
+.caseStamp {
+  border-color: var(--line-light);
+  background: var(--inverse-panel);
+  color: var(--paper-bright);
+  box-shadow: none;
+}
+
+.caseStamp dt,
+.caseStamp dd {
+  color: var(--paper-bright);
+}
+
+.caseStamp dl > div {
+  border-bottom-color: var(--line-dark);
+}
+
+.oracleSplit,
+.repairCompare {
+  overflow: hidden;
+  border-color: var(--line-paper);
+  border-radius: 14px;
+}
+
+.oracleSplit > div:first-child {
+  background: var(--inverse);
+}
+
+.oracleSplit pre code {
+  color: var(--paper-bright);
+}
+
+.oracleSplit tbody,
+.beforeRepair {
+  background: rgb(180 35 24 / 8%);
+  color: var(--failure-dark);
+}
+
+.afterRepair {
+  background: var(--paper-deep);
+}
+
+.afterRepair code {
+  color: var(--ink);
+}
+
+.shrinkHistory > div {
+  border-radius: 10px;
+  background: var(--inverse-panel);
+}
+
+.shrinkHistory > i {
+  color: var(--ink-muted);
+}
+
+.shrinkHistory small {
+  color: var(--paper-bright);
+}
+
+.scopeReceipt {
+  border-color: var(--line-paper);
+  background: var(--paper-bright);
+  color: var(--ink);
+}
+
+.scopeReceipt > p {
+  background: var(--inverse);
+  color: var(--paper-bright);
+}
+
+.counterHero .heroCopy h1 {
+  font-size: clamp(3.8rem, 6vw, 6.2rem);
+}
+
+.lockCard {
+  box-shadow: 0 1px 0 rgb(0 0 0 / 6%);
+}
+
+.kicker,
+.cardBar,
+.sectionHeading > span,
+.factStrip span,
+.stageGrid article > span,
+.refusalGrid article > span,
+.qualificationGrid article > span,
+.claimClasses article > span,
+.benchmarkGrid span,
+.deliverableGrid span,
+.auditTimeline li > span,
+.intakeNote > span {
+  font-size: 10px;
+}
+
+.commandPrompt code,
+.commandCard dt,
+.commandCard dd,
+.claimCard dt,
+.claimCard dd,
+.scopeReceipt dt,
+.caseStamp dt,
+.caseStamp dd,
+.invariantList article > span,
+.invariantList article > code,
+.invariantList article > strong,
+.boundaryCallout,
+.fingerprintCard li span,
+.fingerprintCard li code,
+.scheduleRows span,
+.scheduleRows code,
+.controlMatrix ul,
+.gateList span,
+.gateList code,
+.gateList em,
+.refusalGrid code,
+.oracleSplit th,
+.oracleSplit td,
+.shrinkHistory span,
+.shrinkHistory small,
+.repairCompare code,
+.scopeReceipt > p {
+  font-size: 10px;
+}
+
+.sourceLedger article {
+  min-height: 92px;
+}
+
+.sourceLedger article > code,
+.sourceLedger article > span {
+  font-size: 10px;
+}
+
+.sourceLedger article strong {
+  font-size: 12px;
+}
+
+.sourceLedger article small,
+.sourceLedger article > p {
+  font-size: 11px;
+}
+
+@media (max-width: 780px) {
+  .heroGrid,
+  .artifactGrid {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 48px;
+  }
+
+  .heroCopy,
+  .commandCard,
+  .scheduleCard,
+  .claimCard,
+  .scopeReceipt,
+  .caseStamp {
+    min-width: 0;
+    width: 100%;
+  }
+}
+
+@media (max-width: 600px) {
+  .heroCopy h1 {
+    font-size: clamp(3rem, 14vw, 4.4rem);
+    line-height: 0.98;
+  }
+
+  .heroCopy > p {
+    padding-left: 0;
+    font-size: 13px;
+  }
+
+  .auditHero .heroLinks :global(.button-quiet) {
+    width: fit-content;
+    min-height: auto;
+    justify-content: flex-start;
+    border: 0;
+    border-radius: 0;
+    padding: 8px 0;
+    background: transparent;
   }
 }

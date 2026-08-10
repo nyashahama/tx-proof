@@ -5,7 +5,7 @@
   background-color: var(--paper);
   background-image: radial-gradient(
     circle at 70% 17%,
-    rgb(242 85 52 / 9%),
+    rgb(16 17 18 / 5%),
     transparent 26%
   );
 }
@@ -271,8 +271,8 @@
   width: 6px;
   height: 6px;
   border-radius: 50%;
-  background: var(--danger);
-  box-shadow: 0 0 0 5px rgb(242 85 52 / 13%);
+  background: var(--ink-muted);
+  box-shadow: 0 0 0 5px rgb(255 255 255 / 8%);
 }
 
 .truthCards {
@@ -345,7 +345,7 @@
   margin-top: 22px;
   border: 1px solid var(--danger);
   padding: 18px;
-  background: rgb(242 85 52 / 7%);
+  background: rgb(180 35 24 / 7%);
 }
 
 .noteGlyph {
@@ -691,7 +691,7 @@
 
 .codeLines .failedLine {
   border-left: 2px solid var(--danger);
-  background: rgb(242 85 52 / 8%);
+  background: rgb(180 35 24 / 8%);
 }
 
 .codeLines .failedLine code,
@@ -893,7 +893,7 @@
 .mutationState {
   padding: 17px 18px;
   background: var(--proof);
-  color: #203017;
+  color: var(--ink);
 }
 
 .mutationState span,
@@ -1004,7 +1004,7 @@
   margin-top: 18px;
   border: 1px solid var(--proof-dark);
   padding: 0 18px;
-  background: rgb(185 217 139 / 6%);
+  background: rgb(255 255 255 / 4%);
 }
 
 .notList .isItem > span,
@@ -1022,7 +1022,7 @@
 .auditSection::before {
   position: absolute;
   inset: 0;
-  background-image: linear-gradient(rgb(37 16 11 / 8%) 1px, transparent 1px), linear-gradient(90deg, rgb(37 16 11 / 8%) 1px, transparent 1px);
+  background-image: linear-gradient(rgb(16 17 18 / 4%) 1px, transparent 1px), linear-gradient(90deg, rgb(16 17 18 / 4%) 1px, transparent 1px);
   background-size: 44px 44px;
   content: "";
 }
@@ -1063,7 +1063,7 @@
   border: 1px solid var(--danger-ink);
   background: var(--paper-bright);
   color: var(--ink);
-  box-shadow: 18px 18px 0 rgb(37 16 11 / 15%);
+  box-shadow: 0 24px 70px rgb(0 0 0 / 9%);
   transform: rotate(1deg);
 }
 
@@ -1445,6 +1445,466 @@
   }
 
   .auditReceipt {
-    box-shadow: 8px 8px 0 rgb(37 16 11 / 15%);
+    box-shadow: 0 12px 36px rgb(0 0 0 / 8%);
   }
+}
+
+/* Direction B: forensic monochrome. The evidence object, not decoration, carries the identity. */
+.hero {
+  background-color: var(--paper);
+  background-image:
+    radial-gradient(circle at 74% 38%, rgb(16 17 18 / 5%), transparent 30%),
+    linear-gradient(to bottom, var(--paper-bright), var(--paper));
+}
+
+.heroGrid {
+  background-image:
+    linear-gradient(rgb(16 17 18 / 4%) 1px, transparent 1px),
+    linear-gradient(90deg, rgb(16 17 18 / 4%) 1px, transparent 1px);
+  background-size: 64px 64px;
+  mask-image: linear-gradient(to bottom, black, transparent 70%);
+  opacity: 0.5;
+}
+
+.heroInner {
+  display: grid;
+  grid-template-columns: minmax(360px, 0.78fr) minmax(620px, 1.22fr);
+  gap: clamp(44px, 6vw, 92px);
+  align-items: center;
+  padding: clamp(88px, 8vw, 128px) 0 clamp(80px, 7vw, 112px);
+}
+
+.heroCopy {
+  display: block;
+}
+
+.heroEyebrow {
+  margin-bottom: 30px;
+  color: var(--muted);
+}
+
+.heroEyebrow span:first-child {
+  border-color: var(--line-paper);
+  border-radius: 999px;
+  padding: 7px 10px;
+  background: var(--paper-bright);
+}
+
+.heroCopy h1 {
+  max-width: 720px;
+  font: 560 clamp(4rem, 5.55vw, 5.45rem)/0.96 var(--font-display), Arial, sans-serif;
+  letter-spacing: -0.065em;
+  text-wrap: pretty;
+}
+
+.heroCopy h1 em {
+  color: var(--ink);
+  font-style: normal;
+  font-weight: inherit;
+}
+
+.heroSupportRow {
+  display: block;
+}
+
+.heroSupport {
+  max-width: 600px;
+  margin-top: 30px;
+  padding-left: 0;
+  border-left: 0;
+  color: var(--muted);
+  font-size: clamp(1rem, 1.35vw, 1.16rem);
+  line-height: 1.65;
+}
+
+.heroActions {
+  justify-content: flex-start;
+  margin-top: 30px;
+}
+
+.qualifier {
+  margin-top: 24px;
+}
+
+.qualifier span {
+  color: var(--failure);
+}
+
+.instrumentWrap {
+  min-width: 0;
+  margin-top: 0;
+}
+
+.instrumentWrap::before,
+.instrumentWrap::after {
+  display: none;
+}
+
+.evidenceRail {
+  background: var(--paper-bright);
+}
+
+.evidenceRail > div {
+  border-left: 1px solid var(--line-paper);
+}
+
+.evidenceItem {
+  min-height: 92px;
+  padding: 24px;
+}
+
+.evidenceItem:first-child {
+  border-left: 0;
+}
+
+.evidenceItem strong {
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.sectionHeader {
+  grid-template-columns: 160px minmax(0, 1fr);
+}
+
+.sectionHeader h2,
+.compactHeader h2,
+.boundaryLead h2,
+.auditCopy h2 {
+  font: 560 clamp(2.85rem, 5vw, 5.4rem)/0.98 var(--font-display), Arial, sans-serif;
+  letter-spacing: -0.06em;
+}
+
+.sectionHeader > div > p,
+.compactHeader > p,
+.boundaryLead > p,
+.auditCopy > p {
+  font-size: 14px;
+  line-height: 1.7;
+}
+
+.truthCore {
+  border-radius: 18px;
+  background: var(--ink);
+  color: var(--paper-bright);
+  box-shadow: 0 0 0 18px var(--paper-bright), 0 0 0 19px var(--line-paper);
+}
+
+.truthCore span,
+.truthCore small {
+  color: var(--ink-subtle);
+}
+
+.truthCore strong {
+  font-family: var(--font-mono), monospace;
+  font-size: 1.8rem;
+}
+
+.truthCore i {
+  background: var(--ink-muted);
+  box-shadow: 0 0 0 5px rgb(255 255 255 / 8%);
+}
+
+.truthCard {
+  background: var(--paper-bright);
+}
+
+.truthCardTop code {
+  border-radius: 999px;
+  background: var(--paper);
+}
+
+.truthCard h3,
+.faultRow strong,
+.methodRail h3,
+.notList strong {
+  font-family: var(--font-display), Arial, sans-serif;
+  font-weight: 600;
+}
+
+.truthCard > strong {
+  color: var(--muted);
+}
+
+.contradictionNote {
+  border-color: var(--line-paper);
+  border-radius: 12px;
+  background: var(--paper);
+}
+
+.noteGlyph {
+  background: var(--failure);
+  color: var(--failure-ink);
+}
+
+.methodSection,
+.artifactSection,
+.boundarySection {
+  background: var(--inverse);
+  color: var(--paper-bright);
+}
+
+.methodRail,
+.artifactWorkbench {
+  border-color: var(--line-dark);
+  border-radius: 16px;
+  overflow: hidden;
+  background: var(--inverse-panel);
+}
+
+.methodRail article {
+  min-height: 440px;
+  border-color: var(--line-dark);
+}
+
+.methodGlyph {
+  border-radius: 10px;
+  background-color: var(--inverse);
+}
+
+.methodGlyph span:last-child,
+.shrinkGlyph span:last-child,
+.methodRail > article > code {
+  border-color: var(--line-light);
+  color: var(--paper-bright);
+}
+
+.methodRail h3 {
+  font-size: 2rem;
+}
+
+.faultTable {
+  border-top-color: var(--ink);
+}
+
+.faultHeader,
+.faultRow {
+  background: var(--paper-bright);
+}
+
+.faultHeader {
+  border-radius: 12px 12px 0 0;
+}
+
+.faultRow:last-child {
+  border-radius: 0 0 12px 12px;
+}
+
+.faultRow code {
+  color: var(--muted);
+}
+
+.artifactWorkbench {
+  box-shadow: 0 24px 80px rgb(0 0 0 / 30%);
+}
+
+.fileTree .selectedFile {
+  border-left-color: var(--paper-bright);
+  background: #1b1d1f;
+}
+
+.codeLines .failedLine {
+  border-left-color: var(--failure);
+  background: rgb(180 35 24 / 10%);
+}
+
+.replayCommand {
+  border-radius: 8px;
+  background: var(--inverse);
+}
+
+.replayCommand > span {
+  color: var(--paper-bright);
+}
+
+.exitPanel {
+  border-top: 2px solid var(--failure);
+  background: var(--inverse);
+  color: var(--paper-bright);
+}
+
+.exitCode {
+  border-color: var(--failure);
+  border-radius: 8px;
+  color: var(--failure-light);
+}
+
+.identityCard {
+  border-color: var(--line-paper);
+  border-radius: 16px;
+  overflow: hidden;
+  background: var(--paper-bright);
+  box-shadow: 0 24px 70px rgb(0 0 0 / 8%);
+}
+
+.identityHeader strong {
+  color: var(--muted);
+}
+
+.dbGlyph {
+  border-radius: 8px;
+}
+
+.identityCard li > span {
+  background: var(--ink);
+}
+
+.identityCard li code {
+  color: var(--ink);
+}
+
+.mutationState {
+  background: var(--paper-deep);
+  color: var(--ink);
+}
+
+.bigStatement {
+  font: 560 clamp(2.2rem, 4vw, 4rem)/1.02 var(--font-display), Arial, sans-serif;
+}
+
+.bigStatement em {
+  color: var(--ink);
+  font-style: normal;
+}
+
+.notList > div > span {
+  color: var(--ink-muted);
+}
+
+.notList .isItem {
+  border-color: var(--line-light);
+  border-radius: 12px;
+  background: var(--inverse-panel);
+}
+
+.notList .isItem > span,
+.notList .isItem small {
+  color: var(--paper-bright);
+}
+
+.auditSection {
+  border-top: 1px solid var(--line-paper);
+  background: var(--paper-bright);
+}
+
+.auditSection::before {
+  background-image:
+    linear-gradient(rgb(16 17 18 / 4%) 1px, transparent 1px),
+    linear-gradient(90deg, rgb(16 17 18 / 4%) 1px, transparent 1px);
+}
+
+.auditCopy > p,
+.auditActions > span {
+  color: var(--muted);
+}
+
+.auditReceipt {
+  border-color: var(--ink);
+  border-radius: 14px;
+  overflow: hidden;
+  box-shadow: 0 24px 70px rgb(0 0 0 / 9%);
+  transform: none;
+}
+
+@media (max-width: 1120px) {
+  .heroInner {
+    grid-template-columns: 1fr;
+  }
+
+  .heroCopy {
+    max-width: 850px;
+  }
+
+  .heroCopy h1 {
+    font-size: clamp(4rem, 8vw, 6.5rem);
+  }
+}
+
+@media (max-width: 800px) {
+  .sectionHeader,
+  .compactHeader {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 24px;
+  }
+
+  .sectionHeader > div {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 23px;
+  }
+}
+
+@media (max-width: 600px) {
+  .heroInner {
+    gap: 44px;
+    padding-top: 62px;
+  }
+
+  .heroEyebrow span:last-child {
+    max-width: 210px;
+  }
+
+  .heroCopy h1 {
+    font-size: clamp(3rem, 14vw, 4.2rem);
+    line-height: 0.98;
+    letter-spacing: -0.058em;
+  }
+
+  .heroSupport {
+    font-size: 1rem;
+  }
+
+  .heroActions :global(.button) {
+    width: 100%;
+  }
+
+  .evidenceRail > div {
+    border-left: 0;
+  }
+
+  .sectionHeader h2,
+  .compactHeader h2,
+  .boundaryLead h2,
+  .auditCopy h2 {
+    font-size: clamp(2.65rem, 12vw, 4rem);
+  }
+
+  .identityCard,
+  .auditReceipt {
+    box-shadow: none;
+  }
+}
+
+/* Evidence labels stay legible; mono is for machine facts, not decorative texture. */
+.heroEyebrow,
+.qualifier,
+.methodNumber,
+.methodRail > article > code,
+.methodFooter,
+.faultHeader,
+.faultIndex,
+.panelLabel,
+.exitPanel small,
+.exitStatus,
+.receiptTop,
+.receiptBottom span {
+  font-size: 10px;
+}
+
+.evidenceItem span,
+.truthCardTop,
+.truthCard > strong,
+.fileTree li strong,
+.fileTree li small,
+.codeLines > div > span,
+.codeLines small,
+.commandTag,
+.identityTarget small,
+.identityCard li small,
+.identityCard li code,
+.mutationState span,
+.safetyRules span,
+.notList > div > span,
+.auditActions > span,
+.auditReceipt li > span,
+.auditReceipt li small {
+  font-size: 10px;
 }

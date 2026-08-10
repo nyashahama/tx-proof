@@ -22,14 +22,18 @@ test("homepage explains TxProof and exposes a working counterexample", async ({ 
     .toHaveCount(5);
 });
 
-test("counterexample instrument renders on its intended forensic ink surface", async ({ page }) => {
+test("counterexample and primary action render with the forensic monochrome contract", async ({ page }) => {
   await page.goto("/");
 
   const instrument = page.getByRole("region", {
     name: "Committed remotely. Unknown locally.",
   });
   await expect(instrument).toBeVisible();
-  await expect(instrument).toHaveCSS("background-color", "rgb(16, 19, 16)");
+  await expect(instrument).toHaveCSS("background-color", "rgb(8, 9, 10)");
+
+  const primaryAction = page.getByRole("link", { name: "View a failing trace" });
+  await expect(primaryAction).toHaveCSS("background-color", "rgb(16, 17, 18)");
+  await expect(primaryAction).toHaveCSS("border-radius", "999px");
 });
 
 test("homepage has no serious automated accessibility violations", async ({ page }) => {
@@ -55,4 +59,18 @@ test("homepage reflows without horizontal overflow at 390px", async ({ page }) =
   expect(widths.content).toBeLessThanOrEqual(widths.viewport);
   await expect(page.getByRole("heading", { level: 1 })).toBeVisible();
   await expect(page.getByRole("tab", { name: "01 Lost response" })).toBeVisible();
+});
+
+test("counterexample stays understandable and operable with reduced motion", async ({ page }) => {
+  await page.emulateMedia({ reducedMotion: "reduce" });
+  await page.goto("/");
+
+  await page.getByRole("tab", { name: "04 Process crash" }).click();
+  await expect(
+    page.getByRole("heading", { level: 2, name: "The row commits. The acknowledgement does not." }),
+  ).toBeVisible();
+
+  await page.getByRole("button", { name: "Minimize trace" }).click();
+  await expect(page.getByRole("list", { name: "Minimized counterexample" }).getByRole("listitem"))
+    .toHaveCount(5);
 });
