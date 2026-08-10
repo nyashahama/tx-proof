@@ -1,14 +1,14 @@
 # TxProof world-class marketing site execution plan
 
-Status: plan only — implementation has not started
+Status: implemented direction — Polar-aligned dark marketing experience
 
 Date: 2026-08-10
 
 ## 1. Objective
 
-Build a premium Next.js marketing site that makes TxProof understandable, credible, and memorable before the product engine is complete.
+Build a premium Next.js marketing site that makes TxProof understandable, credible, and memorable before the product engine is complete, using the pinned Polar landing experience as the UI/UX baseline and replacing its product story with TxProof content.
 
-The site must outperform Polar as a TxProof marketing experience by being:
+The site must preserve Polar's dark visual and interaction grammar while becoming a TxProof marketing experience through:
 
 1. More product-specific above the fold.
 2. More technically demonstrative instead of decorative.
@@ -25,7 +25,7 @@ Every release candidate is scored out of 100. It cannot ship below 90, and no ha
 | Dimension | Weight | Evidence |
 | --- | ---: | --- |
 | Product clarity and copy | 20 | Five-second comprehension review, claims audit, route-specific message hierarchy |
-| Original visual craft | 20 | Desktop/mobile screenshots, typography and spacing audit, no reference imitation |
+| Polar UI/UX fidelity | 20 | Side-by-side desktop/mobile screenshots, dark-surface, typography, spacing, panel, and interaction audit |
 | Product-specific interaction | 20 | Four-truth schedule and counterexample workbench explain real TxProof behavior |
 | Trust and evidence | 15 | Safety boundary, source register, honest limitations, no invented social proof |
 | Responsive accessibility | 15 | WCAG 2.2 AA, keyboard, reduced motion, 390 px reflow, Axe and manual checks |
@@ -49,7 +49,7 @@ The sources of truth, in order, are:
 3. Current primary vendor and standards documentation.
 4. The pinned Polar reference at `reference-projects/polar`.
 
-The reference is for structure and engineering study. TxProof will not copy Polar’s copy, brand, customer proof, product screenshots, page geometry, or animation choreography.
+The reference is an Apache-2.0 source and UI/UX baseline. TxProof may adapt Polar's layout, spacing, dark materials, panel geometry, responsive patterns, and interaction grammar. TxProof will not reuse Polar's name, marks, marketing copy, customer proof, photography, or product screenshots.
 
 ## 4. Technical architecture
 
@@ -120,7 +120,7 @@ TxProof should feel like a forensic financial instrument: calm, exact, adversari
 
 ### Visual material
 
-- Warm off-white “evidence paper” and near-black “instrument ink.”
+- A continuous near-black canvas with light type and raised charcoal panels, matching Polar's dark presentation.
 - Vermilion or signal orange only for contradiction, failure, and causal emphasis.
 - A restrained mineral green only for repaired or holding invariants.
 - Fine ledger rules, checkpoint ticks, hashes, event IDs, and SQL witnesses as functional texture.
@@ -204,8 +204,8 @@ Working content hierarchy:
 
 Desktop composition:
 
-- Editorial copy occupies the upper-left reading anchor rather than sitting in a generic centered stack.
-- The four truth planes form a full-width instrument under and partially beside the copy.
+- Copy uses Polar's centered, compact hero stack with restrained width and generous dark negative space.
+- The four truth planes form a full-width raised product proof beneath the hero copy.
 - Customer intent, Stripe, PostgreSQL, and business effect have distinct rows connected by causal events.
 - A lost response creates the first visible divergence; a later duplicate effect creates the invariant witness.
 - The terminal result is integrated as a proof label, not placed inside a fake terminal window.
@@ -559,6 +559,8 @@ Independent review checkpoints:
 - Full-page screenshots at four widths.
 - Copy/claims review.
 - Performance and accessibility baseline.
+
+The second visual pass follows Polar's current pacing without copying its identity: a quiet centered hero, three tall code-native product graphics, a separately framed live product demo, one long-form editorial reset, and a high-contrast conversion close. TxProof uses only its own claims, fixtures, routes, and graphics. Every compact evidence-rail claim links to the supporting product, method, safety, counterexample, or audit route, and modeled evidence is labeled as modeled rather than customer proof.
 
 ### Checkpoint D — supporting routes
 

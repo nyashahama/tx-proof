@@ -306,3 +306,103 @@
 .footerBottom {
   font-size: 10px;
 }
+
+/* Final shell material overrides stay last so desktop and mobile share the same theme. */
+.header {
+  border-bottom-color: rgb(255 255 255 / 7%);
+  background: color-mix(in srgb, var(--surface) 90%, transparent);
+}
+
+.headerInner {
+  min-height: 64px;
+}
+
+.brand,
+.desktopNav a {
+  color: var(--foreground);
+}
+
+.brand > span:last-child {
+  display: none;
+}
+
+.brandMark {
+  border-color: var(--foreground);
+}
+
+.brandMark i {
+  background: var(--foreground);
+}
+
+.desktopNav a:hover,
+.desktopNav a:focus-visible {
+  color: var(--foreground-muted);
+}
+
+.headerCta {
+  border-color: var(--foreground);
+  background: var(--foreground);
+  color: var(--surface);
+}
+
+.headerCta:hover {
+  border-color: #d8d8dc;
+  background: #d8d8dc;
+  color: var(--surface);
+}
+
+.footer {
+  border-top-color: rgb(255 255 255 / 8%);
+  background: var(--surface);
+  color: var(--foreground);
+}
+
+.footerTop {
+  border-bottom-color: rgb(255 255 255 / 8%);
+}
+
+.footerBrand p,
+.footerBottom,
+.footerLinks strong {
+  color: var(--foreground-muted);
+}
+
+.footerLogo {
+  border-color: var(--line-dark);
+  background: var(--surface-raised);
+}
+
+.footerLogo span {
+  background: var(--surface-raised);
+}
+
+.footerLinks a,
+.footerBottom strong {
+  color: var(--foreground);
+}
+
+@media (max-width: 900px) {
+  .mobileNav summary {
+    border-color: var(--line-light);
+  }
+
+  .mobileNav summary span {
+    background: var(--foreground);
+  }
+
+  .mobileNav nav {
+    border-color: var(--line-dark);
+    background: var(--surface-raised);
+    box-shadow: 0 24px 70px rgb(0 0 0 / 45%);
+  }
+
+  .mobileNav nav a {
+    border-bottom-color: var(--line-dark);
+    color: var(--foreground);
+  }
+
+  .mobileNav nav a:last-child {
+    background: var(--foreground);
+    color: var(--surface);
+  }
+}

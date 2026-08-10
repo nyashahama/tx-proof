@@ -35,7 +35,7 @@
       "name": "Polar",
       "source": "https://github.com/polarsource/polar",
       "license": "Apache-2.0",
-      "adoption": "Structural study only; no copy, brand, components, assets, or motion choreography reused."
+      "adoption": "Layout and interaction patterns adapted under Apache-2.0; no Polar copy, brand, marks, customer proof, screenshots, or product assets reused."
     },
     {
       "name": "Linear",

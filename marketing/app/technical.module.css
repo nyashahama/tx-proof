@@ -2130,3 +2130,430 @@
     background: transparent;
   }
 }
+
+/* Supporting routes inherit the same continuous Polar-aligned dark material. */
+.page,
+.hero,
+.heroDark,
+.counterHero,
+.auditHero,
+.darkSection,
+.traceSection {
+  border-color: rgb(255 255 255 / 8%);
+  background-color: var(--surface);
+  color: var(--foreground);
+}
+
+.hero {
+  background-image: none;
+}
+
+.hero::before {
+  background-image:
+    linear-gradient(rgb(255 255 255 / 3%) 1px, transparent 1px),
+    linear-gradient(90deg, rgb(255 255 255 / 3%) 1px, transparent 1px);
+}
+
+.heroCopy h1,
+.sectionHeading h2,
+.artifactCopy h3,
+.stageGrid h3,
+.decisionStatement strong,
+.lockCard > strong,
+.preflightTarget strong,
+.refusalGrid h3,
+.claimClasses h3,
+.qualificationGrid h3,
+.benchmarkGrid strong,
+.deliverableGrid strong,
+.auditTimeline h3,
+.intakeNote strong {
+  color: var(--foreground);
+}
+
+.heroCopy h1 {
+  font-family: var(--font-display), Arial, sans-serif;
+  font-size: clamp(3.5rem, 6.2vw, 5.8rem);
+  font-weight: 520;
+  line-height: 0.97;
+  letter-spacing: -0.06em;
+}
+
+.kicker,
+.heroDark .kicker,
+.heroCopy > p,
+.heroDark .heroCopy > p,
+.auditHero .heroCopy > p,
+.sectionHeading > span,
+.headingDark > span,
+.sectionHeading p,
+.headingDark p,
+.artifactCopy p,
+.artifactCopy li,
+.stageGrid p,
+.decisionStatement p,
+.lockCard > small,
+.lockCard > p,
+.lockCard > code,
+.preflightTarget small,
+.gateList span,
+.gateList code,
+.refusalGrid p,
+.claimClasses p,
+.qualificationGrid p,
+.sourceLedger article small,
+.sourceLedger article > p,
+.researchNote,
+.intakeNote,
+.benchmarkGrid small,
+.deliverableGrid small,
+.auditTimeline p {
+  color: var(--foreground-muted);
+}
+
+.heroCopy > p,
+.heroDark .heroCopy > p,
+.auditHero .heroCopy > p {
+  border-left-color: var(--accent);
+}
+
+.heroDark .heroLinks :global(.button-primary) {
+  border-color: var(--foreground);
+  background: var(--foreground);
+  color: var(--surface);
+}
+
+.commandCard,
+.scheduleCard,
+.claimCard,
+.scopeReceipt,
+.fingerprintCard,
+.caseStamp {
+  border-color: var(--line-dark);
+  border-radius: 0;
+  background: var(--surface-raised);
+  color: var(--foreground);
+  box-shadow: none;
+  transform: none;
+}
+
+.commandCard dd,
+.claimCard dd,
+.scopeReceipt dd,
+.caseStamp dd,
+.claimCard blockquote,
+.cardBar code,
+.scopeReceipt .cardBar code {
+  color: var(--foreground);
+}
+
+.cardBar,
+.commandCard dl > div,
+.claimCard dl > div,
+.scopeReceipt dl > div,
+.caseStamp dl > div,
+.scopeReceipt .cardBar {
+  border-color: var(--line-dark);
+}
+
+.commandPrompt,
+.commandResult,
+.scheduleDecision {
+  background: var(--surface);
+}
+
+.commandResult,
+.scheduleDecision {
+  border-top: 2px solid var(--failure);
+  color: var(--foreground);
+}
+
+.sectionHeading {
+  grid-template-columns: 150px minmax(0, 1fr) minmax(260px, 0.7fr);
+  gap: clamp(30px, 5vw, 72px);
+}
+
+.sectionHeading h2 {
+  font-family: var(--font-display), Arial, sans-serif;
+  font-size: clamp(2.6rem, 4.6vw, 4.6rem);
+  font-weight: 520;
+  line-height: 0.98;
+  letter-spacing: -0.055em;
+}
+
+.systemNode,
+.stageGrid article,
+.decisionStatement,
+.shrinkSteps li,
+.lockCard,
+.preflightCard,
+.refusalGrid article,
+.claimClasses article,
+.qualificationGrid article,
+.benchmarkGrid > div,
+.deliverableGrid > div,
+.auditTimeline li,
+.shrinkHistory > div,
+.oracleSplit > div,
+.repairCompare > div,
+.scopeReceipt {
+  border-color: var(--line-dark);
+  background: var(--surface-raised);
+  color: var(--foreground);
+}
+
+.nodeAccent,
+.decisionStatement,
+.researchNote,
+.intakeNote {
+  border-color: var(--line-light);
+}
+
+.factStrip,
+.stageGrid,
+.shrinkSteps,
+.sourceLedger,
+.benchmarkGrid,
+.deliverableGrid,
+.auditTimeline {
+  gap: 2px;
+  border: 0;
+}
+
+.factStrip > div,
+.stageGrid article,
+.shrinkSteps li,
+.sourceLedger article,
+.ledgerHeader,
+.benchmarkGrid > div,
+.deliverableGrid > div,
+.auditTimeline li {
+  border: 0;
+  background: var(--surface-raised);
+}
+
+.factStrip > div + div,
+.sourceLedger article,
+.ledgerHeader {
+  border-left: 1px solid var(--line-dark);
+}
+
+.invariantList,
+.invariantList article,
+.controlMatrix,
+.controlMatrix > div:first-child,
+.preflightTarget,
+.gateList > div,
+.refusalGrid,
+.claimClasses,
+.qualificationGrid,
+.oracleSplit,
+.oracleSplit > div:first-child,
+.oracleSplit th,
+.oracleSplit td,
+.repairCompare,
+.beforeRepair {
+  border-color: var(--line-dark);
+}
+
+.systemNode > span,
+.systemNode > small,
+.factStrip span,
+.invariantList article > span,
+.invariantList article > p,
+.scheduleRows span,
+.scheduleRows code,
+.shrinkSteps small,
+.sourceLedger,
+.ledgerHeader,
+.sourceLedger article > p,
+.sourceLedger article small,
+.sourceLedger article > a,
+.benchmarkGrid small,
+.deliverableGrid small,
+.auditTimeline p,
+.repairCompare span,
+.repairCompare small,
+.scopeReceipt dt,
+.scopeReceipt .cardBar,
+.scopeReceipt > p {
+  color: var(--foreground-muted);
+}
+
+.invariantList article > code,
+.sourceLedger article > a,
+.shrinkHistory strong,
+.repairCompare strong,
+.scopeReceipt dd {
+  color: var(--foreground);
+}
+
+.boundaryCallout {
+  border-color: var(--line-light);
+  color: var(--foreground-muted);
+}
+
+.fingerprintCard {
+  background: var(--surface-raised);
+}
+
+.hashLine,
+.finalShrink,
+.safeResult {
+  background: var(--foreground);
+  color: var(--surface);
+}
+
+.routeCta {
+  border-top: 1px solid var(--line-dark);
+  background: var(--surface);
+}
+
+.routeCta div > span,
+.routeCta h2 {
+  color: var(--foreground);
+}
+
+.stageGrid article > span,
+.shrinkSteps li > span,
+.benchmarkGrid span,
+.deliverableGrid span,
+.auditTimeline li > span,
+.intakeNote > span {
+  color: var(--foreground-muted);
+}
+
+.controlMatrix > div:first-child,
+.controlMatrix > div:last-child {
+  background: var(--surface-raised);
+}
+
+.shrinkSteps li:not(:last-child)::after {
+  background: var(--surface-raised);
+}
+
+.lockCard,
+.preflightCard {
+  box-shadow: none;
+}
+
+.lockIcon {
+  box-shadow: 0 0 0 14px var(--surface-soft);
+}
+
+.gateList em,
+.localCircle > small,
+.sourceLedger article > span,
+.afterRepair code {
+  color: #b9b9c0;
+}
+
+.localCircle,
+.externalCircle {
+  border-color: var(--line-light);
+  background: var(--surface-raised);
+}
+
+.externalCircle,
+.blockedArrow,
+.sourceLedger article > code,
+.sourceLedger article > a:hover strong,
+.repairCompare code {
+  color: var(--failure-light);
+}
+
+.sourceLedger article {
+  border-bottom: 2px solid var(--surface);
+}
+
+.statusPrimary {
+  color: var(--foreground);
+}
+
+.caseStamp {
+  border-top: 2px solid var(--failure);
+}
+
+.traceSection {
+  padding: 64px 0;
+}
+
+.oracleSplit > div:first-child,
+.afterRepair,
+.scopeReceipt > p {
+  background: var(--surface-raised);
+  color: var(--foreground);
+}
+
+.oracleSplit tbody,
+.beforeRepair {
+  background: rgb(180 35 24 / 11%);
+  color: var(--failure-light);
+}
+
+.repairCompare {
+  gap: 2px;
+  border: 0;
+}
+
+.scopeReceipt dl > div {
+  border-color: var(--line-dark);
+}
+
+@media (max-width: 1000px) {
+  .sectionHeading {
+    grid-template-columns: 130px 1fr;
+  }
+}
+
+@media (max-width: 780px) {
+  .heroCopy h1 {
+    font-size: clamp(3.4rem, 11vw, 5.2rem);
+  }
+}
+
+@media (max-width: 600px) {
+  .heroCopy h1 {
+    font-size: clamp(3rem, 14vw, 4.15rem);
+    line-height: 0.98;
+  }
+
+  .sectionHeading h2 {
+    font-size: clamp(2.35rem, 11vw, 3.45rem);
+  }
+}
+
+@media (max-width: 600px) {
+  .sectionHeading {
+    grid-template-columns: 1fr;
+    gap: 20px;
+  }
+
+  .sectionHeading p {
+    grid-column: 1;
+  }
+}
+
+.oracleSplit > div > span,
+.oracleSplit p {
+  color: var(--foreground-muted);
+}
+
+.externalCircle > small {
+  color: var(--failure-light);
+}
+
+.researchNote,
+.intakeNote {
+  border-color: var(--line-dark);
+  background: var(--surface-raised);
+  color: var(--foreground-muted);
+}
+
+.intakeNote > span {
+  color: var(--foreground-muted);
+}
+
+.intakeNote strong {
+  color: var(--foreground);
+}

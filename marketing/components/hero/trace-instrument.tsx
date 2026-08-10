@@ -1,6 +1,6 @@
 "use client";
 
-import { useId, useState } from "react";
+import { useEffect, useId, useState } from "react";
 
 import {
   getScenario,
@@ -12,6 +12,16 @@ import {
 
 import styles from "./trace-instrument.module.css";
 
+const compactTraceQuery = "(max-width: 680px)";
+
+function shouldCompactTrace() {
+  return (
+    typeof window !== "undefined" &&
+    typeof window.matchMedia === "function" &&
+    window.matchMedia(compactTraceQuery).matches
+  );
+}
+
 export function TraceInstrument() {
   const [activeId, setActiveId] = useState<ScenarioId>("lost-response");
   const [isMinimized, setIsMinimized] = useState(false);
@@ -19,9 +29,20 @@ export function TraceInstrument() {
   const activeScenario = getScenario(activeId);
   const minimized = minimizeScenario(activeScenario);
 
+  useEffect(() => {
+    if (typeof window.matchMedia !== "function") return;
+
+    const viewport = window.matchMedia(compactTraceQuery);
+    const syncDensity = () => setIsMinimized(viewport.matches);
+
+    syncDensity();
+    viewport.addEventListener("change", syncDensity);
+    return () => viewport.removeEventListener("change", syncDensity);
+  }, []);
+
   function selectScenario(id: ScenarioId) {
     setActiveId(id);
-    setIsMinimized(false);
+    setIsMinimized(shouldCompactTrace());
   }
 
   function moveTab(currentIndex: number, direction: -1 | 1) {
