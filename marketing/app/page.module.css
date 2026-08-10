@@ -1,0 +1,1910 @@
+.hero {
+  position: relative;
+  overflow: hidden;
+  border-bottom: 1px solid var(--line-paper);
+  background-color: var(--paper);
+  background-image: radial-gradient(
+    circle at 70% 17%,
+    rgb(16 17 18 / 5%),
+    transparent 26%
+  );
+}
+
+.heroGrid {
+  position: absolute;
+  inset: 0;
+  background-image:
+    linear-gradient(var(--line-paper) 1px, transparent 1px),
+    linear-gradient(90deg, var(--line-paper) 1px, transparent 1px);
+  background-size: 80px 80px;
+  mask-image: linear-gradient(to bottom, black, transparent 64%);
+  opacity: 0.45;
+  pointer-events: none;
+}
+
+.heroInner {
+  position: relative;
+  z-index: 1;
+  padding: clamp(72px, 8vw, 118px) 0 clamp(58px, 7vw, 98px);
+}
+
+.heroCopy {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0 48px;
+  align-items: end;
+}
+
+.heroEyebrow {
+  display: flex;
+  grid-column: 1 / -1;
+  align-items: center;
+  gap: 16px;
+  margin-bottom: 30px;
+  color: var(--muted);
+  font: 650 9px/1 var(--font-mono), monospace;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.heroEyebrow span:first-child {
+  border: 1px solid var(--line-strong);
+  padding: 7px 9px;
+  color: var(--ink);
+}
+
+.heroCopy h1 {
+  grid-column: 1 / -1;
+  max-width: 1180px;
+  margin: 0;
+  font: 470 clamp(3.7rem, 7.6vw, 7.5rem)/0.85 var(--font-display), serif;
+  letter-spacing: -0.065em;
+  text-wrap: balance;
+}
+
+.heroCopy h1 em {
+  color: var(--danger);
+  font-weight: 420;
+}
+
+.heroSupportRow {
+  display: contents;
+}
+
+.heroSupport {
+  max-width: 590px;
+  margin: 36px 0 0;
+  padding-left: 25px;
+  border-left: 2px solid var(--danger);
+  color: #383c37;
+  font-size: clamp(0.96rem, 1.3vw, 1.12rem);
+  line-height: 1.65;
+}
+
+.heroActions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 9px;
+  align-self: end;
+  justify-content: flex-end;
+  margin-top: 36px;
+}
+
+.qualifier {
+  display: flex;
+  grid-column: 1 / -1;
+  align-items: center;
+  gap: 8px;
+  margin: 30px 0 0;
+  color: var(--muted);
+  font: 560 9px/1 var(--font-mono), monospace;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.qualifier span {
+  color: var(--danger);
+  font-size: 13px;
+}
+
+.instrumentWrap {
+  position: relative;
+  margin-top: 42px;
+}
+
+.instrumentWrap::before,
+.instrumentWrap::after {
+  position: absolute;
+  z-index: 2;
+  width: 18px;
+  height: 18px;
+  border-color: var(--paper);
+  content: "";
+  pointer-events: none;
+}
+
+.instrumentWrap::before {
+  top: 9px;
+  left: 9px;
+  border-top: 1px solid;
+  border-left: 1px solid;
+}
+
+.instrumentWrap::after {
+  right: 9px;
+  bottom: 9px;
+  border-right: 1px solid;
+  border-bottom: 1px solid;
+}
+
+.evidenceRail {
+  border-bottom: 1px solid var(--line-paper);
+  background: var(--paper-bright);
+}
+
+.evidenceRail > div {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+}
+
+.evidenceItem {
+  min-height: 100px;
+  border-right: 1px solid var(--line-paper);
+  padding: 25px 20px;
+}
+
+.evidenceItem:first-child {
+  border-left: 1px solid var(--line-paper);
+}
+
+.evidenceItem span,
+.evidenceItem strong {
+  display: block;
+}
+
+.evidenceItem span {
+  margin-bottom: 12px;
+  color: var(--muted);
+  font: 600 8px/1 var(--font-mono), monospace;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.evidenceItem strong {
+  font-size: 11px;
+  line-height: 1.35;
+}
+
+.evidenceLink {
+  color: var(--ink);
+  text-decoration: none;
+}
+
+.evidenceLink:hover {
+  background: var(--paper-deep);
+}
+
+.truthSection,
+.faultSection,
+.safetySection {
+  background: var(--paper-bright);
+}
+
+.sectionHeader {
+  display: grid;
+  grid-template-columns: 220px minmax(0, 1fr);
+  gap: 40px;
+  margin-bottom: clamp(55px, 7vw, 94px);
+}
+
+.sectionHeader > div {
+  display: grid;
+  grid-template-columns: minmax(0, 2fr) minmax(260px, 0.8fr);
+  gap: 48px;
+  align-items: end;
+}
+
+.sectionHeader h2,
+.compactHeader h2,
+.boundaryLead h2,
+.auditCopy h2 {
+  margin: 0;
+  font: 470 clamp(2.7rem, 5vw, 5.2rem)/0.94 var(--font-display), serif;
+  letter-spacing: -0.055em;
+  text-wrap: balance;
+}
+
+.sectionHeader > div > p,
+.compactHeader > p,
+.boundaryLead > p,
+.auditCopy > p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.7;
+}
+
+.truthMap {
+  position: relative;
+  display: grid;
+  place-items: center;
+}
+
+.truthCore {
+  position: absolute;
+  z-index: 2;
+  display: grid;
+  width: 210px;
+  height: 210px;
+  place-content: center;
+  border: 1px solid var(--line-strong);
+  border-radius: 50%;
+  background: var(--paper-bright);
+  text-align: center;
+  box-shadow: 0 0 0 18px var(--paper-bright), 0 0 0 19px var(--line-paper);
+}
+
+.truthCore span,
+.truthCore small {
+  font: 550 8px/1 var(--font-mono), monospace;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.truthCore span {
+  color: var(--muted);
+}
+
+.truthCore strong {
+  margin: 14px 0;
+  font: 500 2.4rem/1 var(--font-display), serif;
+}
+
+.truthCore small {
+  color: var(--danger-dark);
+}
+
+.truthCore i {
+  position: absolute;
+  bottom: 18px;
+  left: calc(50% - 3px);
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--ink-muted);
+  box-shadow: 0 0 0 5px rgb(255 255 255 / 8%);
+}
+
+.truthCards {
+  display: grid;
+  width: 100%;
+  grid-template-columns: repeat(2, 1fr);
+  border-top: 1px solid var(--line-paper);
+  border-left: 1px solid var(--line-paper);
+}
+
+.truthCard {
+  min-height: 300px;
+  border-right: 1px solid var(--line-paper);
+  border-bottom: 1px solid var(--line-paper);
+  padding: 30px;
+}
+
+.truthCard:nth-child(even) {
+  padding-left: max(30px, 22%);
+}
+
+.truthCard:nth-child(odd) {
+  padding-right: max(30px, 22%);
+}
+
+.truthCardTop {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 48px;
+  color: var(--muted);
+  font: 550 9px/1 var(--font-mono), monospace;
+}
+
+.truthCardTop code {
+  border: 1px solid var(--line-paper);
+  padding: 6px 8px;
+  color: var(--ink);
+  font: inherit;
+}
+
+.truthCard h3 {
+  margin: 0 0 10px;
+  font: 500 1.7rem/1 var(--font-display), serif;
+  letter-spacing: -0.03em;
+}
+
+.truthCard > strong {
+  display: block;
+  margin-bottom: 17px;
+  color: var(--danger-dark);
+  font: 650 9px/1 var(--font-mono), monospace;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.truthCard p {
+  max-width: 380px;
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.contradictionNote {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  gap: 20px;
+  align-items: center;
+  margin-top: 22px;
+  border: 1px solid var(--danger);
+  padding: 18px;
+  background: rgb(180 35 24 / 7%);
+}
+
+.noteGlyph {
+  display: grid;
+  width: 34px;
+  height: 34px;
+  place-items: center;
+  border-radius: 50%;
+  background: var(--danger);
+  color: var(--danger-ink);
+}
+
+.contradictionNote p {
+  margin: 0;
+  font-size: 11px;
+  line-height: 1.55;
+}
+
+.contradictionNote a {
+  color: var(--ink);
+  font-size: 10px;
+  font-weight: 700;
+  text-decoration: none;
+}
+
+.methodSection,
+.artifactSection,
+.boundarySection {
+  background: var(--ink);
+  color: var(--paper);
+}
+
+.sectionHeaderLight > div > p {
+  color: var(--ink-subtle);
+}
+
+.methodRail {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  border-top: 1px solid var(--line-light);
+  border-left: 1px solid var(--line-light);
+}
+
+.methodRail article {
+  position: relative;
+  min-height: 470px;
+  border-right: 1px solid var(--line-light);
+  border-bottom: 1px solid var(--line-light);
+  padding: 28px;
+}
+
+.methodNumber {
+  color: var(--ink-muted);
+  font: 600 9px/1 var(--font-mono), monospace;
+}
+
+.methodGlyph {
+  display: flex;
+  height: 150px;
+  align-items: center;
+  justify-content: center;
+  gap: 22px;
+  margin: 38px 0 44px;
+  border: 1px solid var(--line-dark);
+  background-image: linear-gradient(var(--grid-line) 1px, transparent 1px), linear-gradient(90deg, var(--grid-line) 1px, transparent 1px);
+  background-size: 18px 18px;
+  font: 600 10px/1 var(--font-mono), monospace;
+}
+
+.methodGlyph span:first-child {
+  color: var(--ink-muted);
+}
+
+.methodGlyph span:last-child {
+  border: 1px solid var(--proof-dark);
+  padding: 10px;
+  color: var(--proof);
+}
+
+.scheduleGlyph span {
+  width: 9px;
+  height: 9px;
+  border: 1px solid var(--paper);
+  border-radius: 50%;
+  background: var(--paper);
+}
+
+.scheduleGlyph span:nth-child(3),
+.scheduleGlyph span:nth-child(5) {
+  border-color: var(--danger);
+  background: var(--danger);
+  box-shadow: 0 0 0 6px var(--danger-glow);
+}
+
+.scheduleGlyph::before {
+  position: absolute;
+  width: 58%;
+  height: 1px;
+  background: var(--line-light);
+  content: "";
+}
+
+.shrinkGlyph span:first-child,
+.shrinkGlyph span:last-child {
+  display: grid;
+  width: 55px;
+  height: 55px;
+  place-items: center;
+  border: 1px solid var(--line-light);
+  color: var(--paper);
+  font-size: 17px;
+}
+
+.shrinkGlyph span:last-child {
+  border-color: var(--proof-dark);
+  color: var(--proof);
+}
+
+.shrinkGlyph i {
+  color: var(--ink-muted);
+  font-style: normal;
+}
+
+.methodRail h3 {
+  margin: 0 0 14px;
+  font: 480 2.2rem/1 var(--font-display), serif;
+}
+
+.methodRail p {
+  min-height: 80px;
+  margin: 0 0 25px;
+  color: var(--ink-subtle);
+  font-size: 12px;
+  line-height: 1.65;
+}
+
+.methodRail > article > code {
+  color: var(--proof);
+  font: 500 9px/1 var(--font-mono), monospace;
+}
+
+.methodFooter {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 30px;
+  padding: 24px 0 0;
+  color: var(--ink-muted);
+  font: 500 9px/1.4 var(--font-mono), monospace;
+}
+
+.methodFooter a {
+  color: var(--paper);
+  font-weight: 650;
+  text-decoration: none;
+}
+
+.compactHeader {
+  display: grid;
+  grid-template-columns: 1.2fr 0.6fr;
+  gap: 60px;
+  align-items: end;
+  margin-bottom: 64px;
+}
+
+.compactHeader h2 {
+  margin-top: 24px;
+}
+
+.faultTable {
+  border-top: 1px solid var(--line-strong);
+}
+
+.faultHeader,
+.faultRow {
+  display: grid;
+  grid-template-columns: 38px 1fr 1.1fr 1.2fr;
+  align-items: center;
+  border-right: 1px solid var(--line-paper);
+  border-bottom: 1px solid var(--line-paper);
+  border-left: 1px solid var(--line-paper);
+}
+
+.faultHeader {
+  grid-template-columns: 38px 1fr 1.1fr 1.2fr;
+  min-height: 44px;
+  color: var(--muted);
+  font: 600 8px/1 var(--font-mono), monospace;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.faultHeader span:first-child {
+  grid-column: 2;
+}
+
+.faultRow {
+  min-height: 86px;
+  transition: background-color 160ms ease;
+}
+
+.faultRow:hover {
+  background: var(--paper);
+}
+
+.faultHeader span,
+.faultRow > * {
+  padding: 0 22px;
+}
+
+.faultIndex {
+  align-self: stretch;
+  display: grid;
+  place-items: center;
+  border-right: 1px solid var(--line-paper);
+  color: var(--muted);
+  font: 500 8px/1 var(--font-mono), monospace;
+}
+
+.faultRow strong {
+  font: 500 1.3rem/1.2 var(--font-display), serif;
+}
+
+.faultRow code {
+  color: var(--danger-dark);
+  font: 560 10px/1.4 var(--font-mono), monospace;
+}
+
+.faultRow > span:last-child {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.artifactWorkbench {
+  display: grid;
+  grid-template-columns: minmax(260px, 0.75fr) minmax(420px, 1.4fr);
+  border: 1px solid var(--line-light);
+  box-shadow: 0 45px 120px rgb(0 0 0 / 30%);
+}
+
+.fileTree {
+  border-right: 1px solid var(--line-dark);
+}
+
+.panelLabel {
+  display: flex;
+  min-height: 45px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 15px;
+  border-bottom: 1px solid var(--line-dark);
+  padding: 0 16px;
+  color: var(--ink-muted);
+  font: 600 8px/1 var(--font-mono), monospace;
+  letter-spacing: 0.1em;
+}
+
+.panelLabel code {
+  color: var(--ink-subtle);
+  font: inherit;
+  letter-spacing: 0;
+}
+
+.fileTree ul {
+  margin: 0;
+  padding: 12px 0;
+  list-style: none;
+}
+
+.fileTree li {
+  display: grid;
+  min-height: 52px;
+  grid-template-columns: 24px 1fr;
+  align-items: center;
+  padding: 0 16px;
+  color: var(--ink-subtle);
+}
+
+.fileTree li > span {
+  grid-row: 1 / 3;
+  color: var(--ink-muted);
+  font: 500 11px/1 var(--font-mono), monospace;
+}
+
+.fileTree li strong,
+.fileTree li small {
+  display: block;
+}
+
+.fileTree li strong {
+  font: 500 9px/1.35 var(--font-mono), monospace;
+}
+
+.fileTree li small {
+  color: var(--ink-muted);
+  font-size: 8px;
+}
+
+.fileTree .selectedFile {
+  border-left: 2px solid var(--proof);
+  background: var(--ink-elevated);
+  color: var(--paper);
+}
+
+.artifactDetail {
+  min-width: 0;
+}
+
+.codeLines {
+  padding: 24px 0;
+}
+
+.codeLines > div {
+  display: grid;
+  min-height: 49px;
+  grid-template-columns: 52px minmax(220px, 0.9fr) 1fr;
+  align-items: center;
+  border-bottom: 1px solid var(--line-dark);
+  padding: 0 18px;
+}
+
+.codeLines > div > span,
+.codeLines code,
+.codeLines small {
+  font-family: var(--font-mono), monospace;
+}
+
+.codeLines > div > span {
+  color: var(--ink-muted);
+  font-size: 8px;
+}
+
+.codeLines code {
+  color: var(--paper);
+  font-size: 10px;
+}
+
+.codeLines small {
+  color: var(--ink-muted);
+  font-size: 8px;
+  text-align: right;
+}
+
+.codeLines .failedLine {
+  border-left: 2px solid var(--danger);
+  background: rgb(180 35 24 / 8%);
+}
+
+.codeLines .failedLine code,
+.codeLines .failedLine small {
+  color: var(--danger-light);
+}
+
+.replayCommand {
+  display: grid;
+  min-height: 62px;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+  margin: 0 18px 22px;
+  border: 1px solid var(--line-light);
+  padding-left: 14px;
+  background: #0a0c0a;
+}
+
+.replayCommand > span {
+  color: var(--proof);
+}
+
+.replayCommand code {
+  overflow: hidden;
+  color: var(--paper);
+  font: 500 9px/1.4 var(--font-mono), monospace;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.commandTag {
+  display: grid;
+  align-self: stretch;
+  border-left: 1px solid var(--line-light);
+  place-items: center;
+  padding: 0 16px;
+  color: var(--ink-muted);
+  font: 600 8px/1 var(--font-mono), monospace;
+}
+
+.exitPanel {
+  display: grid;
+  grid-column: 1 / -1;
+  grid-template-columns: auto 1fr auto;
+  align-items: center;
+  gap: 18px;
+  border-top: 1px solid var(--danger);
+  padding: 18px;
+  background: var(--danger);
+  color: var(--danger-ink);
+}
+
+.exitCode {
+  display: grid;
+  width: 48px;
+  height: 48px;
+  place-items: center;
+  border: 1px solid var(--danger-ink);
+  font: 600 17px/1 var(--font-mono), monospace;
+}
+
+.exitPanel small,
+.exitPanel strong {
+  display: block;
+}
+
+.exitPanel small {
+  margin-bottom: 5px;
+  font: 700 8px/1 var(--font-mono), monospace;
+  letter-spacing: 0.1em;
+}
+
+.exitPanel strong {
+  font-size: 12px;
+}
+
+.exitStatus {
+  font: 700 9px/1 var(--font-mono), monospace;
+  letter-spacing: 0.08em;
+}
+
+.safetyGrid {
+  display: grid;
+  grid-template-columns: 1.15fr 0.85fr;
+  gap: clamp(50px, 8vw, 110px);
+  align-items: center;
+}
+
+.identityCard {
+  border: 1px solid var(--line-strong);
+  background: var(--paper);
+  box-shadow: 20px 20px 0 var(--paper-deep);
+}
+
+.identityHeader,
+.receiptTop {
+  display: flex;
+  min-height: 42px;
+  align-items: center;
+  justify-content: space-between;
+  border-bottom: 1px solid var(--line-paper);
+  padding: 0 16px;
+  font: 600 8px/1 var(--font-mono), monospace;
+  letter-spacing: 0.08em;
+}
+
+.identityHeader strong {
+  color: var(--danger-dark);
+  text-transform: uppercase;
+}
+
+.identityTarget {
+  display: grid;
+  min-height: 90px;
+  grid-template-columns: auto 1fr auto;
+  align-items: center;
+  gap: 15px;
+  border-bottom: 1px solid var(--line-paper);
+  padding: 0 18px;
+}
+
+.dbGlyph {
+  display: grid;
+  width: 42px;
+  height: 42px;
+  place-items: center;
+  border-radius: 50%;
+  background: var(--ink);
+  color: var(--paper);
+}
+
+.identityTarget small,
+.identityTarget strong {
+  display: block;
+}
+
+.identityTarget small {
+  margin-bottom: 5px;
+  color: var(--muted);
+  font: 600 7px/1 var(--font-mono), monospace;
+}
+
+.identityTarget strong {
+  font: 550 13px/1 var(--font-mono), monospace;
+}
+
+.identityTarget > code {
+  font: 500 8px/1 var(--font-mono), monospace;
+}
+
+.identityCard ul {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.identityCard li {
+  display: grid;
+  min-height: 68px;
+  grid-template-columns: 24px 1fr auto;
+  align-items: center;
+  gap: 10px;
+  border-bottom: 1px solid var(--line-paper);
+  padding: 0 18px;
+}
+
+.identityCard li > span {
+  display: grid;
+  width: 19px;
+  height: 19px;
+  place-items: center;
+  border-radius: 50%;
+  background: var(--proof-dark);
+  color: var(--paper);
+  font-size: 9px;
+}
+
+.identityCard li strong,
+.identityCard li small {
+  display: block;
+}
+
+.identityCard li strong {
+  margin-bottom: 4px;
+  font-size: 10px;
+}
+
+.identityCard li small {
+  color: var(--muted);
+  font-size: 8px;
+}
+
+.identityCard li code {
+  color: var(--proof-dark);
+  font: 700 8px/1 var(--font-mono), monospace;
+}
+
+.mutationState {
+  padding: 17px 18px;
+  background: var(--proof);
+  color: var(--ink);
+}
+
+.mutationState span,
+.mutationState strong {
+  display: block;
+}
+
+.mutationState span {
+  margin-bottom: 6px;
+  font: 700 8px/1 var(--font-mono), monospace;
+  letter-spacing: 0.1em;
+}
+
+.mutationState strong {
+  font-size: 11px;
+}
+
+.bigStatement {
+  margin: 0 0 44px;
+  font: 470 clamp(2.2rem, 4vw, 4rem)/0.98 var(--font-display), serif;
+  letter-spacing: -0.045em;
+}
+
+.bigStatement em {
+  color: var(--danger-dark);
+}
+
+.safetyRules {
+  margin-bottom: 36px;
+  border-top: 1px solid var(--line-paper);
+}
+
+.safetyRules > div {
+  display: grid;
+  grid-template-columns: 35px 1fr;
+  gap: 12px;
+  border-bottom: 1px solid var(--line-paper);
+  padding: 17px 0;
+}
+
+.safetyRules span {
+  color: var(--muted);
+  font: 600 8px/1.6 var(--font-mono), monospace;
+}
+
+.safetyRules p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.6;
+}
+
+.safetyRules strong {
+  color: var(--ink);
+}
+
+.boundarySection > div {
+  display: grid;
+  grid-template-columns: 0.72fr 1.28fr;
+  gap: clamp(60px, 9vw, 130px);
+  align-items: start;
+}
+
+.boundaryLead {
+  position: sticky;
+  top: 110px;
+}
+
+.boundaryLead h2 {
+  margin: 25px 0 27px;
+}
+
+.boundaryLead > p {
+  margin-bottom: 34px;
+  color: var(--ink-subtle);
+}
+
+.notList {
+  border-top: 1px solid var(--line-light);
+}
+
+.notList > div {
+  display: grid;
+  min-height: 106px;
+  grid-template-columns: 55px minmax(180px, 0.85fr) 1fr;
+  align-items: center;
+  gap: 18px;
+  border-bottom: 1px solid var(--line-dark);
+}
+
+.notList > div > span {
+  color: var(--danger-light);
+  font: 700 8px/1 var(--font-mono), monospace;
+  letter-spacing: 0.1em;
+}
+
+.notList strong {
+  font: 480 1.45rem/1.1 var(--font-display), serif;
+}
+
+.notList small {
+  color: var(--ink-muted);
+  font-size: 10px;
+  line-height: 1.5;
+}
+
+.notList .isItem {
+  margin-top: 18px;
+  border: 1px solid var(--proof-dark);
+  padding: 0 18px;
+  background: rgb(255 255 255 / 4%);
+}
+
+.notList .isItem > span,
+.notList .isItem small {
+  color: var(--proof);
+}
+
+.auditSection {
+  position: relative;
+  overflow: hidden;
+  padding: clamp(90px, 11vw, 160px) 0;
+  background: var(--danger);
+}
+
+.auditSection::before {
+  position: absolute;
+  inset: 0;
+  background-image: linear-gradient(rgb(16 17 18 / 4%) 1px, transparent 1px), linear-gradient(90deg, rgb(16 17 18 / 4%) 1px, transparent 1px);
+  background-size: 44px 44px;
+  content: "";
+}
+
+.auditFrame {
+  position: relative;
+  display: grid;
+  grid-template-columns: 1.1fr 0.9fr;
+  gap: clamp(50px, 8vw, 110px);
+  align-items: center;
+}
+
+.auditCopy h2 {
+  max-width: 720px;
+  margin: 27px 0 30px;
+}
+
+.auditCopy > p {
+  max-width: 630px;
+  color: var(--danger-ink);
+}
+
+.auditActions {
+  display: flex;
+  align-items: center;
+  gap: 24px;
+  margin-top: 38px;
+}
+
+.auditActions > span {
+  max-width: 160px;
+  color: var(--danger-ink);
+  font: 650 8px/1.5 var(--font-mono), monospace;
+  text-transform: uppercase;
+}
+
+.auditReceipt {
+  border: 1px solid var(--danger-ink);
+  background: var(--paper-bright);
+  color: var(--ink);
+  box-shadow: 0 24px 70px rgb(0 0 0 / 9%);
+  transform: rotate(1deg);
+}
+
+.receiptTop code {
+  padding: 5px 7px;
+  background: var(--ink);
+  color: var(--paper);
+  font: inherit;
+}
+
+.auditReceipt ol {
+  margin: 0;
+  padding: 12px 0;
+  list-style: none;
+}
+
+.auditReceipt li {
+  display: grid;
+  min-height: 72px;
+  grid-template-columns: 42px 1fr;
+  align-items: center;
+  border-bottom: 1px dashed var(--line-strong);
+  padding: 0 18px;
+}
+
+.auditReceipt li:last-child {
+  border-bottom: 0;
+}
+
+.auditReceipt li > span {
+  color: var(--muted);
+  font: 600 9px/1 var(--font-mono), monospace;
+}
+
+.auditReceipt li strong,
+.auditReceipt li small {
+  display: block;
+}
+
+.auditReceipt li strong {
+  margin-bottom: 5px;
+  font-size: 11px;
+}
+
+.auditReceipt li small {
+  color: var(--muted);
+  font: 500 8px/1.3 var(--font-mono), monospace;
+}
+
+.receiptBottom {
+  padding: 18px;
+  border-top: 1px solid var(--ink);
+  background: var(--ink);
+  color: var(--paper);
+}
+
+.receiptBottom span,
+.receiptBottom strong {
+  display: block;
+}
+
+.receiptBottom span {
+  margin-bottom: 7px;
+  color: var(--ink-muted);
+  font: 600 8px/1 var(--font-mono), monospace;
+  letter-spacing: 0.1em;
+}
+
+.receiptBottom strong {
+  font-size: 11px;
+}
+
+@media (max-width: 1000px) {
+  .heroCopy h1 {
+    font-size: clamp(3.5rem, 9vw, 6.3rem);
+  }
+
+  .sectionHeader {
+    grid-template-columns: 150px 1fr;
+  }
+
+  .sectionHeader > div {
+    grid-template-columns: 1fr;
+  }
+
+  .methodRail article {
+    min-height: 450px;
+  }
+
+  .artifactWorkbench {
+    grid-template-columns: 0.8fr 1.2fr;
+  }
+
+  .safetyGrid,
+  .auditFrame {
+    gap: 50px;
+  }
+
+  .boundarySection > div {
+    grid-template-columns: 0.8fr 1.2fr;
+    gap: 60px;
+  }
+}
+
+@media (max-width: 800px) {
+  .heroCopy {
+    display: block;
+  }
+
+  .heroCopy h1 {
+    font-size: clamp(3.5rem, 12vw, 6.2rem);
+  }
+
+  .heroSupport {
+    max-width: 620px;
+  }
+
+  .heroActions {
+    justify-content: flex-start;
+  }
+
+  .evidenceRail > div {
+    grid-template-columns: repeat(2, 1fr);
+  }
+
+  .evidenceItem:nth-child(5) {
+    grid-column: 1 / -1;
+  }
+
+  .sectionHeader,
+  .compactHeader {
+    grid-template-columns: 1fr;
+    gap: 24px;
+  }
+
+  .truthCore {
+    display: none;
+  }
+
+  .truthCard:nth-child(even),
+  .truthCard:nth-child(odd) {
+    padding: 25px;
+  }
+
+  .methodRail {
+    grid-template-columns: 1fr;
+  }
+
+  .methodRail article {
+    display: grid;
+    min-height: 0;
+    grid-template-columns: 36px minmax(180px, 0.8fr) 1fr;
+    gap: 20px;
+    align-items: center;
+  }
+
+  .methodGlyph {
+    grid-row: 1 / 5;
+    grid-column: 2;
+    margin: 0;
+  }
+
+  .methodRail h3,
+  .methodRail p,
+  .methodRail > article > code {
+    grid-column: 3;
+  }
+
+  .methodRail p {
+    min-height: 0;
+  }
+
+  .artifactWorkbench {
+    grid-template-columns: 1fr;
+  }
+
+  .fileTree {
+    border-right: 0;
+    border-bottom: 1px solid var(--line-dark);
+  }
+
+  .fileTree ul {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+  }
+
+  .safetyGrid,
+  .auditFrame,
+  .boundarySection > div {
+    grid-template-columns: 1fr;
+  }
+
+  .boundaryLead {
+    position: static;
+  }
+
+  .auditReceipt {
+    width: min(100%, 560px);
+    transform: none;
+  }
+}
+
+@media (max-width: 600px) {
+  .heroInner {
+    padding-top: 58px;
+  }
+
+  .heroEyebrow {
+    align-items: flex-start;
+    font-size: 8px;
+    line-height: 1.4;
+  }
+
+  .heroCopy h1 {
+    font-size: clamp(3.25rem, 16vw, 4.7rem);
+    line-height: 0.89;
+    letter-spacing: -0.06em;
+  }
+
+  .heroSupport {
+    padding-left: 17px;
+    font-size: 0.94rem;
+  }
+
+  .heroActions {
+    display: grid;
+  }
+
+  .instrumentWrap {
+    margin-top: 34px;
+  }
+
+  .evidenceRail > div {
+    grid-template-columns: 1fr;
+  }
+
+  .evidenceItem,
+  .evidenceItem:nth-child(5) {
+    grid-column: auto;
+    min-height: 75px;
+    border-left: 1px solid var(--line-paper);
+    padding: 18px;
+  }
+
+  .sectionHeader > div {
+    gap: 23px;
+  }
+
+  .sectionHeader h2,
+  .compactHeader h2,
+  .boundaryLead h2,
+  .auditCopy h2 {
+    font-size: clamp(2.6rem, 13vw, 4rem);
+  }
+
+  .truthCards {
+    grid-template-columns: 1fr;
+  }
+
+  .truthCard {
+    min-height: 245px;
+  }
+
+  .truthCardTop {
+    margin-bottom: 33px;
+  }
+
+  .contradictionNote {
+    grid-template-columns: auto 1fr;
+  }
+
+  .contradictionNote a {
+    grid-column: 2;
+  }
+
+  .methodRail article {
+    display: block;
+    padding: 22px;
+  }
+
+  .methodNumber {
+    margin-bottom: 15px;
+  }
+
+  .methodGlyph {
+    height: 128px;
+    margin: 0 0 28px;
+  }
+
+  .methodRail p {
+    margin-bottom: 18px;
+  }
+
+  .methodFooter {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .faultHeader {
+    display: none;
+  }
+
+  .faultRow {
+    grid-template-columns: 32px 1fr;
+    gap: 10px 0;
+    padding: 17px 0;
+  }
+
+  .faultIndex {
+    grid-row: 1 / 4;
+  }
+
+  .faultRow > * {
+    padding: 0 15px;
+  }
+
+  .fileTree ul {
+    grid-template-columns: 1fr;
+  }
+
+  .codeLines > div {
+    grid-template-columns: 30px 1fr;
+  }
+
+  .codeLines small {
+    grid-column: 2;
+    text-align: left;
+  }
+
+  .replayCommand {
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+
+  .commandTag {
+    display: none;
+  }
+
+  .exitPanel {
+    grid-template-columns: auto 1fr;
+  }
+
+  .exitStatus {
+    grid-column: 2;
+  }
+
+  .identityCard {
+    box-shadow: 9px 9px 0 var(--paper-deep);
+  }
+
+  .identityTarget {
+    grid-template-columns: auto 1fr;
+  }
+
+  .identityTarget > code {
+    grid-column: 2;
+  }
+
+  .identityCard li {
+    grid-template-columns: 24px 1fr;
+    padding: 12px 15px;
+  }
+
+  .identityCard li > code {
+    grid-column: 2;
+  }
+
+  .notList > div {
+    grid-template-columns: 42px 1fr;
+    padding: 17px 0;
+  }
+
+  .notList small {
+    grid-column: 2;
+  }
+
+  .auditActions {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .auditReceipt {
+    box-shadow: 0 12px 36px rgb(0 0 0 / 8%);
+  }
+}
+
+/* Direction B: forensic monochrome. The evidence object, not decoration, carries the identity. */
+.hero {
+  background-color: var(--paper);
+  background-image:
+    radial-gradient(circle at 74% 38%, rgb(16 17 18 / 5%), transparent 30%),
+    linear-gradient(to bottom, var(--paper-bright), var(--paper));
+}
+
+.heroGrid {
+  background-image:
+    linear-gradient(rgb(16 17 18 / 4%) 1px, transparent 1px),
+    linear-gradient(90deg, rgb(16 17 18 / 4%) 1px, transparent 1px);
+  background-size: 64px 64px;
+  mask-image: linear-gradient(to bottom, black, transparent 70%);
+  opacity: 0.5;
+}
+
+.heroInner {
+  display: grid;
+  grid-template-columns: minmax(360px, 0.78fr) minmax(620px, 1.22fr);
+  gap: clamp(44px, 6vw, 92px);
+  align-items: center;
+  padding: clamp(88px, 8vw, 128px) 0 clamp(80px, 7vw, 112px);
+}
+
+.heroCopy {
+  display: block;
+}
+
+.heroEyebrow {
+  margin-bottom: 30px;
+  color: var(--muted);
+}
+
+.heroEyebrow span:first-child {
+  border-color: var(--line-paper);
+  border-radius: 999px;
+  padding: 7px 10px;
+  background: var(--paper-bright);
+}
+
+.heroCopy h1 {
+  max-width: 720px;
+  font: 560 clamp(4rem, 5.55vw, 5.45rem)/0.96 var(--font-display), Arial, sans-serif;
+  letter-spacing: -0.065em;
+  text-wrap: pretty;
+}
+
+.heroCopy h1 em {
+  color: var(--ink);
+  font-style: normal;
+  font-weight: inherit;
+}
+
+.heroSupportRow {
+  display: block;
+}
+
+.heroSupport {
+  max-width: 600px;
+  margin-top: 30px;
+  padding-left: 0;
+  border-left: 0;
+  color: var(--muted);
+  font-size: clamp(1rem, 1.35vw, 1.16rem);
+  line-height: 1.65;
+}
+
+.heroActions {
+  justify-content: flex-start;
+  margin-top: 30px;
+}
+
+.qualifier {
+  margin-top: 24px;
+}
+
+.qualifier span {
+  color: var(--failure);
+}
+
+.instrumentWrap {
+  min-width: 0;
+  margin-top: 0;
+}
+
+.instrumentWrap::before,
+.instrumentWrap::after {
+  display: none;
+}
+
+.evidenceRail {
+  background: var(--paper-bright);
+}
+
+.evidenceRail > div {
+  border-left: 1px solid var(--line-paper);
+}
+
+.evidenceItem {
+  min-height: 92px;
+  padding: 24px;
+}
+
+.evidenceItem:first-child {
+  border-left: 0;
+}
+
+.evidenceItem strong {
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.sectionHeader {
+  grid-template-columns: 160px minmax(0, 1fr);
+}
+
+.sectionHeader h2,
+.compactHeader h2,
+.boundaryLead h2,
+.auditCopy h2 {
+  font: 560 clamp(2.85rem, 5vw, 5.4rem)/0.98 var(--font-display), Arial, sans-serif;
+  letter-spacing: -0.06em;
+}
+
+.sectionHeader > div > p,
+.compactHeader > p,
+.boundaryLead > p,
+.auditCopy > p {
+  font-size: 14px;
+  line-height: 1.7;
+}
+
+.truthCore {
+  border-radius: 18px;
+  background: var(--ink);
+  color: var(--paper-bright);
+  box-shadow: 0 0 0 18px var(--paper-bright), 0 0 0 19px var(--line-paper);
+}
+
+.truthCore span,
+.truthCore small {
+  color: var(--ink-subtle);
+}
+
+.truthCore strong {
+  font-family: var(--font-mono), monospace;
+  font-size: 1.8rem;
+}
+
+.truthCore i {
+  background: var(--ink-muted);
+  box-shadow: 0 0 0 5px rgb(255 255 255 / 8%);
+}
+
+.truthCard {
+  background: var(--paper-bright);
+}
+
+.truthCardTop code {
+  border-radius: 999px;
+  background: var(--paper);
+}
+
+.truthCard h3,
+.faultRow strong,
+.methodRail h3,
+.notList strong {
+  font-family: var(--font-display), Arial, sans-serif;
+  font-weight: 600;
+}
+
+.truthCard > strong {
+  color: var(--muted);
+}
+
+.contradictionNote {
+  border-color: var(--line-paper);
+  border-radius: 12px;
+  background: var(--paper);
+}
+
+.noteGlyph {
+  background: var(--failure);
+  color: var(--failure-ink);
+}
+
+.methodSection,
+.artifactSection,
+.boundarySection {
+  background: var(--inverse);
+  color: var(--paper-bright);
+}
+
+.methodRail,
+.artifactWorkbench {
+  border-color: var(--line-dark);
+  border-radius: 16px;
+  overflow: hidden;
+  background: var(--inverse-panel);
+}
+
+.methodRail article {
+  min-height: 440px;
+  border-color: var(--line-dark);
+}
+
+.methodGlyph {
+  border-radius: 10px;
+  background-color: var(--inverse);
+}
+
+.methodGlyph span:last-child,
+.shrinkGlyph span:last-child,
+.methodRail > article > code {
+  border-color: var(--line-light);
+  color: var(--paper-bright);
+}
+
+.methodRail h3 {
+  font-size: 2rem;
+}
+
+.faultTable {
+  border-top-color: var(--ink);
+}
+
+.faultHeader,
+.faultRow {
+  background: var(--paper-bright);
+}
+
+.faultHeader {
+  border-radius: 12px 12px 0 0;
+}
+
+.faultRow:last-child {
+  border-radius: 0 0 12px 12px;
+}
+
+.faultRow code {
+  color: var(--muted);
+}
+
+.artifactWorkbench {
+  box-shadow: 0 24px 80px rgb(0 0 0 / 30%);
+}
+
+.fileTree .selectedFile {
+  border-left-color: var(--paper-bright);
+  background: #1b1d1f;
+}
+
+.codeLines .failedLine {
+  border-left-color: var(--failure);
+  background: rgb(180 35 24 / 10%);
+}
+
+.replayCommand {
+  border-radius: 8px;
+  background: var(--inverse);
+}
+
+.replayCommand > span {
+  color: var(--paper-bright);
+}
+
+.exitPanel {
+  border-top: 2px solid var(--failure);
+  background: var(--inverse);
+  color: var(--paper-bright);
+}
+
+.exitCode {
+  border-color: var(--failure);
+  border-radius: 8px;
+  color: var(--failure-light);
+}
+
+.identityCard {
+  border-color: var(--line-paper);
+  border-radius: 16px;
+  overflow: hidden;
+  background: var(--paper-bright);
+  box-shadow: 0 24px 70px rgb(0 0 0 / 8%);
+}
+
+.identityHeader strong {
+  color: var(--muted);
+}
+
+.dbGlyph {
+  border-radius: 8px;
+}
+
+.identityCard li > span {
+  background: var(--ink);
+}
+
+.identityCard li code {
+  color: var(--ink);
+}
+
+.mutationState {
+  background: var(--paper-deep);
+  color: var(--ink);
+}
+
+.bigStatement {
+  font: 560 clamp(2.2rem, 4vw, 4rem)/1.02 var(--font-display), Arial, sans-serif;
+}
+
+.bigStatement em {
+  color: var(--ink);
+  font-style: normal;
+}
+
+.notList > div > span {
+  color: var(--ink-muted);
+}
+
+.notList .isItem {
+  border-color: var(--line-light);
+  border-radius: 12px;
+  background: var(--inverse-panel);
+}
+
+.notList .isItem > span,
+.notList .isItem small {
+  color: var(--paper-bright);
+}
+
+.auditSection {
+  border-top: 1px solid var(--line-paper);
+  background: var(--paper-bright);
+}
+
+.auditSection::before {
+  background-image:
+    linear-gradient(rgb(16 17 18 / 4%) 1px, transparent 1px),
+    linear-gradient(90deg, rgb(16 17 18 / 4%) 1px, transparent 1px);
+}
+
+.auditCopy > p,
+.auditActions > span {
+  color: var(--muted);
+}
+
+.auditReceipt {
+  border-color: var(--ink);
+  border-radius: 14px;
+  overflow: hidden;
+  box-shadow: 0 24px 70px rgb(0 0 0 / 9%);
+  transform: none;
+}
+
+@media (max-width: 1120px) {
+  .heroInner {
+    grid-template-columns: 1fr;
+  }
+
+  .heroCopy {
+    max-width: 850px;
+  }
+
+  .heroCopy h1 {
+    font-size: clamp(4rem, 8vw, 6.5rem);
+  }
+}
+
+@media (max-width: 800px) {
+  .sectionHeader,
+  .compactHeader {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 24px;
+  }
+
+  .sectionHeader > div {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 23px;
+  }
+}
+
+@media (max-width: 600px) {
+  .heroInner {
+    gap: 44px;
+    padding-top: 62px;
+  }
+
+  .heroEyebrow span:last-child {
+    max-width: 210px;
+  }
+
+  .heroCopy h1 {
+    font-size: clamp(3rem, 14vw, 4.2rem);
+    line-height: 0.98;
+    letter-spacing: -0.058em;
+  }
+
+  .heroSupport {
+    font-size: 1rem;
+  }
+
+  .heroActions :global(.button) {
+    width: 100%;
+  }
+
+  .evidenceRail > div {
+    border-left: 0;
+  }
+
+  .sectionHeader h2,
+  .compactHeader h2,
+  .boundaryLead h2,
+  .auditCopy h2 {
+    font-size: clamp(2.65rem, 12vw, 4rem);
+  }
+
+  .identityCard,
+  .auditReceipt {
+    box-shadow: none;
+  }
+}
+
+/* Evidence labels stay legible; mono is for machine facts, not decorative texture. */
+.heroEyebrow,
+.qualifier,
+.methodNumber,
+.methodRail > article > code,
+.methodFooter,
+.faultHeader,
+.faultIndex,
+.panelLabel,
+.exitPanel small,
+.exitStatus,
+.receiptTop,
+.receiptBottom span {
+  font-size: 10px;
+}
+
+.evidenceItem span,
+.truthCardTop,
+.truthCard > strong,
+.fileTree li strong,
+.fileTree li small,
+.codeLines > div > span,
+.codeLines small,
+.commandTag,
+.identityTarget small,
+.identityCard li small,
+.identityCard li code,
+.mutationState span,
+.safetyRules span,
+.notList > div > span,
+.auditActions > span,
+.auditReceipt li > span,
+.auditReceipt li small {
+  font-size: 10px;
+}
