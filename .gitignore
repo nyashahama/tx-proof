@@ -1,6 +1,12 @@
 .worktrees/
 reference-projects/
 
+# Rust
+/target/
+
+# Local database baselines
+*.pgdump
+
 # Node / Next.js
 node_modules/
 .next/
@@ -19,4 +25,3 @@ test-results/
 .DS_Store
 .idea/
 .vscode/
-

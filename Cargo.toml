@@ -1,0 +1,47 @@
+[workspace]
+members = [
+    "crates/tiv-cli",
+    "crates/tiv-core",
+    "crates/tiv-runtime",
+    "crates/tiv-stripe-pi",
+]
+resolver = "3"
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.94.1"
+publish = false
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+
+[workspace.dependencies]
+blake3 = "1.8"
+bytes = "1.12"
+clap = { version = "4.5", features = ["derive"] }
+form_urlencoded = "1.2"
+hex = "0.4.3"
+hmac = "0.13.0"
+http-body-util = "0.1.4"
+hyper = { version = "1.11", features = ["http1", "server"] }
+hyper-util = { version = "0.1.20", features = ["tokio"] }
+rand = "0.10.0"
+rand_chacha = "0.10.0"
+reqwest = { version = "0.13.4", default-features = false, features = ["form", "json"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.11.0"
+tokio = { version = "1.53", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio-postgres = { version = "0.7.16", features = ["with-uuid-1"] }
+thiserror = "2.0"
+uuid = { version = "1.22", features = ["v4"] }
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+strip = "symbols"
