@@ -30,6 +30,17 @@ TIV_POSTGRES_TEST_PORT=15432 \
   cargo test -p tiv-runtime postgres::spike::tests:: -- --ignored --test-threads=1
 ```
 
+Pull requests and `main` run the same boundary in
+`.github/workflows/rust.yml`. The job retains the Compose service-configuration
+hash and bounded test log for 14 days, without publishing the resolved
+environment, then removes only the exact truth-spike project and its
+project-owned volume even when the test fails.
+
+Every synthetic persistent write re-observes the complete marked case
+identity immediately before mutation. The live test also carries a stale
+pre-reset identity across a template clone and proves that it is rejected
+without changing the clean case database.
+
 The operation-level `provider-object-unique` invariant is a truth-spike
 interpretation, not yet a final customer invariant template. It reports an
 operation that has more than one provider PaymentIntent ID. The other four
