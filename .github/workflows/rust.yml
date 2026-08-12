@@ -58,7 +58,7 @@ jobs:
 
       - name: Validate and fingerprint the isolated topology
         run: |
-          mkdir -p .tiv-ci
+          mkdir -p ci-evidence
           docker compose \
             --project-name tiv-truth-spike-postgres \
             --project-directory "$PWD" \
@@ -68,7 +68,7 @@ jobs:
             --project-name tiv-truth-spike-postgres \
             --project-directory "$PWD" \
             --file spike/postgres.compose.yaml \
-            config --hash '*' > .tiv-ci/postgres.compose.hash
+            config --hash '*' > ci-evidence/postgres.compose.hash
 
       - name: Start the isolated PostgreSQL service
         run: |
@@ -85,7 +85,7 @@ jobs:
           set -o pipefail
           cargo test -p tiv-runtime postgres::spike::tests:: \
             -- --ignored --test-threads=1 2>&1 \
-            | tee .tiv-ci/postgres-spike.log
+            | tee ci-evidence/postgres-spike.log
 
       - name: Capture PostgreSQL logs after a failure
         if: failure()
@@ -95,7 +95,7 @@ jobs:
             --project-name tiv-truth-spike-postgres \
             --project-directory "$PWD" \
             --file spike/postgres.compose.yaml \
-            logs --no-color postgres > .tiv-ci/postgres.log
+            logs --no-color postgres > ci-evidence/postgres.log
 
       - name: Remove only the isolated truth-spike project
         if: always()
@@ -111,6 +111,6 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: postgres-truth-spike
-          path: .tiv-ci/
+          path: ci-evidence/
           if-no-files-found: error
           retention-days: 14
