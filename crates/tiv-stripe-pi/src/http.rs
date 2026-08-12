@@ -17,7 +17,7 @@ use tokio::{
 
 use crate::{
     CreatePaymentIntent, DataPlaneDisposition, DataPlaneResponse, FaultOutcome, FixtureError,
-    IdempotencyKey, PaymentIntentFixture,
+    FixtureServiceError, IdempotencyKey, ManagedFixture, OperationId, PaymentIntentFixture,
 };
 
 const MAX_REQUEST_BODY_BYTES: usize = 8 * 1024;
@@ -39,15 +39,34 @@ pub async fn serve_http1_connection(
     fixture: Arc<Mutex<PaymentIntentFixture>>,
     outcome: FaultOutcome,
 ) -> Result<(), hyper::Error> {
+    serve_data_plane_connection(stream, DataPlaneBackend::Fixed { fixture, outcome }).await
+}
+
+/// Serves one HTTP/1 connection using the fault plan installed through the
+/// local control plane.
+///
+/// Invalid requests do not consume an outcome. A valid create consumes exactly
+/// one planned outcome.
+///
+/// # Errors
+///
+/// Returns Hyper's connection error when the peer disconnects, parsing fails,
+/// or the fixture intentionally closes a committed connection.
+pub async fn serve_managed_http1_connection(
+    stream: TcpStream,
+    fixture: Arc<Mutex<ManagedFixture>>,
+) -> Result<(), hyper::Error> {
+    serve_data_plane_connection(stream, DataPlaneBackend::Managed(fixture)).await
+}
+
+async fn serve_data_plane_connection(
+    stream: TcpStream,
+    backend: DataPlaneBackend,
+) -> Result<(), hyper::Error> {
     let close_connection = Arc::new(Notify::new());
     let close_signal = Arc::clone(&close_connection);
     let service = service_fn(move |request| {
-        handle_request(
-            request,
-            Arc::clone(&fixture),
-            outcome,
-            Arc::clone(&close_signal),
-        )
+        handle_request(request, backend.clone(), Arc::clone(&close_signal))
     });
     let connection = http1::Builder::new().serve_connection(TokioIo::new(stream), service);
     tokio::pin!(connection);
@@ -59,8 +78,7 @@ pub async fn serve_http1_connection(
 
 async fn handle_request(
     request: Request<Incoming>,
-    fixture: Arc<Mutex<PaymentIntentFixture>>,
-    outcome: FaultOutcome,
+    backend: DataPlaneBackend,
     close_connection: Arc<Notify>,
 ) -> Result<Response<ResponseBody>, FixtureHttpError> {
     if request.method() != Method::POST || request.uri().path() != "/v1/payment_intents" {
@@ -98,13 +116,15 @@ async fn handle_request(
     let mut fields = BTreeMap::new();
     for (name, value) in form_urlencoded::parse(&collected) {
         let name = name.into_owned();
-        if !matches!(name.as_str(), "amount" | "currency")
-            || fields.insert(name, value.into_owned()).is_some()
+        if !matches!(
+            name.as_str(),
+            "amount" | "currency" | "metadata[operation_id]"
+        ) || fields.insert(name, value.into_owned()).is_some()
         {
             return Ok(response(StatusCode::BAD_REQUEST, "invalid form parameters"));
         }
     }
-    if fields.len() != 2 {
+    if !matches!(fields.len(), 2 | 3) {
         return Ok(response(StatusCode::BAD_REQUEST, "invalid form parameters"));
     }
     let Some(amount_minor) = fields
@@ -116,11 +136,20 @@ async fn handle_request(
     let Some(currency) = fields.get("currency") else {
         return Ok(response(StatusCode::BAD_REQUEST, "invalid currency"));
     };
-    let Ok(create) = CreatePaymentIntent::new(amount_minor, currency) else {
+    let Ok(mut create) = CreatePaymentIntent::new(amount_minor, currency) else {
         return Ok(response(StatusCode::BAD_REQUEST, "invalid create request"));
     };
+    if let Some(operation_id) = fields.get("metadata[operation_id]") {
+        let Ok(operation_id) = OperationId::new(operation_id) else {
+            return Ok(response(
+                StatusCode::BAD_REQUEST,
+                "invalid operation metadata",
+            ));
+        };
+        create = create.with_operation_id(operation_id);
+    }
 
-    let result = fixture.lock().await.create_data_plane(key, create, outcome);
+    let result = backend.create_data_plane(key, create).await;
     match result {
         Ok(DataPlaneDisposition::Response(provider_response)) => {
             data_plane_response(&provider_response)
@@ -129,20 +158,69 @@ async fn handle_request(
             close_connection.notify_one();
             std::future::pending().await
         }
-        Err(FixtureError::IdempotencyConflict) => Ok(response(
+        Err(DataPlaneExecutionError::Fixture(FixtureError::IdempotencyConflict)) => Ok(response(
             StatusCode::CONFLICT,
             "idempotency key conflicts with prior parameters",
         )),
-        Err(FixtureError::ConnectionClosed) => unreachable!("the data plane uses a disposition"),
-        Err(FixtureError::RateLimited) => {
+        Err(DataPlaneExecutionError::Fixture(FixtureError::ConnectionClosed)) => {
+            unreachable!("the data plane uses a disposition")
+        }
+        Err(DataPlaneExecutionError::Fixture(FixtureError::RateLimited)) => {
             Ok(response(StatusCode::TOO_MANY_REQUESTS, "rate limited"))
         }
-        Err(FixtureError::NotFound) => Ok(response(StatusCode::NOT_FOUND, "not found")),
-        Err(FixtureError::Serialization | FixtureError::ServerError) => Ok(response(
+        Err(DataPlaneExecutionError::Fixture(FixtureError::NotFound)) => {
+            Ok(response(StatusCode::NOT_FOUND, "not found"))
+        }
+        Err(DataPlaneExecutionError::Fixture(
+            FixtureError::Serialization | FixtureError::ServerError,
+        )) => Ok(response(
             StatusCode::INTERNAL_SERVER_ERROR,
             "provider error",
         )),
+        Err(DataPlaneExecutionError::Service(_)) => Ok(response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "fixture fault plan unavailable",
+        )),
     }
+}
+
+#[derive(Clone)]
+enum DataPlaneBackend {
+    Fixed {
+        fixture: Arc<Mutex<PaymentIntentFixture>>,
+        outcome: FaultOutcome,
+    },
+    Managed(Arc<Mutex<ManagedFixture>>),
+}
+
+impl DataPlaneBackend {
+    async fn create_data_plane(
+        &self,
+        key: IdempotencyKey,
+        request: CreatePaymentIntent,
+    ) -> Result<DataPlaneDisposition, DataPlaneExecutionError> {
+        match self {
+            Self::Fixed { fixture, outcome } => fixture
+                .lock()
+                .await
+                .create_data_plane(key, request, *outcome)
+                .map_err(DataPlaneExecutionError::Fixture),
+            Self::Managed(fixture) => fixture
+                .lock()
+                .await
+                .create_data_plane(key, request)
+                .map_err(|error| match error {
+                    FixtureServiceError::Fixture(error) => DataPlaneExecutionError::Fixture(error),
+                    error => DataPlaneExecutionError::Service(error),
+                }),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DataPlaneExecutionError {
+    Fixture(FixtureError),
+    Service(FixtureServiceError),
 }
 
 fn data_plane_response(

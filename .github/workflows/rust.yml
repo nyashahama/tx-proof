@@ -84,7 +84,9 @@ jobs:
         run: |
           set -o pipefail
           cargo test -p tiv-runtime postgres::spike::tests:: \
-            -- --ignored --test-threads=1 2>&1 \
+            -- --ignored --test-threads=1 \
+            --skip real_reference_app_replays_commit_close_with_the_same_failure_identity \
+            2>&1 \
             | tee ci-evidence/postgres-spike.log
 
       - name: Capture PostgreSQL logs after a failure
@@ -111,6 +113,82 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: postgres-truth-spike
+          path: ci-evidence/
+          if-no-files-found: error
+          retention-days: 14
+
+  reference-app-spike:
+    name: Real reference application truth spike
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install the pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: 1.94.1
+
+      - name: Validate and fingerprint the isolated topology
+        run: |
+          mkdir -p ci-evidence
+          docker compose \
+            --project-name tiv-reference-app-spike \
+            --project-directory "$PWD" \
+            --file spike/reference-app.compose.yaml \
+            config --quiet
+          docker compose \
+            --project-name tiv-reference-app-spike \
+            --project-directory "$PWD" \
+            --file spike/reference-app.compose.yaml \
+            config --hash '*' > ci-evidence/reference-app.compose.hash
+
+      - name: Build and start the isolated reference stack
+        run: |
+          docker compose \
+            --project-name tiv-reference-app-spike \
+            --project-directory "$PWD" \
+            --file spike/reference-app.compose.yaml \
+            up --detach --build --wait
+
+      - name: Prove the real application counterexample and replay
+        env:
+          TIV_COMPOSE_PROJECT: tiv-reference-app-spike
+          TIV_FIXTURE_CONTROL_URL: http://127.0.0.1:12112
+          TIV_POSTGRES_TEST_PORT: "15432"
+          TIV_REFERENCE_APP_URL: http://127.0.0.1:18080
+        run: |
+          set -o pipefail
+          cargo test -p tiv-runtime \
+            postgres::spike::tests::real_reference_app_replays_commit_close_with_the_same_failure_identity \
+            -- --ignored --test-threads=1 2>&1 \
+            | tee ci-evidence/reference-app-spike.log
+
+      - name: Capture isolated service logs after a failure
+        if: failure()
+        continue-on-error: true
+        run: |
+          docker compose \
+            --project-name tiv-reference-app-spike \
+            --project-directory "$PWD" \
+            --file spike/reference-app.compose.yaml \
+            logs --no-color --tail 500 > ci-evidence/reference-app-services.log
+
+      - name: Remove only the isolated reference-app project
+        if: always()
+        run: |
+          docker compose \
+            --project-name tiv-reference-app-spike \
+            --project-directory "$PWD" \
+            --file spike/reference-app.compose.yaml \
+            down --volumes --remove-orphans
+
+      - name: Retain bounded reference-app evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: reference-app-truth-spike
           path: ci-evidence/
           if-no-files-found: error
           retention-days: 14

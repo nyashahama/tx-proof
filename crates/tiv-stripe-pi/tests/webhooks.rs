@@ -2,7 +2,8 @@ use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 use tiv_core::decision::Seed;
 use tiv_stripe_pi::{
-    CreatePaymentIntent, FaultOutcome, IdempotencyKey, PaymentIntentFixture, WebhookSignatureError,
+    CreatePaymentIntent, DataPlaneDisposition, FaultOutcome, IdempotencyKey, OperationId,
+    PaymentIntentFixture, WebhookSignatureError,
 };
 
 #[test]
@@ -33,6 +34,49 @@ fn webhook_signing_rejects_an_empty_secret() {
         .expect_err("an empty webhook secret is unsafe");
 
     assert_eq!(error, WebhookSignatureError::EmptySecret);
+}
+
+#[test]
+fn operation_metadata_round_trips_through_create_and_webhook_wire_bytes() {
+    let mut fixture = PaymentIntentFixture::new(Seed::new(42));
+    let create = CreatePaymentIntent::new(2_500, "usd")
+        .expect("the create request is valid")
+        .with_operation_id(OperationId::new("op_1").expect("the operation ID is valid"));
+    let disposition = fixture
+        .create_data_plane(
+            IdempotencyKey::new("checkout-order-42").expect("the test key is valid"),
+            create,
+            FaultOutcome::Normal,
+        )
+        .expect("the create executes");
+    let DataPlaneDisposition::Response(response) = disposition else {
+        panic!("the normal create returns an HTTP response");
+    };
+    let create_json: serde_json::Value =
+        serde_json::from_slice(response.raw_body()).expect("the create response is JSON");
+    let payment_intent_id = create_json["id"]
+        .as_str()
+        .expect("the response contains a PaymentIntent ID");
+
+    fixture
+        .confirm(payment_intent_id)
+        .expect("the PaymentIntent confirms");
+    let event_json: serde_json::Value = serde_json::from_slice(
+        fixture
+            .events()
+            .first()
+            .expect("confirmation emits one event")
+            .webhook_attempt(1_700_000_000, b"whsec_test_secret")
+            .expect("the event can be signed")
+            .raw_body(),
+    )
+    .expect("the webhook body is JSON");
+
+    assert_eq!(create_json["metadata"]["operation_id"], "op_1");
+    assert_eq!(
+        event_json["data"]["object"]["metadata"]["operation_id"],
+        "op_1"
+    );
 }
 
 fn succeeded_event() -> tiv_stripe_pi::ProviderEvent {
