@@ -1,0 +1,116 @@
+name: Rust verification
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rust-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  quality:
+    name: Format, lint, test, and build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install the pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: 1.94.1
+          components: clippy, rustfmt
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Deny Clippy warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Run the workspace test suite
+        run: cargo test --workspace --all-targets
+
+      - name: Build release binaries
+        run: cargo build --workspace --release
+
+  postgres-spike:
+    name: PostgreSQL truth spike
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install the pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: 1.94.1
+
+      - name: Validate and fingerprint the isolated topology
+        run: |
+          mkdir -p .tiv-ci
+          docker compose \
+            --project-name tiv-truth-spike-postgres \
+            --project-directory "$PWD" \
+            --file spike/postgres.compose.yaml \
+            config --quiet
+          docker compose \
+            --project-name tiv-truth-spike-postgres \
+            --project-directory "$PWD" \
+            --file spike/postgres.compose.yaml \
+            config --hash '*' > .tiv-ci/postgres.compose.hash
+
+      - name: Start the isolated PostgreSQL service
+        run: |
+          docker compose \
+            --project-name tiv-truth-spike-postgres \
+            --project-directory "$PWD" \
+            --file spike/postgres.compose.yaml \
+            up --detach --wait postgres
+
+      - name: Prove reset, invariant, and fresh-baseline replay
+        env:
+          TIV_POSTGRES_TEST_PORT: "15432"
+        run: |
+          set -o pipefail
+          cargo test -p tiv-runtime postgres::spike::tests:: \
+            -- --ignored --test-threads=1 2>&1 \
+            | tee .tiv-ci/postgres-spike.log
+
+      - name: Capture PostgreSQL logs after a failure
+        if: failure()
+        continue-on-error: true
+        run: |
+          docker compose \
+            --project-name tiv-truth-spike-postgres \
+            --project-directory "$PWD" \
+            --file spike/postgres.compose.yaml \
+            logs --no-color postgres > .tiv-ci/postgres.log
+
+      - name: Remove only the isolated truth-spike project
+        if: always()
+        run: |
+          docker compose \
+            --project-name tiv-truth-spike-postgres \
+            --project-directory "$PWD" \
+            --file spike/postgres.compose.yaml \
+            down --volumes --remove-orphans
+
+      - name: Retain bounded truth-spike evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: postgres-truth-spike
+          path: .tiv-ci/
+          if-no-files-found: error
+          retention-days: 14

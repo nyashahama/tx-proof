@@ -133,25 +133,46 @@ impl TruthSpikePostgres {
         })
     }
 
-    /// Inserts the narrow two-provider-object state produced by the buggy app.
+    /// Freshly verifies the marked case, then inserts the narrow
+    /// two-provider-object state produced by the buggy app.
     ///
     /// # Errors
     ///
-    /// Returns [`SpikePostgresError`] unless exactly two distinct provider
-    /// objects are supplied and both local rows commit atomically.
+    /// Returns [`SpikePostgresError`] unless the expected case identity still
+    /// matches, exactly two distinct provider objects are supplied, and both
+    /// local rows commit atomically. The returned target must be freshly
+    /// verified again before another persistent mutation.
     pub async fn insert_buggy_payment_pair(
         &self,
-        case_name: &DatabaseName,
+        expected: DatabaseTarget<Unverified>,
         operation_id: &str,
         provider_objects: &[ProviderPaymentIntent],
-    ) -> Result<(), SpikePostgresError> {
-        if case_name.kind() != DatabaseKind::Case
+    ) -> Result<DatabaseTarget<Unverified>, SpikePostgresError> {
+        if expected.identity().database_name().kind() != DatabaseKind::Case
             || operation_id.trim().is_empty()
             || provider_objects.len() != 2
             || provider_objects[0].id() == provider_objects[1].id()
         {
             return Err(SpikePostgresError::InvalidBugState);
         }
+        let case_name = expected.identity().database_name().clone();
+        let observed = self.observe_identity(&case_name).await?;
+        let (verified, permit) = expected
+            .verify(&observed)
+            .map_err(SpikePostgresError::Safety)?;
+        self.insert_verified_buggy_payment_pair(verified, permit, operation_id, provider_objects)
+            .await
+    }
+
+    async fn insert_verified_buggy_payment_pair(
+        &self,
+        verified: DatabaseTarget<Verified>,
+        _permit: MutationPermit,
+        operation_id: &str,
+        provider_objects: &[ProviderPaymentIntent],
+    ) -> Result<DatabaseTarget<Unverified>, SpikePostgresError> {
+        let expected_after_mutation = verified.identity().clone();
+        let case_name = expected_after_mutation.database_name().clone();
         let mut session = self.connect_database(case_name.as_str()).await?;
         let result = async {
             let transaction = session.client().transaction().await?;
@@ -175,7 +196,7 @@ impl TruthSpikePostgres {
         .await;
         session.close().await?;
         result?;
-        Ok(())
+        Ok(DatabaseTarget::new(expected_after_mutation))
     }
 
     /// Runs the exact five-query reference snapshot.
@@ -728,8 +749,9 @@ mod tests {
         let original_oid = provisioned.case_target().identity().database_oid();
         let provider_objects = provider_objects();
 
-        postgres
-            .insert_buggy_payment_pair(&case_name, "op_1", &provider_objects)
+        let stale_case_target = DatabaseTarget::new(provisioned.case_target().identity().clone());
+        let dirty_case_target = postgres
+            .insert_buggy_payment_pair(provisioned.into_case_target(), "op_1", &provider_objects)
             .await
             .expect("the synthetic bug state is inserted");
         let first_report = postgres
@@ -742,11 +764,7 @@ mod tests {
             .clone();
 
         let reset_target = postgres
-            .reset_case_from_template(
-                provisioned.into_case_target(),
-                &baseline_target,
-                Uuid::new_v4(),
-            )
+            .reset_case_from_template(dirty_case_target, &baseline_target, Uuid::new_v4())
             .await
             .expect("a fresh identity check authorizes the template reset");
         assert_ne!(reset_target.identity().database_oid(), original_oid);
@@ -762,8 +780,29 @@ mod tests {
             InvariantVerdict::Held
         ));
 
-        postgres
-            .insert_buggy_payment_pair(&case_name, "op_1", &provider_objects)
+        let stale_write = postgres
+            .insert_buggy_payment_pair(stale_case_target, "op_1", &provider_objects)
+            .await;
+        assert!(matches!(
+            stale_write,
+            Err(SpikePostgresError::Safety(SafetyError::IdentityMismatch(
+                crate::postgres::safety::IdentityField::DatabaseOid
+            )))
+        ));
+        let still_clean_report = postgres
+            .check_reference_invariants(&case_name, &provider_objects, quiescence())
+            .await
+            .expect("the rejected stale write leaves the reset baseline inspectable");
+        assert!(matches!(
+            still_clean_report
+                .outcome("provider-object-unique")
+                .expect("the invariant ran")
+                .verdict(),
+            InvariantVerdict::Held
+        ));
+
+        let _replayed_case_target = postgres
+            .insert_buggy_payment_pair(reset_target, "op_1", &provider_objects)
             .await
             .expect("the same compiled fault is replayed");
         let replay_report = postgres
@@ -786,23 +825,20 @@ mod tests {
             .await
             .expect("the baseline and first case are provisioned");
         let baseline_target = provisioned.baseline_target().clone();
-        let case_name = provisioned.case_name().clone();
         let first_database_oid = provisioned.case_target().identity().database_oid();
 
-        let first_report = run_buggy_checkout(&postgres, &case_name).await;
+        let (first_report, dirty_case_target) =
+            run_buggy_checkout(&postgres, provisioned.into_case_target()).await;
         let first_identity = provider_uniqueness_failure(&first_report)
             .identity()
             .clone();
         let reset_target = postgres
-            .reset_case_from_template(
-                provisioned.into_case_target(),
-                &baseline_target,
-                Uuid::new_v4(),
-            )
+            .reset_case_from_template(dirty_case_target, &baseline_target, Uuid::new_v4())
             .await
             .expect("the marked case resets from the sealed template");
         let reset_database_oid = reset_target.identity().database_oid();
-        let replay_report = run_buggy_checkout(&postgres, &case_name).await;
+        let (replay_report, _replayed_case_target) =
+            run_buggy_checkout(&postgres, reset_target).await;
         let replay_identity = provider_uniqueness_failure(&replay_report).identity();
 
         let evidence = TruthSpikeEvidence::new(
@@ -849,8 +885,9 @@ mod tests {
 
     async fn run_buggy_checkout(
         postgres: &TruthSpikePostgres,
-        case_name: &DatabaseName,
-    ) -> SnapshotReport {
+        case_target: DatabaseTarget<Unverified>,
+    ) -> (SnapshotReport, DatabaseTarget<Unverified>) {
+        let case_name = case_target.identity().database_name().clone();
         let fixture = Arc::new(Mutex::new(PaymentIntentFixture::new(Seed::new(42))));
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -910,14 +947,15 @@ mod tests {
                 })
                 .collect::<Vec<_>>()
         };
-        postgres
-            .insert_buggy_payment_pair(case_name, "op_1", &provider_objects)
+        let case_target = postgres
+            .insert_buggy_payment_pair(case_target, "op_1", &provider_objects)
             .await
             .expect("reconciliation persists both provider objects for one operation");
-        postgres
-            .check_reference_invariants(case_name, &provider_objects, quiescence())
+        let report = postgres
+            .check_reference_invariants(&case_name, &provider_objects, quiescence())
             .await
-            .expect("the five-query snapshot completes")
+            .expect("the five-query snapshot completes");
+        (report, case_target)
     }
 
     fn provider_uniqueness_failure(report: &SnapshotReport) -> &InvariantOutcome {
