@@ -4,6 +4,7 @@ members = [
     "crates/tiv-core",
     "crates/tiv-runtime",
     "crates/tiv-stripe-pi",
+    "tests/reference-app",
 ]
 resolver = "3"
 

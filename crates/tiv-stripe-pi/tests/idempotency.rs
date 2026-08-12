@@ -1,7 +1,7 @@
 use tiv_core::decision::Seed;
 use tiv_stripe_pi::{
     CreatePaymentIntent, DataPlaneDisposition, FaultOutcome, FixtureError, IdempotencyKey,
-    InvalidCreateRequest, PaymentIntentFixture,
+    InvalidCreateRequest, OperationId, PaymentIntentFixture,
 };
 
 #[test]
@@ -142,6 +142,26 @@ fn retrying_with_a_different_key_creates_a_second_provider_object() {
 }
 
 #[test]
+fn operation_metadata_is_part_of_the_idempotent_request_identity() {
+    let mut fixture = PaymentIntentFixture::new(Seed::new(42));
+    let key = IdempotencyKey::new("checkout-order-42").expect("the test key is valid");
+    let first_request = valid_create(2_500, "usd")
+        .with_operation_id(OperationId::new("op_1").expect("the operation ID is valid"));
+    let different_request = valid_create(2_500, "usd")
+        .with_operation_id(OperationId::new("op_2").expect("the operation ID is valid"));
+
+    fixture
+        .create(key.clone(), first_request, FaultOutcome::Normal)
+        .expect("the first request executes");
+    let retry = fixture
+        .create(key, different_request, FaultOutcome::Normal)
+        .expect_err("changed operation metadata conflicts with the cached request");
+
+    assert_eq!(retry, FixtureError::IdempotencyConflict);
+    assert_eq!(fixture.payment_intent_count(), 1);
+}
+
+#[test]
 fn fixture_ids_are_reproducible_for_a_seed_and_distinct_across_seeds() {
     let first = first_payment_intent(42);
     let same_seed = first_payment_intent(42);
@@ -175,6 +195,13 @@ fn idempotency_keys_reject_blank_or_overlong_values() {
     assert!(IdempotencyKey::new(" \n").is_err());
     assert!(IdempotencyKey::new("x".repeat(256)).is_err());
     assert!(IdempotencyKey::new("x".repeat(255)).is_ok());
+}
+
+#[test]
+fn operation_ids_reject_blank_or_overlong_values() {
+    assert!(OperationId::new(" \n").is_err());
+    assert!(OperationId::new("x".repeat(256)).is_err());
+    assert!(OperationId::new("x".repeat(255)).is_ok());
 }
 
 #[test]

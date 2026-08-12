@@ -1137,9 +1137,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "tiv-reference-app"
+version = "0.0.0"
+dependencies = [
+ "bytes",
+ "hex",
+ "hmac",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tiv-core",
+ "tiv-stripe-pi",
+ "tokio",
+ "tokio-postgres",
+]
+
+[[package]]
 name = "tiv-runtime"
 version = "0.0.0"
 dependencies = [
+ "hex",
  "reqwest",
  "serde",
  "serde_json",

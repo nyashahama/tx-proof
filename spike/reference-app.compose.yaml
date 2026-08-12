@@ -1,0 +1,102 @@
+services:
+  postgres:
+    image: postgres:18.4-bookworm
+    command: ["postgres", "-c", "cluster_name=tiv-truth-spike-postgres"]
+    environment:
+      POSTGRES_DB: postgres
+      POSTGRES_INITDB_ARGS: --data-checksums
+      POSTGRES_PASSWORD: tiv-local-only-password
+      POSTGRES_USER: tiv_admin
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "tiv_admin", "-d", "postgres"]
+      interval: 1s
+      timeout: 2s
+      retries: 30
+    labels:
+      io.txproof.purpose: disposable-reference-app-postgres
+    ports:
+      - "127.0.0.1:15432:5432"
+    stop_grace_period: 5s
+    volumes:
+      - postgres-data:/var/lib/postgresql
+    networks:
+      data: {}
+      postgres-host:
+        gw_priority: 1
+
+  stripe-fixture:
+    build:
+      context: .
+      dockerfile: spike/reference-app.Dockerfile
+      target: fixture
+    command: ["tiv-stripe-pi-fixture"]
+    environment:
+      TIV_FIXTURE_CONTROL_BIND: fixture-control:12112
+      TIV_FIXTURE_CONTROL_TOKEN: run-scoped-control-token
+      TIV_FIXTURE_DATA_BIND: fixture-data:12111
+      TIV_WEBHOOK_SECRET: whsec_test_secret
+    healthcheck:
+      test: ["CMD", "tiv-stripe-pi-fixture", "healthcheck"]
+      interval: 1s
+      timeout: 2s
+      retries: 30
+    labels:
+      io.txproof.purpose: disposable-stripe-payment-intent-fixture
+    ports:
+      - "127.0.0.1:12112:12112"
+    stop_grace_period: 2s
+    networks:
+      data:
+        aliases:
+          - fixture-data
+      fixture-control:
+        aliases:
+          - fixture-control
+        gw_priority: 1
+
+  reference-app:
+    build:
+      context: .
+      dockerfile: spike/reference-app.Dockerfile
+      target: reference-app
+    command: ["tiv-reference-app"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      stripe-fixture:
+        condition: service_healthy
+    environment:
+      TIV_FIXTURE_BASE_URL: http://fixture-data:12111
+      TIV_FIXTURE_CONTROL_PROBE: stripe-fixture:12112
+      TIV_POSTGRES_HOST: postgres
+      TIV_POSTGRES_PASSWORD: tiv-app-local-only-password
+      TIV_POSTGRES_PORT: "5432"
+      TIV_POSTGRES_ROLE: tiv_app
+      TIV_REFERENCE_APP_BIND: reference-app-host:18080
+      TIV_WEBHOOK_SECRET: whsec_test_secret
+    healthcheck:
+      test: ["CMD", "tiv-reference-app", "healthcheck"]
+      interval: 1s
+      timeout: 2s
+      retries: 30
+    labels:
+      io.txproof.purpose: disposable-known-bug-reference-application
+    ports:
+      - "127.0.0.1:18080:18080"
+    stop_grace_period: 2s
+    networks:
+      data: {}
+      app-host:
+        aliases:
+          - reference-app-host
+        gw_priority: 1
+
+networks:
+  app-host: {}
+  data:
+    internal: true
+  fixture-control: {}
+  postgres-host: {}
+
+volumes:
+  postgres-data:

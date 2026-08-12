@@ -27,7 +27,9 @@ healthy:
 
 ```sh
 TIV_POSTGRES_TEST_PORT=15432 \
-  cargo test -p tiv-runtime postgres::spike::tests:: -- --ignored --test-threads=1
+  cargo test -p tiv-runtime postgres::spike::tests:: -- \
+    --ignored --test-threads=1 \
+    --skip real_reference_app_replays_commit_close_with_the_same_failure_identity
 ```
 
 Pull requests and `main` run the same boundary in
@@ -50,5 +52,75 @@ shape is exercised without claiming unimplemented product semantics.
 The PostgreSQL-only stack does not mark its sole bridge `internal: true`.
 Docker 29 accepted the declared port binding but did not install a runtime
 publication for a container attached only to a gateway-less internal network.
-The later multi-service topology can use a separate internal data network while
-retaining a loopback-capable control network.
+The multi-service topology below uses a separate internal data network while
+retaining loopback-capable host networks for control and evidence collection.
+
+## Real reference application spike
+
+`reference-app.compose.yaml` adds the next Phase 0 boundary: a real synthetic
+application and a long-lived Stripe-shaped fixture around the same disposable
+PostgreSQL safety layer.
+
+The topology keeps four separate paths:
+
+- an internal data network shared by the application, fixture data listener,
+  and PostgreSQL;
+- a fixture-control network published only at `127.0.0.1:12112`;
+- an application-ingress network published only at `127.0.0.1:18080`;
+- a PostgreSQL host network published only at `127.0.0.1:15432`.
+
+The application is not attached to the fixture-control network. The acceptance
+test asks the application to probe `stripe-fixture:12112` on their shared data
+network and requires that connection to fail. The fixture data listener uses a
+different, data-network-only alias so multi-network DNS cannot bind it to the
+control address.
+
+Start the exact isolated project:
+
+```sh
+docker compose \
+  --project-name tiv-reference-app-spike \
+  --project-directory "$PWD" \
+  --file spike/reference-app.compose.yaml \
+  config --quiet
+
+docker compose \
+  --project-name tiv-reference-app-spike \
+  --project-directory "$PWD" \
+  --file spike/reference-app.compose.yaml \
+  up --detach --build --wait
+```
+
+Then run the real application path:
+
+```sh
+TIV_COMPOSE_PROJECT=tiv-reference-app-spike \
+TIV_FIXTURE_CONTROL_URL=http://127.0.0.1:12112 \
+TIV_POSTGRES_TEST_PORT=15432 \
+TIV_REFERENCE_APP_URL=http://127.0.0.1:18080 \
+  cargo test -p tiv-runtime \
+    postgres::spike::tests::real_reference_app_replays_commit_close_with_the_same_failure_identity \
+    -- --ignored --test-threads=1
+```
+
+The test provisions a generated case database, installs a sequenced
+`commit_then_close`/`normal` fault plan, drives the application checkout, signs
+and delivers the fixture's exact raw webhook bytes, observes two provider and
+local objects for `op_1`, runs the five-query snapshot, resets from the sealed
+template, and requires the replayed failure identity to match.
+
+Remove only this exact disposable project when finished:
+
+```sh
+docker compose \
+  --project-name tiv-reference-app-spike \
+  --project-directory "$PWD" \
+  --file spike/reference-app.compose.yaml \
+  down --volumes --remove-orphans
+```
+
+This remains bounded truth-spike evidence. It proves one synthetic known-bug
+application and one implemented operation-level invariant. It does not yet
+prove arbitrary customer repositories, all five business invariants, schedule
+generation or shrinking, production secret management, or distributed image
+provenance.

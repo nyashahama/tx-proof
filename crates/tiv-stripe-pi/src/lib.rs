@@ -1,12 +1,13 @@
 //! Stripe `PaymentIntent` fixture for `TxProof`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 
 use hmac::{Hmac, KeyInit, Mac};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use tiv_core::decision::Seed;
 
+pub mod control;
 pub mod http;
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -32,9 +33,37 @@ impl IdempotencyKey {
 pub struct InvalidIdempotencyKey;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OperationId(String);
+
+impl OperationId {
+    /// Creates a semantic operation identifier for provider metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidOperationId`] when the value is blank or exceeds 255
+    /// characters.
+    pub fn new(value: impl Into<String>) -> Result<Self, InvalidOperationId> {
+        let value = value.into();
+        if value.trim().is_empty() || value.chars().count() > 255 {
+            return Err(InvalidOperationId);
+        }
+        Ok(Self(value))
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InvalidOperationId;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CreatePaymentIntent {
     amount_minor: i64,
     currency: String,
+    operation_id: Option<OperationId>,
 }
 
 impl CreatePaymentIntent {
@@ -60,7 +89,14 @@ impl CreatePaymentIntent {
         Ok(Self {
             amount_minor,
             currency,
+            operation_id: None,
         })
+    }
+
+    #[must_use]
+    pub fn with_operation_id(mut self, operation_id: OperationId) -> Self {
+        self.operation_id = Some(operation_id);
+        self
     }
 }
 
@@ -70,7 +106,8 @@ pub enum InvalidCreateRequest {
     NonPositiveAmount,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum FaultOutcome {
     Normal,
     PreExecute429,
@@ -84,6 +121,7 @@ pub struct PaymentIntent {
     id: String,
     amount_minor: i64,
     currency: String,
+    operation_id: Option<OperationId>,
     status: PaymentIntentStatus,
 }
 
@@ -96,6 +134,21 @@ impl PaymentIntent {
     #[must_use]
     pub const fn status(&self) -> PaymentIntentStatus {
         self.status
+    }
+
+    #[must_use]
+    pub fn operation_id(&self) -> Option<&str> {
+        self.operation_id.as_ref().map(OperationId::as_str)
+    }
+
+    #[must_use]
+    pub const fn amount_minor(&self) -> i64 {
+        self.amount_minor
+    }
+
+    #[must_use]
+    pub fn currency(&self) -> &str {
+        &self.currency
     }
 }
 
@@ -262,6 +315,13 @@ struct PaymentIntentWire<'a> {
     amount: i64,
     currency: &'a str,
     status: &'static str,
+    metadata: PaymentIntentMetadataWire<'a>,
+}
+
+#[derive(Serialize)]
+struct PaymentIntentMetadataWire<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    operation_id: Option<&'a str>,
 }
 
 fn payment_intent_json(payment_intent: &PaymentIntent) -> Result<Vec<u8>, FixtureError> {
@@ -275,6 +335,9 @@ fn payment_intent_json(payment_intent: &PaymentIntent) -> Result<Vec<u8>, Fixtur
         amount: payment_intent.amount_minor,
         currency: &payment_intent.currency,
         status,
+        metadata: PaymentIntentMetadataWire {
+            operation_id: payment_intent.operation_id(),
+        },
     })
     .map_err(|_| FixtureError::Serialization)
 }
@@ -306,6 +369,280 @@ pub struct PaymentIntentFixture {
     payment_intents: Vec<PaymentIntent>,
     events: Vec<ProviderEvent>,
     idempotency: BTreeMap<IdempotencyKey, IdempotencyEntry>,
+}
+
+/// A fixture plus the explicit fault plan owned by the local control plane.
+pub struct ManagedFixture {
+    fixture: PaymentIntentFixture,
+    planned_outcomes: VecDeque<FaultOutcome>,
+    command_sequence: u64,
+}
+
+impl ManagedFixture {
+    #[must_use]
+    pub fn new(seed: Seed) -> Self {
+        Self {
+            fixture: PaymentIntentFixture::new(seed),
+            planned_outcomes: VecDeque::new(),
+            command_sequence: 0,
+        }
+    }
+
+    /// Replaces all provider state and installs a complete ordered fault plan.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FixtureServiceError::UnexpectedCommandSequence`] unless this
+    /// is exactly the next mutating command, or
+    /// [`FixtureServiceError::EmptyFaultPlan`] for an empty plan.
+    pub fn reset(
+        &mut self,
+        command_sequence: u64,
+        seed: Seed,
+        outcomes: Vec<FaultOutcome>,
+    ) -> Result<FixtureSnapshot, FixtureServiceError> {
+        self.require_next_sequence(command_sequence)?;
+        if outcomes.is_empty() {
+            return Err(FixtureServiceError::EmptyFaultPlan);
+        }
+        self.fixture = PaymentIntentFixture::new(seed);
+        self.planned_outcomes = outcomes.into();
+        self.command_sequence = command_sequence;
+        Ok(self.snapshot())
+    }
+
+    /// Executes one valid create against the next planned provider outcome.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FixtureServiceError::FaultPlanExhausted`] when no outcome is
+    /// left, or wraps a provider fixture error.
+    pub fn create_data_plane(
+        &mut self,
+        key: IdempotencyKey,
+        request: CreatePaymentIntent,
+    ) -> Result<DataPlaneDisposition, FixtureServiceError> {
+        let outcome = self
+            .planned_outcomes
+            .pop_front()
+            .ok_or(FixtureServiceError::FaultPlanExhausted)?;
+        self.fixture
+            .create_data_plane(key, request, outcome)
+            .map_err(FixtureServiceError::Fixture)
+    }
+
+    /// Confirms every provider object and returns signed, losslessly encoded
+    /// webhook attempts.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an out-of-order command or an unexpected fixture
+    /// or signing failure.
+    pub fn confirm_all(
+        &mut self,
+        command_sequence: u64,
+        timestamp: i64,
+        secret: &control::WebhookSigningSecret,
+    ) -> Result<ConfirmationResult, FixtureServiceError> {
+        self.require_next_sequence(command_sequence)?;
+        let ids = self
+            .fixture
+            .payment_intents()
+            .iter()
+            .map(|payment_intent| payment_intent.id().to_owned())
+            .collect::<Vec<_>>();
+        for id in ids {
+            self.fixture
+                .confirm(&id)
+                .map_err(FixtureServiceError::Fixture)?;
+        }
+        let attempts = self
+            .fixture
+            .events()
+            .iter()
+            .map(|event| {
+                event
+                    .webhook_attempt(timestamp, secret.as_bytes())
+                    .map(SignedWebhookAttempt::from)
+                    .map_err(FixtureServiceError::WebhookSignature)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        self.command_sequence = command_sequence;
+        Ok(ConfirmationResult {
+            command_sequence,
+            attempts,
+        })
+    }
+
+    #[must_use]
+    pub fn snapshot(&self) -> FixtureSnapshot {
+        FixtureSnapshot {
+            command_sequence: self.command_sequence,
+            remaining_outcomes: self.planned_outcomes.len(),
+            payment_intents: self
+                .fixture
+                .payment_intents()
+                .iter()
+                .map(PaymentIntentSnapshot::from)
+                .collect(),
+        }
+    }
+
+    fn require_next_sequence(&self, received: u64) -> Result<(), FixtureServiceError> {
+        let expected = self
+            .command_sequence
+            .checked_add(1)
+            .ok_or(FixtureServiceError::CommandSequenceExhausted)?;
+        if received != expected {
+            return Err(FixtureServiceError::UnexpectedCommandSequence { expected, received });
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct FixtureSnapshot {
+    command_sequence: u64,
+    remaining_outcomes: usize,
+    payment_intents: Vec<PaymentIntentSnapshot>,
+}
+
+impl FixtureSnapshot {
+    #[must_use]
+    pub const fn command_sequence(&self) -> u64 {
+        self.command_sequence
+    }
+
+    #[must_use]
+    pub const fn remaining_outcomes(&self) -> usize {
+        self.remaining_outcomes
+    }
+
+    #[must_use]
+    pub fn payment_intents(&self) -> &[PaymentIntentSnapshot] {
+        &self.payment_intents
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct PaymentIntentSnapshot {
+    id: String,
+    amount_minor: i64,
+    currency: String,
+    status: &'static str,
+    operation_id: Option<String>,
+}
+
+impl PaymentIntentSnapshot {
+    #[must_use]
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    #[must_use]
+    pub const fn amount_minor(&self) -> i64 {
+        self.amount_minor
+    }
+
+    #[must_use]
+    pub fn currency(&self) -> &str {
+        &self.currency
+    }
+
+    #[must_use]
+    pub fn status(&self) -> &str {
+        self.status
+    }
+
+    #[must_use]
+    pub fn operation_id(&self) -> Option<&str> {
+        self.operation_id.as_deref()
+    }
+}
+
+impl From<&PaymentIntent> for PaymentIntentSnapshot {
+    fn from(payment_intent: &PaymentIntent) -> Self {
+        let status = match payment_intent.status() {
+            PaymentIntentStatus::RequiresConfirmation => "requires_confirmation",
+            PaymentIntentStatus::Succeeded => "succeeded",
+        };
+        Self {
+            id: payment_intent.id().to_owned(),
+            amount_minor: payment_intent.amount_minor(),
+            currency: payment_intent.currency().to_owned(),
+            status,
+            operation_id: payment_intent.operation_id().map(str::to_owned),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ConfirmationResult {
+    command_sequence: u64,
+    attempts: Vec<SignedWebhookAttempt>,
+}
+
+impl ConfirmationResult {
+    #[must_use]
+    pub const fn command_sequence(&self) -> u64 {
+        self.command_sequence
+    }
+
+    #[must_use]
+    pub fn attempts(&self) -> &[SignedWebhookAttempt] {
+        &self.attempts
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct SignedWebhookAttempt {
+    event_id: String,
+    timestamp: i64,
+    raw_body_hex: String,
+    signature_header: String,
+}
+
+impl SignedWebhookAttempt {
+    #[must_use]
+    pub fn event_id(&self) -> &str {
+        &self.event_id
+    }
+
+    #[must_use]
+    pub const fn timestamp(&self) -> i64 {
+        self.timestamp
+    }
+
+    #[must_use]
+    pub fn raw_body_hex(&self) -> &str {
+        &self.raw_body_hex
+    }
+
+    #[must_use]
+    pub fn signature_header(&self) -> &str {
+        &self.signature_header
+    }
+}
+
+impl From<WebhookAttempt> for SignedWebhookAttempt {
+    fn from(attempt: WebhookAttempt) -> Self {
+        Self {
+            event_id: attempt.event_id,
+            timestamp: attempt.timestamp,
+            raw_body_hex: hex::encode(attempt.raw_body),
+            signature_header: attempt.signature_header,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FixtureServiceError {
+    CommandSequenceExhausted,
+    EmptyFaultPlan,
+    FaultPlanExhausted,
+    Fixture(FixtureError),
+    UnexpectedCommandSequence { expected: u64, received: u64 },
+    WebhookSignature(WebhookSignatureError),
 }
 
 impl PaymentIntentFixture {
@@ -412,6 +749,7 @@ impl PaymentIntentFixture {
             id: self.payment_intent_id(sequence),
             amount_minor: request.amount_minor,
             currency: request.currency.clone(),
+            operation_id: request.operation_id.clone(),
             status: PaymentIntentStatus::RequiresConfirmation,
         };
         self.payment_intents.push(payment_intent.clone());
@@ -476,6 +814,9 @@ impl PaymentIntentFixture {
                         amount: payment_intent.amount_minor,
                         currency: &payment_intent.currency,
                         status: "succeeded",
+                        metadata: PaymentIntentMetadataWire {
+                            operation_id: payment_intent.operation_id(),
+                        },
                     },
                 },
             })

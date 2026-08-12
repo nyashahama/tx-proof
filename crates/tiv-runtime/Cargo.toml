@@ -15,6 +15,7 @@ tokio-postgres.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+hex.workspace = true
 reqwest.workspace = true
 tiv-stripe-pi = { path = "../tiv-stripe-pi" }
 

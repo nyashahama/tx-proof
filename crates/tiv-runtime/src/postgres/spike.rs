@@ -33,16 +33,23 @@ impl BaselineTarget {
 pub struct SpikePostgresConfig {
     endpoint: DatabaseEndpoint,
     admin_role: String,
-    password: String,
+    admin_password: String,
+    application_password: String,
 }
 
 impl SpikePostgresConfig {
     #[must_use]
-    pub fn loopback(port: u16, admin_role: impl Into<String>, password: impl Into<String>) -> Self {
+    pub fn loopback(
+        port: u16,
+        admin_role: impl Into<String>,
+        admin_password: impl Into<String>,
+        application_password: impl Into<String>,
+    ) -> Self {
         Self {
             endpoint: DatabaseEndpoint::loopback(port),
             admin_role: admin_role.into(),
-            password: password.into(),
+            admin_password: admin_password.into(),
+            application_password: application_password.into(),
         }
     }
 }
@@ -60,7 +67,10 @@ impl TruthSpikePostgres {
     /// failed `PostgreSQL` probe.
     pub async fn connect(config: SpikePostgresConfig) -> Result<Self, SpikePostgresError> {
         validate_role_name(&config.admin_role)?;
-        if config.endpoint.port() == 0 || config.password.is_empty() {
+        if config.endpoint.port() == 0
+            || config.admin_password.is_empty()
+            || config.application_password.is_empty()
+        {
             return Err(SpikePostgresError::InvalidConfiguration);
         }
         let postgres = Self { config };
@@ -99,6 +109,7 @@ impl TruthSpikePostgres {
         let baseline_marker = Uuid::new_v4();
         let case_marker = Uuid::new_v4();
 
+        self.ensure_application_role().await?;
         self.create_empty_database(&baseline_name).await?;
         self.initialize_reference_baseline(&baseline_name, baseline_marker, &compose_project)
             .await?;
@@ -280,6 +291,56 @@ impl TruthSpikePostgres {
         Ok(())
     }
 
+    async fn ensure_application_role(&self) -> Result<(), SpikePostgresError> {
+        let mut session = self.connect_database("postgres").await?;
+        let result = async {
+            let exists = session
+                .client()
+                .query_opt(
+                    "SELECT 1::integer FROM pg_roles WHERE rolname = $1",
+                    &[&APPLICATION_ROLE],
+                )
+                .await?
+                .is_some();
+            if !exists {
+                session
+                    .client()
+                    .batch_execute(
+                        "CREATE ROLE tiv_app WITH \
+                             LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT \
+                             NOREPLICATION NOBYPASSRLS",
+                    )
+                    .await?;
+            }
+            session
+                .client()
+                .batch_execute(
+                    "ALTER ROLE tiv_app WITH \
+                         LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT \
+                         NOREPLICATION NOBYPASSRLS",
+                )
+                .await?;
+            let quoted_password = session
+                .client()
+                .query_one(
+                    "SELECT quote_literal($1::text)",
+                    &[&self.config.application_password],
+                )
+                .await?
+                .get::<_, String>(0);
+            session
+                .client()
+                .batch_execute(&format!(
+                    "ALTER ROLE {APPLICATION_ROLE} PASSWORD {quoted_password}"
+                ))
+                .await
+        }
+        .await;
+        session.close().await?;
+        result?;
+        Ok(())
+    }
+
     async fn initialize_reference_baseline(
         &self,
         baseline_name: &DatabaseName,
@@ -314,9 +375,19 @@ impl TruthSpikePostgres {
                          status text NOT NULL CHECK (status IN ('pending', 'succeeded')) \
                      ); \
                      CREATE INDEX payments_operation_id_idx ON payments (operation_id); \
-                     CREATE INDEX payments_provider_id_idx ON payments (stripe_payment_intent_id); \
+                    CREATE INDEX payments_provider_id_idx ON payments (stripe_payment_intent_id); \
                      INSERT INTO orders (operation_id, amount_minor, currency, status) \
-                     VALUES ('op_1', 2500, 'usd', 'pending');",
+                     VALUES ('op_1', 2500, 'usd', 'pending'); \
+                     REVOKE ALL ON SCHEMA public FROM PUBLIC; \
+                     GRANT USAGE ON SCHEMA public TO tiv_app; \
+                     REVOKE ALL ON TABLE tiv_verifier_marker, orders, payments \
+                         FROM PUBLIC, tiv_app; \
+                     REVOKE ALL ON SEQUENCE orders_id_seq, payments_id_seq \
+                         FROM PUBLIC, tiv_app; \
+                     GRANT INSERT ON TABLE payments TO tiv_app; \
+                     GRANT SELECT (operation_id, stripe_payment_intent_id), \
+                           UPDATE (status) ON TABLE payments TO tiv_app; \
+                     GRANT USAGE ON SEQUENCE payments_id_seq TO tiv_app;",
                 )
                 .await?;
             session
@@ -368,12 +439,31 @@ impl TruthSpikePostgres {
             session.client().batch_execute(&comment).await?;
             session.client().batch_execute(&mark_template).await?;
             session.client().batch_execute(&seal_connections).await?;
-            session.client().batch_execute(&clone).await
+            session.client().batch_execute(&clone).await?;
+            self.configure_case_connect(session.client(), case_name)
+                .await
         }
         .await;
         session.close().await?;
         result?;
         Ok(())
+    }
+
+    async fn configure_case_connect(
+        &self,
+        client: &Client,
+        case_name: &DatabaseName,
+    ) -> Result<(), tokio_postgres::Error> {
+        client
+            .batch_execute(&format!(
+                "REVOKE ALL ON DATABASE {} FROM PUBLIC; \
+                 REVOKE ALL ON DATABASE {} FROM {APPLICATION_ROLE}; \
+                 GRANT CONNECT ON DATABASE {} TO {APPLICATION_ROLE}",
+                case_name.as_str(),
+                case_name.as_str(),
+                case_name.as_str(),
+            ))
+            .await
     }
 
     async fn replace_case_marker(
@@ -540,7 +630,9 @@ impl TruthSpikePostgres {
                 )
                 .await?;
             maintenance.client().batch_execute(&drop_case).await?;
-            maintenance.client().batch_execute(&clone_case).await
+            maintenance.client().batch_execute(&clone_case).await?;
+            self.configure_case_connect(maintenance.client(), &case_name)
+                .await
         }
         .await;
         maintenance.close().await?;
@@ -566,12 +658,41 @@ impl TruthSpikePostgres {
         &self,
         database_name: &str,
     ) -> Result<PostgresSession, SpikePostgresError> {
+        self.connect_database_as(
+            database_name,
+            &self.config.admin_role,
+            &self.config.admin_password,
+        )
+        .await
+    }
+
+    async fn connect_application_database(
+        &self,
+        database_name: &DatabaseName,
+    ) -> Result<PostgresSession, SpikePostgresError> {
+        if database_name.kind() != DatabaseKind::Case {
+            return Err(SpikePostgresError::InvalidConfiguration);
+        }
+        self.connect_database_as(
+            database_name.as_str(),
+            APPLICATION_ROLE,
+            &self.config.application_password,
+        )
+        .await
+    }
+
+    async fn connect_database_as(
+        &self,
+        database_name: &str,
+        role: &str,
+        password: &str,
+    ) -> Result<PostgresSession, SpikePostgresError> {
         let mut config = tokio_postgres::Config::new();
         config
             .host("127.0.0.1")
             .port(self.config.endpoint.port())
-            .user(&self.config.admin_role)
-            .password(&self.config.password)
+            .user(role)
+            .password(password)
             .dbname(database_name);
         let (client, connection) = config.connect(NoTls).await?;
         let connection = tokio::spawn(connection);
@@ -856,6 +977,195 @@ mod tests {
         assert!(!encoded.contains("tiv-local-only-password"));
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires the isolated tiv-truth-spike-postgres Compose project"]
+    async fn intended_application_role_has_only_the_required_case_write_capability() {
+        let postgres = test_postgres().await;
+        let suffix = Uuid::new_v4().simple().to_string()[..16].to_owned();
+        let provisioned = postgres
+            .provision_reference_databases(&suffix, test_project())
+            .await
+            .expect("the baseline and first case are provisioned");
+        let baseline_target = provisioned.baseline_target().clone();
+        let case_name = provisioned.case_name().clone();
+        assert_application_role_contract(&postgres, &case_name).await;
+
+        let reset_target = postgres
+            .reset_case_from_template(
+                provisioned.into_case_target(),
+                &baseline_target,
+                Uuid::new_v4(),
+            )
+            .await
+            .expect("the marked case resets from the template");
+        assert_application_role_after_reset(&postgres, reset_target.identity().database_name())
+            .await;
+    }
+
+    async fn assert_application_role_contract(
+        postgres: &TruthSpikePostgres,
+        case_name: &DatabaseName,
+    ) {
+        let mut app = postgres
+            .connect_application_database(case_name)
+            .await
+            .expect("the intended application role can connect to the case");
+
+        let current_user = app
+            .client()
+            .query_one("SELECT current_user", &[])
+            .await
+            .expect("the role identity is observable")
+            .get::<_, String>(0);
+        let inserted = app
+            .client()
+            .execute(
+                "INSERT INTO payments \
+                     (operation_id, stripe_payment_intent_id, amount_minor, currency, status) \
+                 VALUES ('op_1', 'pi_tiv_role_test', 2500, 'usd', 'succeeded')",
+                &[],
+            )
+            .await
+            .expect("the app can persist its one required relation");
+        let marker_read = app
+            .client()
+            .query("SELECT marker_uuid FROM tiv_verifier_marker", &[])
+            .await;
+        let reconciled = app
+            .client()
+            .execute(
+                "UPDATE payments SET status = 'succeeded' \
+                 WHERE operation_id = 'op_1' \
+                   AND stripe_payment_intent_id = 'pi_tiv_role_test'",
+                &[],
+            )
+            .await
+            .expect("the app can reconcile the exact provider relation it wrote");
+        let marker_write = app
+            .client()
+            .execute(
+                "UPDATE tiv_verifier_marker SET application_role = 'tampered'",
+                &[],
+            )
+            .await;
+        let schema_write = app
+            .client()
+            .batch_execute("CREATE TABLE unauthorized_app_table (id integer)")
+            .await;
+        let temporary_write = app
+            .client()
+            .batch_execute("CREATE TEMP TABLE unauthorized_temp_table (id integer)")
+            .await;
+        let payment_delete = app
+            .client()
+            .execute(
+                "DELETE FROM payments \
+                 WHERE stripe_payment_intent_id = 'pi_tiv_role_test'",
+                &[],
+            )
+            .await;
+        let ungranted_payment_read = app.client().query("SELECT status FROM payments", &[]).await;
+        app.close()
+            .await
+            .expect("the application connection closes cleanly");
+
+        assert_eq!(current_user, APPLICATION_ROLE);
+        assert_eq!(inserted, 1);
+        assert_eq!(reconciled, 1);
+        assert!(
+            marker_read.is_err(),
+            "the app cannot inspect safety identity"
+        );
+        assert!(
+            marker_write.is_err(),
+            "the app cannot mutate safety identity"
+        );
+        assert!(
+            schema_write.is_err(),
+            "the app cannot create schema objects"
+        );
+        assert!(
+            temporary_write.is_err(),
+            "the app cannot create temporary schema objects"
+        );
+        assert!(payment_delete.is_err(), "the app cannot delete payments");
+        assert!(
+            ungranted_payment_read.is_err(),
+            "the app cannot read columns outside its reconciliation predicate"
+        );
+    }
+
+    async fn assert_application_role_after_reset(
+        postgres: &TruthSpikePostgres,
+        case_name: &DatabaseName,
+    ) {
+        let mut reset_app = postgres
+            .connect_application_database(case_name)
+            .await
+            .expect("the app role can connect after reset");
+        let reset_insert = reset_app
+            .client()
+            .execute(
+                "INSERT INTO payments \
+                     (operation_id, stripe_payment_intent_id, amount_minor, currency, status) \
+                 VALUES ('op_1', 'pi_tiv_role_test_after_reset', 2500, 'usd', 'succeeded')",
+                &[],
+            )
+            .await
+            .expect("the narrow grant survives a template reset");
+        reset_app
+            .close()
+            .await
+            .expect("the reset application connection closes cleanly");
+        assert_eq!(reset_insert, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "requires the isolated reference-app Compose project"]
+    async fn real_reference_app_replays_commit_close_with_the_same_failure_identity() {
+        let postgres = test_postgres().await;
+        let suffix = Uuid::new_v4().simple().to_string()[..16].to_owned();
+        let provisioned = postgres
+            .provision_reference_databases(&suffix, test_project())
+            .await
+            .expect("the baseline and first case are provisioned");
+        let baseline_target = provisioned.baseline_target().clone();
+        let case_name = provisioned.case_name().clone();
+        let first_database_oid = provisioned.case_target().identity().database_oid();
+
+        let first_report = run_reference_app_checkout(&postgres, &case_name, 1, 2).await;
+        let first_identity = provider_uniqueness_failure(&first_report)
+            .identity()
+            .clone();
+        let reset_target = postgres
+            .reset_case_from_template(
+                provisioned.into_case_target(),
+                &baseline_target,
+                Uuid::new_v4(),
+            )
+            .await
+            .expect("the real app case resets from the sealed template");
+        let reset_database_oid = reset_target.identity().database_oid();
+
+        let replay_report = run_reference_app_checkout(&postgres, &case_name, 3, 4).await;
+        let replay_identity = provider_uniqueness_failure(&replay_report).identity();
+        let evidence = TruthSpikeEvidence::new(
+            2,
+            first_database_oid,
+            reset_database_oid,
+            &first_identity,
+            replay_identity,
+        )
+        .expect("the real application path forms coherent bounded evidence");
+        let encoded = evidence
+            .to_pretty_json()
+            .expect("the evidence document serializes");
+
+        assert!(encoded.contains("provider-object-unique"));
+        assert!(!encoded.contains("run-scoped-control-token"));
+        assert!(!encoded.contains("tiv-app-local-only-password"));
+    }
+
     async fn test_postgres() -> TruthSpikePostgres {
         let port = std::env::var("TIV_POSTGRES_TEST_PORT")
             .ok()
@@ -865,13 +1175,16 @@ mod tests {
             port,
             "tiv_admin",
             "tiv-local-only-password",
+            "tiv-app-local-only-password",
         ))
         .await
         .expect("the isolated PostgreSQL fixture is healthy")
     }
 
     fn test_project() -> ComposeProjectId {
-        ComposeProjectId::new("tiv-truth-spike-postgres").expect("the test project name is valid")
+        let project = std::env::var("TIV_COMPOSE_PROJECT")
+            .unwrap_or_else(|_| "tiv-truth-spike-postgres".to_owned());
+        ComposeProjectId::new(project).expect("the test project name is valid")
     }
 
     fn provider_objects() -> [ProviderPaymentIntent; 2] {
@@ -956,6 +1269,180 @@ mod tests {
             .await
             .expect("the five-query snapshot completes");
         (report, case_target)
+    }
+
+    async fn run_reference_app_checkout(
+        postgres: &TruthSpikePostgres,
+        case_name: &DatabaseName,
+        reset_sequence: u64,
+        confirm_sequence: u64,
+    ) -> SnapshotReport {
+        let client = reqwest::Client::new();
+        let control_base = std::env::var("TIV_FIXTURE_CONTROL_URL")
+            .unwrap_or_else(|_| "http://127.0.0.1:12112".to_owned());
+        let app_base = std::env::var("TIV_REFERENCE_APP_URL")
+            .unwrap_or_else(|_| "http://127.0.0.1:18080".to_owned());
+        reset_fixture(&client, &control_base, reset_sequence).await;
+        drive_reference_checkout(&client, &app_base, case_name).await;
+        assert_fixture_control_is_isolated(&client, &app_base).await;
+        let attempts = confirm_fixture(&client, &control_base, confirm_sequence).await;
+        deliver_webhook_attempts(&client, &app_base, &attempts).await;
+        let provider_objects = fixture_provider_projection(&client, &control_base).await;
+
+        postgres
+            .check_reference_invariants(case_name, &provider_objects, quiescence())
+            .await
+            .expect("the real app path reaches the five-query oracle")
+    }
+
+    async fn reset_fixture(client: &reqwest::Client, control_base: &str, sequence: u64) {
+        const CONTROL_TOKEN: &str = "run-scoped-control-token";
+        let reset = client
+            .post(format!("{control_base}/v1/control/reset"))
+            .header("X-Tiv-Control-Token", CONTROL_TOKEN)
+            .json(&serde_json::json!({
+                "command_sequence": sequence,
+                "seed": 42,
+                "outcomes": ["commit_then_close", "normal"]
+            }))
+            .send()
+            .await
+            .expect("the host reaches the loopback-only fixture control listener");
+        assert_eq!(reset.status(), StatusCode::OK);
+    }
+
+    async fn drive_reference_checkout(
+        client: &reqwest::Client,
+        app_base: &str,
+        case_name: &DatabaseName,
+    ) {
+        let checkout = client
+            .post(format!("{app_base}/checkout"))
+            .json(&serde_json::json!({
+                "database": case_name.as_str(),
+                "operation_id": "op_1",
+                "amount_minor": 2500,
+                "currency": "usd"
+            }))
+            .send()
+            .await
+            .expect("the host reaches the real reference application");
+        assert_eq!(checkout.status(), StatusCode::OK);
+        let checkout: serde_json::Value = checkout.json().await.expect("checkout returns JSON");
+        assert!(
+            checkout["payment_intent_id"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("pi_tiv_"))
+        );
+    }
+
+    async fn assert_fixture_control_is_isolated(client: &reqwest::Client, app_base: &str) {
+        let isolation_probe = client
+            .get(format!("{app_base}/probe-fixture-control"))
+            .send()
+            .await
+            .expect("the app reports its control-network probe");
+        assert_eq!(isolation_probe.status(), StatusCode::OK);
+        let isolation_probe: serde_json::Value = isolation_probe
+            .json()
+            .await
+            .expect("the isolation probe is JSON");
+        assert_eq!(isolation_probe["reachable"], false);
+    }
+
+    async fn confirm_fixture(
+        client: &reqwest::Client,
+        control_base: &str,
+        sequence: u64,
+    ) -> Vec<serde_json::Value> {
+        const CONTROL_TOKEN: &str = "run-scoped-control-token";
+        let confirmation = client
+            .post(format!("{control_base}/v1/control/confirm-all"))
+            .header("X-Tiv-Control-Token", CONTROL_TOKEN)
+            .json(&serde_json::json!({
+                "command_sequence": sequence,
+                "timestamp": 1_700_000_000
+            }))
+            .send()
+            .await
+            .expect("the host confirms the fixture objects");
+        assert_eq!(confirmation.status(), StatusCode::OK);
+        let confirmation: serde_json::Value = confirmation
+            .json()
+            .await
+            .expect("the signed attempts are JSON");
+        let attempts = confirmation["attempts"]
+            .as_array()
+            .expect("confirmation exports attempts");
+        assert_eq!(attempts.len(), 2);
+        attempts.clone()
+    }
+
+    async fn deliver_webhook_attempts(
+        client: &reqwest::Client,
+        app_base: &str,
+        attempts: &[serde_json::Value],
+    ) {
+        for attempt in attempts {
+            let raw_body = hex::decode(
+                attempt["raw_body_hex"]
+                    .as_str()
+                    .expect("the attempt carries raw bytes"),
+            )
+            .expect("the raw-body transport is valid hex");
+            let delivery = client
+                .post(format!("{app_base}/webhooks/stripe"))
+                .header(
+                    "Stripe-Signature",
+                    attempt["signature_header"]
+                        .as_str()
+                        .expect("the attempt carries a signature"),
+                )
+                .body(raw_body)
+                .send()
+                .await
+                .expect("the exact signed bytes reach the app handler");
+            assert_eq!(delivery.status(), StatusCode::OK);
+        }
+    }
+
+    async fn fixture_provider_projection(
+        client: &reqwest::Client,
+        control_base: &str,
+    ) -> Vec<ProviderPaymentIntent> {
+        const CONTROL_TOKEN: &str = "run-scoped-control-token";
+        let state = client
+            .get(format!("{control_base}/v1/control/state"))
+            .header("X-Tiv-Control-Token", CONTROL_TOKEN)
+            .send()
+            .await
+            .expect("the host reads the bounded provider projection");
+        assert_eq!(state.status(), StatusCode::OK);
+        let state: serde_json::Value = state.json().await.expect("fixture state is JSON");
+        let provider_objects = state["payment_intents"]
+            .as_array()
+            .expect("fixture state carries provider objects")
+            .iter()
+            .map(|payment_intent| {
+                ProviderPaymentIntent::new(
+                    payment_intent["id"]
+                        .as_str()
+                        .expect("the provider ID is present"),
+                    payment_intent["amount_minor"]
+                        .as_i64()
+                        .expect("the amount is present"),
+                    payment_intent["currency"]
+                        .as_str()
+                        .expect("the currency is present"),
+                    payment_intent["status"]
+                        .as_str()
+                        .expect("the status is present"),
+                )
+                .expect("the fixture projection is valid")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(provider_objects.len(), 2);
+        provider_objects
     }
 
     fn provider_uniqueness_failure(report: &SnapshotReport) -> &InvariantOutcome {

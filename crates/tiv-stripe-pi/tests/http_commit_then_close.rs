@@ -119,6 +119,46 @@ async fn unsupported_form_fields_are_rejected_before_idempotent_execution() {
     assert_rejected_body("amount=2500&currency=usd&description=ignored").await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn operation_metadata_is_accepted_through_the_exact_supported_form_field() {
+    let fixture = Arc::new(Mutex::new(PaymentIntentFixture::new(Seed::new(42))));
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("a loopback port is available");
+    let address = listener.local_addr().expect("the listener has an address");
+    let server_fixture = Arc::clone(&fixture);
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("a client connects");
+        let _result = serve_http1_connection(stream, server_fixture, FaultOutcome::Normal).await;
+    });
+
+    let response = reqwest::Client::new()
+        .post(format!("http://{address}/v1/payment_intents"))
+        .header("Idempotency-Key", "checkout-order-42")
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .body("amount=2500&currency=usd&metadata%5Boperation_id%5D=op_1")
+        .send()
+        .await
+        .expect("the create returns an HTTP response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let response: serde_json::Value = response.json().await.expect("the response is JSON");
+    assert_eq!(response["metadata"]["operation_id"], "op_1");
+
+    timeout(Duration::from_secs(2), server)
+        .await
+        .expect("the one-connection server stops")
+        .expect("the server task does not panic");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn duplicate_or_invalid_operation_metadata_is_rejected_before_execution() {
+    assert_rejected_body(
+        "amount=2500&currency=usd&metadata%5Boperation_id%5D=op_1&metadata%5Boperation_id%5D=op_2",
+    )
+    .await;
+    assert_rejected_body("amount=2500&currency=usd&metadata%5Boperation_id%5D=%20").await;
+}
+
 async fn assert_rejected_body(body: &'static str) {
     let fixture = Arc::new(Mutex::new(PaymentIntentFixture::new(Seed::new(42))));
     let listener = TcpListener::bind("127.0.0.1:0")
