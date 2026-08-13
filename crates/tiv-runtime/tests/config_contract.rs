@@ -91,6 +91,13 @@ fn config_rejects_public_databases_and_any_invariant_count_other_than_five() {
         resolve_document(&document[..fifth]),
         Err(ConfigError::InvariantCount { actual: 4 })
     ));
+    assert!(matches!(
+        resolve_document(&document.replace(
+            "id = \"provider-object-unique\"",
+            "id = \"invented-invariant\""
+        )),
+        Err(ConfigError::UnsupportedInvariantSet)
+    ));
 }
 
 #[test]

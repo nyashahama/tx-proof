@@ -29,6 +29,13 @@ const MAX_DATABASE_BYTES: u64 = 2_147_483_648;
 const MAX_WEBHOOK_DUPLICATES: u32 = 3;
 const MAX_DELAY_MILLIS: u64 = 5_000;
 const SUPPORTED_STRIPE_API_VERSION: &str = "2026-02-25.clover";
+const SUPPORTED_INVARIANT_IDS: [&str; 5] = [
+    "provider-object-unique",
+    "webhook-effect-at-most-once",
+    "paid-order-amount-conservation",
+    "terminal-success-monotonic",
+    "balanced-ledger",
+];
 
 /// Environment lookup boundary used by config resolution.
 pub trait EnvironmentLookup {
@@ -622,14 +629,18 @@ fn resolve_raw_config(
             actual: raw.invariants.len(),
         });
     }
-    let mut invariant_ids = BTreeSet::new();
+    if !raw
+        .invariants
+        .iter()
+        .map(|invariant| invariant.id.as_str())
+        .eq(SUPPORTED_INVARIANT_IDS)
+    {
+        return Err(ConfigError::UnsupportedInvariantSet);
+    }
     let mut invariant_paths = Vec::with_capacity(raw.invariants.len());
     let mut redacted_invariants = Vec::with_capacity(raw.invariants.len());
     for invariant in &raw.invariants {
         InvariantId::new(&invariant.id).map_err(|_| ConfigError::InvalidInvariantId)?;
-        if !invariant_ids.insert(invariant.id.clone()) {
-            return Err(ConfigError::DuplicateInvariantId);
-        }
         invariant_paths.push(existing_repository_file(
             &canonical_root,
             &repository_root,
@@ -1035,8 +1046,8 @@ pub enum ConfigError {
     UnsupportedFaultModel,
     #[error("exactly five invariants are required, found {actual}")]
     InvariantCount { actual: usize },
-    #[error("invariant IDs must be unique")]
-    DuplicateInvariantId,
+    #[error("invariants must be the fixed five version-one IDs in canonical order")]
+    UnsupportedInvariantSet,
     #[error("invariant ID is invalid")]
     InvalidInvariantId,
     #[error("duration budget is invalid for {0}")]
