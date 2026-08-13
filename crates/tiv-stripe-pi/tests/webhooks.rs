@@ -41,7 +41,7 @@ fn operation_metadata_round_trips_through_create_and_webhook_wire_bytes() {
     let mut fixture = PaymentIntentFixture::new(Seed::new(42));
     let create = CreatePaymentIntent::new(2_500, "usd")
         .expect("the create request is valid")
-        .with_operation_id(OperationId::new("op_1").expect("the operation ID is valid"));
+        .with_operation_id(&OperationId::new("op_1").expect("the operation ID is valid"));
     let disposition = fixture
         .create_data_plane(
             IdempotencyKey::new("checkout-order-42").expect("the test key is valid"),
@@ -77,6 +77,20 @@ fn operation_metadata_round_trips_through_create_and_webhook_wire_bytes() {
         event_json["data"]["object"]["metadata"]["operation_id"],
         "op_1"
     );
+}
+
+#[test]
+fn succeeded_webhook_contains_the_amount_received_field_saleor_reads() {
+    let event = succeeded_event();
+    let event_json: serde_json::Value = serde_json::from_slice(
+        event
+            .webhook_attempt(1_700_000_000, b"whsec_test_secret")
+            .expect("the event can be signed")
+            .raw_body(),
+    )
+    .expect("the webhook body is JSON");
+
+    assert_eq!(event_json["data"]["object"]["amount_received"], 2_500);
 }
 
 fn succeeded_event() -> tiv_stripe_pi::ProviderEvent {

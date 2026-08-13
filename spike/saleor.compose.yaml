@@ -1,0 +1,35 @@
+services:
+  stripe-fixture:
+    build:
+      context: ${TIV_TXPROOF_ROOT}
+      dockerfile: spike/reference-app.Dockerfile
+      target: fixture
+    command: ["tiv-stripe-pi-fixture"]
+    environment:
+      TIV_FIXTURE_CONTROL_BIND: 0.0.0.0:12112
+      TIV_FIXTURE_CONTROL_TOKEN: run-scoped-control-token
+      TIV_FIXTURE_DATA_BIND: 0.0.0.0:12111
+      TIV_WEBHOOK_SECRET: whsec_test_secret
+    healthcheck:
+      test: ["CMD", "tiv-stripe-pi-fixture", "healthcheck"]
+      interval: 1s
+      timeout: 2s
+      retries: 30
+    labels:
+      io.txproof.purpose: disposable-saleor-stripe-payment-intent-fixture
+    stop_grace_period: 2s
+
+  saleor:
+    depends_on:
+      stripe-fixture:
+        condition: service_healthy
+    working_dir: /app
+    environment:
+      DJANGO_SETTINGS_MODULE: saleor.tests.settings
+      PYTHONPATH: /tiv-saleor
+      TIV_FIXTURE_CONTROL_TOKEN: run-scoped-control-token
+      TIV_FIXTURE_CONTROL_URL: http://stripe-fixture:12112
+      TIV_STRIPE_API_BASE: http://stripe-fixture:12111
+      TIV_STRIPE_MAX_NETWORK_RETRIES: "0"
+    volumes:
+      - ${TIV_TXPROOF_ROOT}/spike/saleor:/tiv-saleor:ro
