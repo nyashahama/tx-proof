@@ -412,6 +412,13 @@ impl CompiledTrace {
             })
     }
 
+    pub fn replay_actions(&self) -> impl Iterator<Item = ReplayAction<'_>> {
+        self.actions.iter().map(|action| ReplayAction {
+            action,
+            captured: &self.captured,
+        })
+    }
+
     #[must_use]
     pub fn resolve(&self, output_ref: OutputRef) -> Option<&CapturedValue> {
         self.captured

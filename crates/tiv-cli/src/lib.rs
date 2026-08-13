@@ -6,6 +6,7 @@ use clap::{Parser, Subcommand};
 use serde::Serialize;
 use thiserror::Error;
 use tiv_core::trace::CompiledTrace;
+use tiv_runtime::replay::{ReplayPlan, ReplayPlanError};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 pub struct TraceSummary {
@@ -26,11 +27,22 @@ pub struct Cli {
 
 #[derive(Debug, PartialEq, Subcommand)]
 pub enum Command {
+    /// Inspect replay readiness without executing customer code.
+    Replay {
+        #[command(subcommand)]
+        command: ReplayCommand,
+    },
     /// Inspect and validate compiled replay traces.
     Trace {
         #[command(subcommand)]
         command: TraceCommand,
     },
+}
+
+#[derive(Debug, PartialEq, Subcommand)]
+pub enum ReplayCommand {
+    /// Compile a trace into the runtime replay plan without executing it.
+    Inspect { path: PathBuf },
 }
 
 #[derive(Debug, PartialEq, Subcommand)]
@@ -46,13 +58,18 @@ pub enum TraceCommand {
 /// Returns [`CliError`] when the input cannot be read, validated, or encoded.
 pub fn execute(cli: Cli) -> Result<String, CliError> {
     match cli.command {
+        Command::Replay {
+            command: ReplayCommand::Inspect { path },
+        } => {
+            let document = read_trace_document(&path)?;
+            let trace: CompiledTrace = serde_json::from_str(&document)?;
+            let plan = ReplayPlan::from_trace(&trace)?;
+            serde_json::to_string(&plan).map_err(CliError::Encode)
+        }
         Command::Trace {
             command: TraceCommand::Validate { path },
         } => {
-            let document = fs::read_to_string(&path).map_err(|source| CliError::Read {
-                path: path.clone(),
-                source,
-            })?;
+            let document = read_trace_document(&path)?;
             let summary = validate_trace_json(&document)?;
             serde_json::to_string(&summary).map_err(CliError::Encode)
         }
@@ -73,6 +90,13 @@ pub fn validate_trace_json(document: &str) -> Result<TraceSummary, serde_json::E
     })
 }
 
+fn read_trace_document(path: &PathBuf) -> Result<String, CliError> {
+    fs::read_to_string(path).map_err(|source| CliError::Read {
+        path: path.clone(),
+        source,
+    })
+}
+
 #[derive(Debug, Error)]
 pub enum CliError {
     #[error("could not read trace {path}: {source}")]
@@ -82,6 +106,8 @@ pub enum CliError {
     },
     #[error("compiled trace is invalid: {0}")]
     InvalidTrace(#[from] serde_json::Error),
+    #[error("compiled trace cannot be replayed by this runtime: {0}")]
+    ReplayPlan(#[from] ReplayPlanError),
     #[error("could not encode trace summary: {0}")]
     Encode(serde_json::Error),
 }

@@ -1,0 +1,117 @@
+//! Read-only replay preparation for compiled traces.
+
+use serde::Serialize;
+use thiserror::Error;
+use tiv_core::trace::{
+    ActionId, ActionKind, CapturedValue, CompiledTrace, InputSlot, OutputRef, OutputSlot,
+};
+
+/// A read-only runtime replay plan compiled from a fully bound trace.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ReplayPlan {
+    schema_version: u16,
+    action_count: usize,
+    steps: Vec<ReplayStep>,
+}
+
+impl ReplayPlan {
+    /// Converts a validated compiled trace into runtime-executable step
+    /// descriptors without opening sockets, touching databases, or releasing
+    /// customer-code effects.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReplayPlanError`] when a trace is structurally valid but not
+    /// executable by the current runtime slice.
+    pub fn from_trace(trace: &CompiledTrace) -> Result<Self, ReplayPlanError> {
+        let steps = trace
+            .replay_actions()
+            .map(|action| {
+                let operation = match action.kind() {
+                    ActionKind::DriveCheckout => {
+                        let output_ref = OutputRef::new(action.id(), OutputSlot::PaymentIntentId);
+                        let captured_payment_intent_id =
+                            payment_intent_id(trace.resolve(output_ref))
+                                .ok_or(ReplayPlanError::MissingPaymentIntentOutput(action.id()))?;
+                        ReplayOperation::DriveCheckout {
+                            captured_payment_intent_id,
+                        }
+                    }
+                    ActionKind::ConfirmPaymentIntent => {
+                        let payment_intent_id =
+                            payment_intent_id(action.input(InputSlot::PaymentIntentId))
+                                .ok_or(ReplayPlanError::MissingPaymentIntentInput(action.id()))?;
+                        ReplayOperation::ConfirmPaymentIntent { payment_intent_id }
+                    }
+                };
+                Ok(ReplayStep {
+                    action_id: action.id(),
+                    operation,
+                })
+            })
+            .collect::<Result<Vec<_>, ReplayPlanError>>()?;
+        Ok(Self {
+            schema_version: trace.schema_version(),
+            action_count: trace.action_count(),
+            steps,
+        })
+    }
+
+    #[must_use]
+    pub const fn schema_version(&self) -> u16 {
+        self.schema_version
+    }
+
+    #[must_use]
+    pub const fn action_count(&self) -> usize {
+        self.action_count
+    }
+
+    #[must_use]
+    pub fn steps(&self) -> &[ReplayStep] {
+        &self.steps
+    }
+}
+
+/// One ordered runtime replay step.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ReplayStep {
+    action_id: ActionId,
+    #[serde(flatten)]
+    operation: ReplayOperation,
+}
+
+impl ReplayStep {
+    #[must_use]
+    pub const fn action_id(&self) -> ActionId {
+        self.action_id
+    }
+
+    #[must_use]
+    pub const fn operation(&self) -> &ReplayOperation {
+        &self.operation
+    }
+}
+
+/// The current runtime's supported replay operations.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "operation", rename_all = "snake_case")]
+pub enum ReplayOperation {
+    DriveCheckout { captured_payment_intent_id: String },
+    ConfirmPaymentIntent { payment_intent_id: String },
+}
+
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+pub enum ReplayPlanError {
+    #[error("drive checkout action {0:?} did not capture a PaymentIntent ID")]
+    MissingPaymentIntentOutput(ActionId),
+    #[error("confirm action {0:?} did not resolve a PaymentIntent ID")]
+    MissingPaymentIntentInput(ActionId),
+}
+
+fn payment_intent_id(value: Option<&CapturedValue>) -> Option<String> {
+    match value {
+        Some(CapturedValue::PaymentIntentId(id)) => Some(id.as_str().to_owned()),
+        Some(CapturedValue::EventId(_)) | None => None,
+    }
+}

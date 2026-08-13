@@ -1124,6 +1124,7 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tiv-core",
+ "tiv-runtime",
 ]
 
 [[package]]
