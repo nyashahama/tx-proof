@@ -13,6 +13,7 @@ use tiv_core::trace::CompiledTrace;
 use tiv_runtime::{
     config::ProcessEnvironment,
     doctor::{DoctorError, run_doctor},
+    init::{InitError, initialize_project},
     postgres::safety::DatabaseName,
     reference_app::{
         ReferenceAppEvidenceConfig, ReferenceAppEvidenceConfigError, ReferenceAppEvidenceError,
@@ -43,6 +44,8 @@ pub struct Cli {
 
 #[derive(Debug, PartialEq, Subcommand)]
 pub enum Command {
+    /// Write a fail-closed version-one project scaffold without overwriting files.
+    Init,
     /// Validate configuration and inspect local Compose readiness without mutation.
     Doctor(DoctorArgs),
     /// Inspect replay readiness without executing customer code.
@@ -127,13 +130,18 @@ pub enum TraceCommand {
     Validate { path: PathBuf },
 }
 
-/// Executes one read-only CLI command.
+/// Executes one synchronous CLI command.
 ///
 /// # Errors
 ///
 /// Returns [`CliError`] when the input cannot be read, validated, or encoded.
 pub fn execute(cli: Cli) -> Result<String, CliError> {
     match cli.command {
+        Command::Init => {
+            let root = std::env::current_dir().map_err(CliError::CurrentDirectory)?;
+            let report = initialize_project(&root)?;
+            report.to_pretty_json().map_err(CliError::Encode)
+        }
         Command::Replay {
             command: ReplayCommand::Inspect { path },
         } => {
@@ -265,6 +273,10 @@ pub enum CliError {
     AsyncCommand,
     #[error("doctor preflight failed: {0}")]
     Doctor(#[from] DoctorError),
+    #[error("could not determine the current directory: {0}")]
+    CurrentDirectory(std::io::Error),
+    #[error("project initialization failed: {0}")]
+    Init(#[from] InitError),
     #[error("invalid generated case database")]
     InvalidCaseDatabase,
     #[error("required environment variable {0} is missing or invalid")]
@@ -279,7 +291,7 @@ pub enum CliError {
     ReferenceAppEvidenceConfig(#[from] ReferenceAppEvidenceConfigError),
     #[error("reference app evidence run failed: {0}")]
     ReferenceAppEvidence(#[from] ReferenceAppEvidenceError),
-    #[error("could not encode trace summary: {0}")]
+    #[error("could not encode command output: {0}")]
     Encode(serde_json::Error),
 }
 

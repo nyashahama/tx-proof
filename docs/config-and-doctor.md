@@ -15,7 +15,8 @@ tiv doctor --config path/to/tiv.toml
 
 The complete contract specimen used by the reference stack is
 `tests/golden/doctor-project/tiv.toml`. Its input files are intentionally inert
-fixtures; `tiv init` is not part of this slice.
+fixtures. New repositories can create the editable fail-closed skeleton with
+`tiv init`; see `docs/init.md`.
 
 The preflight performs these bounded checks:
 

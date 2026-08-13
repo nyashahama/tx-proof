@@ -25,6 +25,13 @@ fn the_cli_exposes_doctor_with_a_safe_default_config_path() {
 }
 
 #[test]
+fn the_cli_exposes_init_without_an_implicit_overwrite_flag() {
+    let cli = Cli::try_parse_from(["tiv", "init"]).expect("the init command parses");
+    assert_eq!(cli.command, Command::Init);
+    assert!(Cli::try_parse_from(["tiv", "init", "--force"]).is_err());
+}
+
+#[test]
 fn the_cli_exposes_only_the_narrow_trace_validation_command_for_this_slice() {
     let cli = Cli::try_parse_from(["tiv", "trace", "validate", "compiled-trace.json"])
         .expect("the documented command parses");
