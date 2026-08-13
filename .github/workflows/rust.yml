@@ -40,6 +40,9 @@ jobs:
       - name: Run the workspace test suite
         run: cargo test --workspace --all-targets
 
+      - name: Prove the non-mutating doctor Docker boundary
+        run: cargo test -p tiv-cli --test doctor -- --ignored --nocapture
+
       - name: Build release binaries
         run: cargo build --workspace --release
 
