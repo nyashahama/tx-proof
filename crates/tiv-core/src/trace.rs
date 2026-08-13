@@ -397,6 +397,11 @@ impl CompiledTrace {
     }
 
     #[must_use]
+    pub const fn seed(&self) -> Seed {
+        self.seed
+    }
+
+    #[must_use]
     pub const fn action_count(&self) -> usize {
         self.actions.len()
     }

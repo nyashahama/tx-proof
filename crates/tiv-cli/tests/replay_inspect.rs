@@ -18,17 +18,18 @@ fn replay_inspect_uses_the_runtime_replay_plan_without_executing_customer_code()
         value,
         json!({
             "schema_version": 1,
+            "seed": 7,
             "action_count": 2,
             "steps": [
                 {
                     "action_id": 1,
                     "operation": "drive_checkout",
-                    "captured_payment_intent_id": "pi_tiv_7_1"
+                    "captured_payment_intent_id": "pi_tiv_7dc6fb6eb37270c34d739b91"
                 },
                 {
                     "action_id": 2,
                     "operation": "confirm_payment_intent",
-                    "payment_intent_id": "pi_tiv_7_1"
+                    "payment_intent_id": "pi_tiv_7dc6fb6eb37270c34d739b91"
                 }
             ]
         })

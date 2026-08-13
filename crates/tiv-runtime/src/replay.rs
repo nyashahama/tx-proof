@@ -2,14 +2,16 @@
 
 use serde::Serialize;
 use thiserror::Error;
-use tiv_core::trace::{
-    ActionId, ActionKind, CapturedValue, CompiledTrace, InputSlot, OutputRef, OutputSlot,
+use tiv_core::{
+    decision::Seed,
+    trace::{ActionId, ActionKind, CapturedValue, CompiledTrace, InputSlot, OutputRef, OutputSlot},
 };
 
 /// A read-only runtime replay plan compiled from a fully bound trace.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ReplayPlan {
     schema_version: u16,
+    seed: Seed,
     action_count: usize,
     steps: Vec<ReplayStep>,
 }
@@ -52,6 +54,7 @@ impl ReplayPlan {
             .collect::<Result<Vec<_>, ReplayPlanError>>()?;
         Ok(Self {
             schema_version: trace.schema_version(),
+            seed: trace.seed(),
             action_count: trace.action_count(),
             steps,
         })
@@ -63,6 +66,11 @@ impl ReplayPlan {
     }
 
     #[must_use]
+    pub const fn seed(&self) -> Seed {
+        self.seed
+    }
+
+    #[must_use]
     pub const fn action_count(&self) -> usize {
         self.action_count
     }
@@ -70,6 +78,11 @@ impl ReplayPlan {
     #[must_use]
     pub fn steps(&self) -> &[ReplayStep] {
         &self.steps
+    }
+
+    #[must_use]
+    pub fn step(&self, action_id: ActionId) -> Option<&ReplayStep> {
+        self.steps.iter().find(|step| step.action_id == action_id)
     }
 }
 

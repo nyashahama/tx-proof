@@ -40,7 +40,8 @@ fn the_committed_spike_trace_replays_the_commit_then_close_checkout_path() {
         serde_json::from_str(trace).expect("the committed spike trace deserializes");
     let payment_intent_output = OutputRef::new(ActionId::new(1), OutputSlot::PaymentIntentId);
     let captured_payment_intent =
-        CapturedValue::payment_intent_id("pi_tiv_7_1").expect("the fixture ID is valid");
+        CapturedValue::payment_intent_id("pi_tiv_7dc6fb6eb37270c34d739b91")
+            .expect("the fixture ID is valid");
     let confirm = compiled
         .replay_action(ActionId::new(2))
         .expect("the confirm step is present");

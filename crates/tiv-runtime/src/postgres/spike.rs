@@ -846,8 +846,10 @@ mod tests {
     use std::{sync::Arc, time::Duration};
 
     use reqwest::StatusCode;
-    use tiv_core::decision::Seed;
+    use tiv_core::{decision::Seed, trace::CompiledTrace};
     use tiv_stripe_pi::{FaultOutcome, PaymentIntentFixture, http::serve_http1_connection};
+
+    use crate::replay::{ReplayOperation, ReplayPlan};
     use tokio::{net::TcpListener, sync::Mutex, time::timeout};
 
     use super::*;
@@ -1133,7 +1135,8 @@ mod tests {
         let case_name = provisioned.case_name().clone();
         let first_database_oid = provisioned.case_target().identity().database_oid();
 
-        let first_report = run_reference_app_checkout(&postgres, &case_name, 1, 2).await;
+        let plan = committed_replay_plan();
+        let first_report = run_reference_app_checkout(&postgres, &case_name, &plan, 1).await;
         let first_identity = provider_uniqueness_failure(&first_report)
             .identity()
             .clone();
@@ -1147,7 +1150,7 @@ mod tests {
             .expect("the real app case resets from the sealed template");
         let reset_database_oid = reset_target.identity().database_oid();
 
-        let replay_report = run_reference_app_checkout(&postgres, &case_name, 3, 4).await;
+        let replay_report = run_reference_app_checkout(&postgres, &case_name, &plan, 3).await;
         let replay_identity = provider_uniqueness_failure(&replay_report).identity();
         let evidence = TruthSpikeEvidence::new(
             2,
@@ -1194,6 +1197,106 @@ mod tests {
             ProviderPaymentIntent::new("pi_tiv_retry", 2_500, "usd", "requires_confirmation")
                 .expect("the retry provider projection is valid"),
         ]
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct ReferenceAppReplayScript {
+        fixture_seed: Seed,
+        expected_payment_intent_id: String,
+    }
+
+    impl ReferenceAppReplayScript {
+        const fn fixture_seed(&self) -> Seed {
+            self.fixture_seed
+        }
+
+        fn expected_payment_intent_id(&self) -> &str {
+            &self.expected_payment_intent_id
+        }
+    }
+
+    #[derive(Clone, Debug, Error, Eq, PartialEq)]
+    enum ReferenceAppReplayScriptError {
+        #[error("reference app replay requires exactly two trace steps, got {actual}")]
+        UnexpectedStepCount { actual: usize },
+        #[error("first replay step must drive checkout")]
+        ExpectedDriveCheckout,
+        #[error("second replay step must confirm the PaymentIntent")]
+        ExpectedConfirmPaymentIntent,
+        #[error("confirm step targets a different PaymentIntent than checkout produced")]
+        PaymentIntentMismatch,
+    }
+
+    fn reference_app_replay_script(
+        plan: &ReplayPlan,
+    ) -> Result<ReferenceAppReplayScript, ReferenceAppReplayScriptError> {
+        let steps = plan.steps();
+        if steps.len() != 2 {
+            return Err(ReferenceAppReplayScriptError::UnexpectedStepCount {
+                actual: steps.len(),
+            });
+        }
+        let ReplayOperation::DriveCheckout {
+            captured_payment_intent_id,
+        } = steps[0].operation()
+        else {
+            return Err(ReferenceAppReplayScriptError::ExpectedDriveCheckout);
+        };
+        let ReplayOperation::ConfirmPaymentIntent { payment_intent_id } = steps[1].operation()
+        else {
+            return Err(ReferenceAppReplayScriptError::ExpectedConfirmPaymentIntent);
+        };
+        if captured_payment_intent_id != payment_intent_id {
+            return Err(ReferenceAppReplayScriptError::PaymentIntentMismatch);
+        }
+        Ok(ReferenceAppReplayScript {
+            fixture_seed: plan.seed(),
+            expected_payment_intent_id: captured_payment_intent_id.clone(),
+        })
+    }
+
+    fn committed_replay_plan() -> ReplayPlan {
+        replay_plan_from_json(include_str!("../../../../spike/compiled-trace-v1.json"))
+    }
+
+    fn replay_plan_from_json(document: &str) -> ReplayPlan {
+        let trace: CompiledTrace = serde_json::from_str(document).expect("the trace is valid");
+        ReplayPlan::from_trace(&trace).expect("the trace compiles into a replay plan")
+    }
+
+    #[test]
+    fn reference_app_replay_script_is_derived_from_the_committed_trace_plan() {
+        let plan = committed_replay_plan();
+        let script = reference_app_replay_script(&plan).expect("the committed trace is executable");
+
+        assert_eq!(script.fixture_seed(), Seed::new(7));
+        assert_eq!(
+            script.expected_payment_intent_id(),
+            "pi_tiv_7dc6fb6eb37270c34d739b91"
+        );
+
+        let incomplete_plan = replay_plan_from_json(
+            r#"{
+            "schema_version": 1,
+            "seed": 7,
+            "actions": [{
+                "id": 1,
+                "kind": "DriveCheckout",
+                "dependencies": [],
+                "inputs": [],
+                "declared_outputs": ["PaymentIntentId"]
+            }],
+            "captured": [{
+                "output_ref": {"action_id": 1, "slot": "PaymentIntentId"},
+                "value": {"PaymentIntentId": "pi_tiv_7dc6fb6eb37270c34d739b91"}
+            }]
+        }"#,
+        );
+
+        assert_eq!(
+            reference_app_replay_script(&incomplete_plan),
+            Err(ReferenceAppReplayScriptError::UnexpectedStepCount { actual: 1 })
+        );
     }
 
     async fn run_buggy_checkout(
@@ -1274,20 +1377,33 @@ mod tests {
     async fn run_reference_app_checkout(
         postgres: &TruthSpikePostgres,
         case_name: &DatabaseName,
+        plan: &ReplayPlan,
         reset_sequence: u64,
-        confirm_sequence: u64,
     ) -> SnapshotReport {
+        let script = reference_app_replay_script(plan).expect("the trace has a supported script");
         let client = reqwest::Client::new();
         let control_base = std::env::var("TIV_FIXTURE_CONTROL_URL")
             .unwrap_or_else(|_| "http://127.0.0.1:12112".to_owned());
         let app_base = std::env::var("TIV_REFERENCE_APP_URL")
             .unwrap_or_else(|_| "http://127.0.0.1:18080".to_owned());
-        reset_fixture(&client, &control_base, reset_sequence).await;
-        drive_reference_checkout(&client, &app_base, case_name).await;
+        reset_fixture(
+            &client,
+            &control_base,
+            reset_sequence,
+            script.fixture_seed(),
+        )
+        .await;
+        drive_reference_checkout(&client, &app_base, case_name, &script).await;
         assert_fixture_control_is_isolated(&client, &app_base).await;
-        let attempts = confirm_fixture(&client, &control_base, confirm_sequence).await;
+        let attempts = confirm_fixture(&client, &control_base, reset_sequence + 1).await;
         deliver_webhook_attempts(&client, &app_base, &attempts).await;
         let provider_objects = fixture_provider_projection(&client, &control_base).await;
+        assert!(
+            provider_objects
+                .iter()
+                .any(|provider| provider.id() == script.expected_payment_intent_id()),
+            "the fixture projection must include the trace-bound PaymentIntent"
+        );
 
         postgres
             .check_reference_invariants(case_name, &provider_objects, quiescence())
@@ -1295,14 +1411,19 @@ mod tests {
             .expect("the real app path reaches the five-query oracle")
     }
 
-    async fn reset_fixture(client: &reqwest::Client, control_base: &str, sequence: u64) {
+    async fn reset_fixture(
+        client: &reqwest::Client,
+        control_base: &str,
+        sequence: u64,
+        seed: Seed,
+    ) {
         const CONTROL_TOKEN: &str = "run-scoped-control-token";
         let reset = client
             .post(format!("{control_base}/v1/control/reset"))
             .header("X-Tiv-Control-Token", CONTROL_TOKEN)
             .json(&serde_json::json!({
                 "command_sequence": sequence,
-                "seed": 42,
+                "seed": seed.value(),
                 "outcomes": ["commit_then_close", "normal"]
             }))
             .send()
@@ -1315,6 +1436,7 @@ mod tests {
         client: &reqwest::Client,
         app_base: &str,
         case_name: &DatabaseName,
+        script: &ReferenceAppReplayScript,
     ) {
         let checkout = client
             .post(format!("{app_base}/checkout"))
@@ -1333,6 +1455,10 @@ mod tests {
             checkout["payment_intent_id"]
                 .as_str()
                 .is_some_and(|id| id.starts_with("pi_tiv_"))
+        );
+        assert_eq!(
+            checkout["payment_intent_id"].as_str(),
+            Some(script.expected_payment_intent_id())
         );
     }
 
