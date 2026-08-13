@@ -1,6 +1,10 @@
 use tiv_core::trace::CompiledTrace;
-use tiv_runtime::replay::{
-    ReferenceReplayScript, ReferenceReplayScriptError, ReplayOperation, ReplayPlan,
+use tiv_runtime::{
+    postgres::safety::DatabaseName,
+    replay::{
+        ReferenceAppReplayConfig, ReferenceAppReplayConfigError, ReferenceReplayScript,
+        ReferenceReplayScriptError, ReplayOperation, ReplayPlan,
+    },
 };
 
 #[test]
@@ -58,6 +62,55 @@ fn reference_replay_script_is_derived_from_the_runtime_plan() {
     assert_eq!(
         ReferenceReplayScript::from_plan(&incomplete_plan),
         Err(ReferenceReplayScriptError::UnexpectedStepCount { actual: 1 })
+    );
+}
+
+#[test]
+fn reference_app_replay_config_accepts_only_loopback_prepared_case_execution() {
+    let case_database =
+        DatabaseName::parse("tiv_case_7dc6fb6e").expect("the generated case name is valid");
+    let config = ReferenceAppReplayConfig::new(
+        case_database.clone(),
+        "http://127.0.0.1:18080",
+        "http://127.0.0.1:12112",
+        "run-scoped-control-token",
+        1,
+        2,
+        1_700_000_000,
+    )
+    .expect("the bounded loopback reference replay config is valid");
+
+    assert_eq!(config.case_database(), &case_database);
+    assert_eq!(config.reference_app_url(), "http://127.0.0.1:18080");
+    assert_eq!(config.fixture_control_url(), "http://127.0.0.1:12112");
+    assert_eq!(config.fixture_control_token(), "run-scoped-control-token");
+    assert_eq!(config.reset_sequence(), 1);
+    assert_eq!(config.confirm_sequence(), 2);
+    assert_eq!(config.webhook_timestamp(), 1_700_000_000);
+
+    assert_eq!(
+        ReferenceAppReplayConfig::new(
+            case_database.clone(),
+            "https://example.com",
+            "http://127.0.0.1:12112",
+            "run-scoped-control-token",
+            1,
+            2,
+            1_700_000_000,
+        ),
+        Err(ReferenceAppReplayConfigError::NonLoopbackUrl)
+    );
+    assert_eq!(
+        ReferenceAppReplayConfig::new(
+            case_database,
+            "http://127.0.0.1:18080",
+            "http://127.0.0.1:12112",
+            "run-scoped-control-token",
+            1,
+            1,
+            1_700_000_000,
+        ),
+        Err(ReferenceAppReplayConfigError::InvalidSequence)
     );
 }
 

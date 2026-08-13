@@ -849,7 +849,10 @@ mod tests {
     use tiv_core::{decision::Seed, trace::CompiledTrace};
     use tiv_stripe_pi::{FaultOutcome, PaymentIntentFixture, http::serve_http1_connection};
 
-    use crate::replay::{ReferenceReplayScript, ReferenceReplayScriptError, ReplayPlan};
+    use crate::replay::{
+        ReferenceAppReplayConfig, ReferenceReplayScript, ReferenceReplayScriptError, ReplayPlan,
+        run_reference_app_replay,
+    };
     use tokio::{net::TcpListener, sync::Mutex, time::timeout};
 
     use super::*;
@@ -1325,196 +1328,41 @@ mod tests {
         plan: &ReplayPlan,
         reset_sequence: u64,
     ) -> SnapshotReport {
-        let script =
-            ReferenceReplayScript::from_plan(plan).expect("the trace has a supported script");
-        let client = reqwest::Client::new();
         let control_base = std::env::var("TIV_FIXTURE_CONTROL_URL")
             .unwrap_or_else(|_| "http://127.0.0.1:12112".to_owned());
         let app_base = std::env::var("TIV_REFERENCE_APP_URL")
             .unwrap_or_else(|_| "http://127.0.0.1:18080".to_owned());
-        reset_fixture(
-            &client,
+        let config = ReferenceAppReplayConfig::new(
+            case_name.clone(),
+            &app_base,
             &control_base,
+            "run-scoped-control-token",
             reset_sequence,
-            script.fixture_seed(),
+            reset_sequence + 1,
+            1_700_000_000,
         )
-        .await;
-        drive_reference_checkout(&client, &app_base, case_name, &script).await;
-        assert_fixture_control_is_isolated(&client, &app_base).await;
-        let attempts = confirm_fixture(&client, &control_base, reset_sequence + 1).await;
-        deliver_webhook_attempts(&client, &app_base, &attempts).await;
-        let provider_objects = fixture_provider_projection(&client, &control_base).await;
-        assert!(
-            provider_objects
-                .iter()
-                .any(|provider| provider.id() == script.expected_payment_intent_id()),
-            "the fixture projection must include the trace-bound PaymentIntent"
-        );
+        .expect("the reference app replay config is valid");
+        let receipt = run_reference_app_replay(plan, &config)
+            .await
+            .expect("the trace drives the real reference app");
+        let provider_objects = receipt
+            .provider_payment_intents()
+            .iter()
+            .map(|payment_intent| {
+                ProviderPaymentIntent::new(
+                    payment_intent.id(),
+                    payment_intent.amount_minor(),
+                    payment_intent.currency(),
+                    payment_intent.status(),
+                )
+                .expect("the fixture projection is valid")
+            })
+            .collect::<Vec<_>>();
 
         postgres
             .check_reference_invariants(case_name, &provider_objects, quiescence())
             .await
             .expect("the real app path reaches the five-query oracle")
-    }
-
-    async fn reset_fixture(
-        client: &reqwest::Client,
-        control_base: &str,
-        sequence: u64,
-        seed: Seed,
-    ) {
-        const CONTROL_TOKEN: &str = "run-scoped-control-token";
-        let reset = client
-            .post(format!("{control_base}/v1/control/reset"))
-            .header("X-Tiv-Control-Token", CONTROL_TOKEN)
-            .json(&serde_json::json!({
-                "command_sequence": sequence,
-                "seed": seed.value(),
-                "outcomes": ["commit_then_close", "normal"]
-            }))
-            .send()
-            .await
-            .expect("the host reaches the loopback-only fixture control listener");
-        assert_eq!(reset.status(), StatusCode::OK);
-    }
-
-    async fn drive_reference_checkout(
-        client: &reqwest::Client,
-        app_base: &str,
-        case_name: &DatabaseName,
-        script: &ReferenceReplayScript,
-    ) {
-        let checkout = client
-            .post(format!("{app_base}/checkout"))
-            .json(&serde_json::json!({
-                "database": case_name.as_str(),
-                "operation_id": "op_1",
-                "amount_minor": 2500,
-                "currency": "usd"
-            }))
-            .send()
-            .await
-            .expect("the host reaches the real reference application");
-        assert_eq!(checkout.status(), StatusCode::OK);
-        let checkout: serde_json::Value = checkout.json().await.expect("checkout returns JSON");
-        assert!(
-            checkout["payment_intent_id"]
-                .as_str()
-                .is_some_and(|id| id.starts_with("pi_tiv_"))
-        );
-        assert_eq!(
-            checkout["payment_intent_id"].as_str(),
-            Some(script.expected_payment_intent_id())
-        );
-    }
-
-    async fn assert_fixture_control_is_isolated(client: &reqwest::Client, app_base: &str) {
-        let isolation_probe = client
-            .get(format!("{app_base}/probe-fixture-control"))
-            .send()
-            .await
-            .expect("the app reports its control-network probe");
-        assert_eq!(isolation_probe.status(), StatusCode::OK);
-        let isolation_probe: serde_json::Value = isolation_probe
-            .json()
-            .await
-            .expect("the isolation probe is JSON");
-        assert_eq!(isolation_probe["reachable"], false);
-    }
-
-    async fn confirm_fixture(
-        client: &reqwest::Client,
-        control_base: &str,
-        sequence: u64,
-    ) -> Vec<serde_json::Value> {
-        const CONTROL_TOKEN: &str = "run-scoped-control-token";
-        let confirmation = client
-            .post(format!("{control_base}/v1/control/confirm-all"))
-            .header("X-Tiv-Control-Token", CONTROL_TOKEN)
-            .json(&serde_json::json!({
-                "command_sequence": sequence,
-                "timestamp": 1_700_000_000
-            }))
-            .send()
-            .await
-            .expect("the host confirms the fixture objects");
-        assert_eq!(confirmation.status(), StatusCode::OK);
-        let confirmation: serde_json::Value = confirmation
-            .json()
-            .await
-            .expect("the signed attempts are JSON");
-        let attempts = confirmation["attempts"]
-            .as_array()
-            .expect("confirmation exports attempts");
-        assert_eq!(attempts.len(), 2);
-        attempts.clone()
-    }
-
-    async fn deliver_webhook_attempts(
-        client: &reqwest::Client,
-        app_base: &str,
-        attempts: &[serde_json::Value],
-    ) {
-        for attempt in attempts {
-            let raw_body = hex::decode(
-                attempt["raw_body_hex"]
-                    .as_str()
-                    .expect("the attempt carries raw bytes"),
-            )
-            .expect("the raw-body transport is valid hex");
-            let delivery = client
-                .post(format!("{app_base}/webhooks/stripe"))
-                .header(
-                    "Stripe-Signature",
-                    attempt["signature_header"]
-                        .as_str()
-                        .expect("the attempt carries a signature"),
-                )
-                .body(raw_body)
-                .send()
-                .await
-                .expect("the exact signed bytes reach the app handler");
-            assert_eq!(delivery.status(), StatusCode::OK);
-        }
-    }
-
-    async fn fixture_provider_projection(
-        client: &reqwest::Client,
-        control_base: &str,
-    ) -> Vec<ProviderPaymentIntent> {
-        const CONTROL_TOKEN: &str = "run-scoped-control-token";
-        let state = client
-            .get(format!("{control_base}/v1/control/state"))
-            .header("X-Tiv-Control-Token", CONTROL_TOKEN)
-            .send()
-            .await
-            .expect("the host reads the bounded provider projection");
-        assert_eq!(state.status(), StatusCode::OK);
-        let state: serde_json::Value = state.json().await.expect("fixture state is JSON");
-        let provider_objects = state["payment_intents"]
-            .as_array()
-            .expect("fixture state carries provider objects")
-            .iter()
-            .map(|payment_intent| {
-                ProviderPaymentIntent::new(
-                    payment_intent["id"]
-                        .as_str()
-                        .expect("the provider ID is present"),
-                    payment_intent["amount_minor"]
-                        .as_i64()
-                        .expect("the amount is present"),
-                    payment_intent["currency"]
-                        .as_str()
-                        .expect("the currency is present"),
-                    payment_intent["status"]
-                        .as_str()
-                        .expect("the status is present"),
-                )
-                .expect("the fixture projection is valid")
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(provider_objects.len(), 2);
-        provider_objects
     }
 
     fn provider_uniqueness_failure(report: &SnapshotReport) -> &InvariantOutcome {

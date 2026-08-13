@@ -1,10 +1,11 @@
 use std::process::ExitCode;
 
 use clap::Parser;
-use tiv_cli::{Cli, execute};
+use tiv_cli::{Cli, execute_async};
 
-fn main() -> ExitCode {
-    match execute(Cli::parse()) {
+#[tokio::main]
+async fn main() -> ExitCode {
+    match execute_async(Cli::parse()).await {
         Ok(output) => {
             println!("{output}");
             ExitCode::SUCCESS

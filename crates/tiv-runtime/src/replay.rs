@@ -1,6 +1,8 @@
 //! Read-only replay preparation for compiled traces.
 
-use serde::Serialize;
+use crate::postgres::safety::{DatabaseKind, DatabaseName};
+
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tiv_core::{
     decision::Seed,
@@ -178,6 +180,253 @@ pub enum ReferenceReplayScriptError {
     PaymentIntentMismatch,
 }
 
+/// Loopback-only execution contract for the known-bug reference app replay.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReferenceAppReplayConfig {
+    case_database: DatabaseName,
+    reference_app_url: String,
+    fixture_control_url: String,
+    fixture_control_token: String,
+    reset_sequence: u64,
+    confirm_sequence: u64,
+    webhook_timestamp: i64,
+}
+
+impl ReferenceAppReplayConfig {
+    /// Builds the bounded reference app replay configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReferenceAppReplayConfigError`] unless the target database is
+    /// a generated case database, both HTTP targets are loopback-only URLs, the
+    /// fixture control token is non-empty, and command sequences are ordered.
+    pub fn new(
+        case_database: DatabaseName,
+        reference_app_url: impl Into<String>,
+        fixture_control_url: impl Into<String>,
+        fixture_control_token: impl Into<String>,
+        reset_sequence: u64,
+        confirm_sequence: u64,
+        webhook_timestamp: i64,
+    ) -> Result<Self, ReferenceAppReplayConfigError> {
+        if case_database.kind() != DatabaseKind::Case {
+            return Err(ReferenceAppReplayConfigError::InvalidCaseDatabase);
+        }
+        if reset_sequence == 0 || confirm_sequence <= reset_sequence {
+            return Err(ReferenceAppReplayConfigError::InvalidSequence);
+        }
+        if webhook_timestamp <= 0 {
+            return Err(ReferenceAppReplayConfigError::InvalidTimestamp);
+        }
+        let fixture_control_token = fixture_control_token.into();
+        if fixture_control_token.trim().is_empty() {
+            return Err(ReferenceAppReplayConfigError::MissingControlToken);
+        }
+        Ok(Self {
+            case_database,
+            reference_app_url: normalize_loopback_http_url(reference_app_url)?,
+            fixture_control_url: normalize_loopback_http_url(fixture_control_url)?,
+            fixture_control_token,
+            reset_sequence,
+            confirm_sequence,
+            webhook_timestamp,
+        })
+    }
+
+    #[must_use]
+    pub const fn case_database(&self) -> &DatabaseName {
+        &self.case_database
+    }
+
+    #[must_use]
+    pub fn reference_app_url(&self) -> &str {
+        &self.reference_app_url
+    }
+
+    #[must_use]
+    pub fn fixture_control_url(&self) -> &str {
+        &self.fixture_control_url
+    }
+
+    #[must_use]
+    pub fn fixture_control_token(&self) -> &str {
+        &self.fixture_control_token
+    }
+
+    #[must_use]
+    pub const fn reset_sequence(&self) -> u64 {
+        self.reset_sequence
+    }
+
+    #[must_use]
+    pub const fn confirm_sequence(&self) -> u64 {
+        self.confirm_sequence
+    }
+
+    #[must_use]
+    pub const fn webhook_timestamp(&self) -> i64 {
+        self.webhook_timestamp
+    }
+}
+
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+pub enum ReferenceAppReplayConfigError {
+    #[error("reference app replay requires a generated case database")]
+    InvalidCaseDatabase,
+    #[error("reference app replay URLs must be loopback http endpoints without paths")]
+    NonLoopbackUrl,
+    #[error("fixture control token is required")]
+    MissingControlToken,
+    #[error("fixture control sequences must start at a positive reset sequence and confirm later")]
+    InvalidSequence,
+    #[error("webhook timestamp must be positive")]
+    InvalidTimestamp,
+}
+
+/// Result of one reference app replay execution.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ReferenceAppReplayReceipt {
+    fixture_seed: u64,
+    expected_payment_intent_id: String,
+    checkout_payment_intent_id: String,
+    fixture_control_isolated: bool,
+    delivered_webhook_count: usize,
+    provider_payment_intents: Vec<ReferenceProviderPaymentIntent>,
+}
+
+impl ReferenceAppReplayReceipt {
+    #[must_use]
+    pub const fn fixture_seed(&self) -> u64 {
+        self.fixture_seed
+    }
+
+    #[must_use]
+    pub fn expected_payment_intent_id(&self) -> &str {
+        &self.expected_payment_intent_id
+    }
+
+    #[must_use]
+    pub fn checkout_payment_intent_id(&self) -> &str {
+        &self.checkout_payment_intent_id
+    }
+
+    #[must_use]
+    pub const fn fixture_control_isolated(&self) -> bool {
+        self.fixture_control_isolated
+    }
+
+    #[must_use]
+    pub const fn delivered_webhook_count(&self) -> usize {
+        self.delivered_webhook_count
+    }
+
+    #[must_use]
+    pub fn provider_payment_intents(&self) -> &[ReferenceProviderPaymentIntent] {
+        &self.provider_payment_intents
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ReferenceProviderPaymentIntent {
+    id: String,
+    amount_minor: i64,
+    currency: String,
+    status: String,
+    operation_id: Option<String>,
+}
+
+impl ReferenceProviderPaymentIntent {
+    #[must_use]
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    #[must_use]
+    pub const fn amount_minor(&self) -> i64 {
+        self.amount_minor
+    }
+
+    #[must_use]
+    pub fn currency(&self) -> &str {
+        &self.currency
+    }
+
+    #[must_use]
+    pub fn status(&self) -> &str {
+        &self.status
+    }
+
+    #[must_use]
+    pub fn operation_id(&self) -> Option<&str> {
+        self.operation_id.as_deref()
+    }
+}
+
+/// Executes one bounded checkout replay against the isolated reference app.
+///
+/// # Errors
+///
+/// Returns [`ReferenceAppReplayError`] when the trace cannot form the current
+/// reference script, the loopback services reject a step, or returned JSON is
+/// outside the narrow reference contract.
+pub async fn run_reference_app_replay(
+    plan: &ReplayPlan,
+    config: &ReferenceAppReplayConfig,
+) -> Result<ReferenceAppReplayReceipt, ReferenceAppReplayError> {
+    let script = ReferenceReplayScript::from_plan(plan)?;
+    let client = reqwest::Client::new();
+
+    reset_fixture(&client, config, script.fixture_seed()).await?;
+    let checkout_payment_intent_id = drive_reference_checkout(&client, config, &script).await?;
+    let fixture_control_isolated = assert_fixture_control_is_isolated(&client, config).await?;
+    let attempts = confirm_fixture(&client, config).await?;
+    deliver_webhook_attempts(&client, config, &attempts).await?;
+    let provider_payment_intents = fixture_provider_projection(&client, config).await?;
+    if !provider_payment_intents
+        .iter()
+        .any(|payment_intent| payment_intent.id == script.expected_payment_intent_id())
+    {
+        return Err(ReferenceAppReplayError::MissingExpectedPaymentIntent);
+    }
+
+    Ok(ReferenceAppReplayReceipt {
+        fixture_seed: script.fixture_seed().value(),
+        expected_payment_intent_id: script.expected_payment_intent_id().to_owned(),
+        checkout_payment_intent_id,
+        fixture_control_isolated,
+        delivered_webhook_count: attempts.len(),
+        provider_payment_intents,
+    })
+}
+
+#[derive(Debug, Error)]
+pub enum ReferenceAppReplayError {
+    #[error("trace cannot form a reference app replay script: {0}")]
+    Script(#[from] ReferenceReplayScriptError),
+    #[error("reference app replay HTTP request failed: {0}")]
+    Http(#[from] reqwest::Error),
+    #[error("reference app replay step {step} returned HTTP {status}")]
+    UnexpectedStatus { step: &'static str, status: u16 },
+    #[error("reference app checkout did not return the trace-bound PaymentIntent")]
+    CheckoutPaymentIntentMismatch,
+    #[error("reference app checkout returned an unexpected operation ID")]
+    CheckoutOperationMismatch,
+    #[error("reference app can reach the fixture control listener")]
+    FixtureControlReachable,
+    #[error("fixture confirmation did not return exactly two webhook attempts")]
+    UnexpectedWebhookAttemptCount,
+    #[error("fixture confirmation returned an unexpected command sequence")]
+    UnexpectedConfirmSequence,
+    #[error("fixture confirmation returned an unexpected webhook attempt")]
+    UnexpectedWebhookAttempt,
+    #[error("fixture state did not match the completed replay contract")]
+    UnexpectedFixtureState,
+    #[error("fixture webhook attempt body is not valid hex")]
+    InvalidWebhookBodyHex,
+    #[error("fixture projection did not contain the expected PaymentIntent")]
+    MissingExpectedPaymentIntent,
+}
+
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
 pub enum ReplayPlanError {
     #[error("drive checkout action {0:?} did not capture a PaymentIntent ID")]
@@ -191,4 +440,218 @@ fn payment_intent_id(value: Option<&CapturedValue>) -> Option<String> {
         Some(CapturedValue::PaymentIntentId(id)) => Some(id.as_str().to_owned()),
         Some(CapturedValue::EventId(_)) | None => None,
     }
+}
+
+fn normalize_loopback_http_url(
+    value: impl Into<String>,
+) -> Result<String, ReferenceAppReplayConfigError> {
+    let value = value.into();
+    if value.chars().any(char::is_whitespace) {
+        return Err(ReferenceAppReplayConfigError::NonLoopbackUrl);
+    }
+    let url =
+        reqwest::Url::parse(&value).map_err(|_| ReferenceAppReplayConfigError::NonLoopbackUrl)?;
+    if url.scheme() != "http"
+        || !matches!(url.host_str(), Some("127.0.0.1" | "localhost"))
+        || url.port().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || !matches!(url.path(), "" | "/")
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(ReferenceAppReplayConfigError::NonLoopbackUrl);
+    }
+    Ok(url.as_str().trim_end_matches('/').to_owned())
+}
+
+async fn reset_fixture(
+    client: &reqwest::Client,
+    config: &ReferenceAppReplayConfig,
+    seed: Seed,
+) -> Result<(), ReferenceAppReplayError> {
+    let response = client
+        .post(format!("{}/v1/control/reset", config.fixture_control_url()))
+        .header("X-Tiv-Control-Token", config.fixture_control_token())
+        .json(&serde_json::json!({
+            "command_sequence": config.reset_sequence(),
+            "seed": seed.value(),
+            "outcomes": ["commit_then_close", "normal"]
+        }))
+        .send()
+        .await?;
+    let _response = require_ok(response, "fixture reset")?;
+    Ok(())
+}
+
+async fn drive_reference_checkout(
+    client: &reqwest::Client,
+    config: &ReferenceAppReplayConfig,
+    script: &ReferenceReplayScript,
+) -> Result<String, ReferenceAppReplayError> {
+    let response = client
+        .post(format!("{}/checkout", config.reference_app_url()))
+        .json(&serde_json::json!({
+            "database": config.case_database().as_str(),
+            "operation_id": "op_1",
+            "amount_minor": 2500,
+            "currency": "usd"
+        }))
+        .send()
+        .await?;
+    let response = require_ok(response, "reference checkout")?;
+    let checkout = response.json::<CheckoutResponse>().await?;
+    if checkout.payment_intent_id != script.expected_payment_intent_id() {
+        return Err(ReferenceAppReplayError::CheckoutPaymentIntentMismatch);
+    }
+    if checkout.operation_id != "op_1" {
+        return Err(ReferenceAppReplayError::CheckoutOperationMismatch);
+    }
+    Ok(checkout.payment_intent_id)
+}
+
+async fn assert_fixture_control_is_isolated(
+    client: &reqwest::Client,
+    config: &ReferenceAppReplayConfig,
+) -> Result<bool, ReferenceAppReplayError> {
+    let response = client
+        .get(format!(
+            "{}/probe-fixture-control",
+            config.reference_app_url()
+        ))
+        .send()
+        .await?;
+    let response = require_ok(response, "fixture isolation probe")?;
+    let isolation = response.json::<FixtureIsolationResponse>().await?;
+    if isolation.reachable {
+        return Err(ReferenceAppReplayError::FixtureControlReachable);
+    }
+    Ok(true)
+}
+
+async fn confirm_fixture(
+    client: &reqwest::Client,
+    config: &ReferenceAppReplayConfig,
+) -> Result<Vec<SignedWebhookAttempt>, ReferenceAppReplayError> {
+    let response = client
+        .post(format!(
+            "{}/v1/control/confirm-all",
+            config.fixture_control_url()
+        ))
+        .header("X-Tiv-Control-Token", config.fixture_control_token())
+        .json(&serde_json::json!({
+            "command_sequence": config.confirm_sequence(),
+            "timestamp": config.webhook_timestamp()
+        }))
+        .send()
+        .await?;
+    let response = require_ok(response, "fixture confirm")?;
+    let confirmation = response.json::<ConfirmationResponse>().await?;
+    if confirmation.command_sequence != config.confirm_sequence() {
+        return Err(ReferenceAppReplayError::UnexpectedConfirmSequence);
+    }
+    if confirmation.attempts.len() != 2 {
+        return Err(ReferenceAppReplayError::UnexpectedWebhookAttemptCount);
+    }
+    if confirmation.attempts.iter().any(|attempt| {
+        attempt.timestamp != config.webhook_timestamp() || !attempt.event_id.starts_with("evt_tiv_")
+    }) {
+        return Err(ReferenceAppReplayError::UnexpectedWebhookAttempt);
+    }
+    Ok(confirmation.attempts)
+}
+
+async fn deliver_webhook_attempts(
+    client: &reqwest::Client,
+    config: &ReferenceAppReplayConfig,
+    attempts: &[SignedWebhookAttempt],
+) -> Result<(), ReferenceAppReplayError> {
+    for attempt in attempts {
+        let raw_body = hex::decode(&attempt.raw_body_hex)
+            .map_err(|_| ReferenceAppReplayError::InvalidWebhookBodyHex)?;
+        let response = client
+            .post(format!("{}/webhooks/stripe", config.reference_app_url()))
+            .header("Stripe-Signature", &attempt.signature_header)
+            .body(raw_body)
+            .send()
+            .await?;
+        let _response = require_ok(response, "webhook delivery")?;
+    }
+    Ok(())
+}
+
+async fn fixture_provider_projection(
+    client: &reqwest::Client,
+    config: &ReferenceAppReplayConfig,
+) -> Result<Vec<ReferenceProviderPaymentIntent>, ReferenceAppReplayError> {
+    let response = client
+        .get(format!("{}/v1/control/state", config.fixture_control_url()))
+        .header("X-Tiv-Control-Token", config.fixture_control_token())
+        .send()
+        .await?;
+    let response = require_ok(response, "fixture state")?;
+    let state = response.json::<FixtureStateResponse>().await?;
+    if state.command_sequence != config.confirm_sequence()
+        || state.remaining_outcomes != 0
+        || state.payment_intents.len() != 2
+        || state.payment_intents.iter().any(|payment_intent| {
+            payment_intent.operation_id() != Some("op_1")
+                || payment_intent.amount_minor() != 2_500
+                || payment_intent.currency() != "usd"
+        })
+    {
+        return Err(ReferenceAppReplayError::UnexpectedFixtureState);
+    }
+    Ok(state.payment_intents)
+}
+
+fn require_ok(
+    response: reqwest::Response,
+    step: &'static str,
+) -> Result<reqwest::Response, ReferenceAppReplayError> {
+    let status = response.status();
+    if !status.is_success() {
+        return Err(ReferenceAppReplayError::UnexpectedStatus {
+            step,
+            status: status.as_u16(),
+        });
+    }
+    Ok(response)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CheckoutResponse {
+    payment_intent_id: String,
+    operation_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FixtureIsolationResponse {
+    reachable: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConfirmationResponse {
+    command_sequence: u64,
+    attempts: Vec<SignedWebhookAttempt>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SignedWebhookAttempt {
+    event_id: String,
+    timestamp: i64,
+    raw_body_hex: String,
+    signature_header: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FixtureStateResponse {
+    payment_intents: Vec<ReferenceProviderPaymentIntent>,
+    command_sequence: u64,
+    remaining_outcomes: usize,
 }

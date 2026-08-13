@@ -1125,6 +1125,7 @@ dependencies = [
  "thiserror",
  "tiv-core",
  "tiv-runtime",
+ "tokio",
 ]
 
 [[package]]

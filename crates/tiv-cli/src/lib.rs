@@ -2,11 +2,17 @@
 
 use std::{fs, path::PathBuf};
 
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use serde::Serialize;
 use thiserror::Error;
 use tiv_core::trace::CompiledTrace;
-use tiv_runtime::replay::{ReplayPlan, ReplayPlanError};
+use tiv_runtime::{
+    postgres::safety::DatabaseName,
+    replay::{
+        ReferenceAppReplayConfig, ReferenceAppReplayConfigError, ReferenceAppReplayError,
+        ReplayPlan, ReplayPlanError, run_reference_app_replay,
+    },
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 pub struct TraceSummary {
@@ -43,6 +49,36 @@ pub enum Command {
 pub enum ReplayCommand {
     /// Compile a trace into the runtime replay plan without executing it.
     Inspect { path: PathBuf },
+    /// Execute the committed reference-app checkout path against loopback services.
+    ReferenceApp(ReferenceAppReplayArgs),
+}
+
+#[derive(Clone, Debug, PartialEq, Args)]
+pub struct ReferenceAppReplayArgs {
+    /// Compiled trace JSON document to replay.
+    #[arg(long)]
+    pub trace: PathBuf,
+    /// Generated case database already provisioned in the isolated reference stack.
+    #[arg(long)]
+    pub case_database: String,
+    /// Loopback URL for the real reference application.
+    #[arg(long)]
+    pub reference_app_url: String,
+    /// Loopback URL for the fixture control listener.
+    #[arg(long)]
+    pub fixture_control_url: String,
+    /// Run-scoped fixture control token.
+    #[arg(long)]
+    pub fixture_control_token: String,
+    /// Fixture reset command sequence.
+    #[arg(long, default_value_t = 1)]
+    pub reset_sequence: u64,
+    /// Fixture confirm command sequence.
+    #[arg(long, default_value_t = 2)]
+    pub confirm_sequence: u64,
+    /// Synthetic webhook timestamp used by the fixture.
+    #[arg(long, default_value_t = 1_700_000_000)]
+    pub webhook_timestamp: i64,
 }
 
 #[derive(Debug, PartialEq, Subcommand)]
@@ -61,11 +97,12 @@ pub fn execute(cli: Cli) -> Result<String, CliError> {
         Command::Replay {
             command: ReplayCommand::Inspect { path },
         } => {
-            let document = read_trace_document(&path)?;
-            let trace: CompiledTrace = serde_json::from_str(&document)?;
-            let plan = ReplayPlan::from_trace(&trace)?;
+            let plan = replay_plan_from_path(&path)?;
             serde_json::to_string(&plan).map_err(CliError::Encode)
         }
+        Command::Replay {
+            command: ReplayCommand::ReferenceApp(_),
+        } => Err(CliError::AsyncCommand),
         Command::Trace {
             command: TraceCommand::Validate { path },
         } => {
@@ -73,6 +110,36 @@ pub fn execute(cli: Cli) -> Result<String, CliError> {
             let summary = validate_trace_json(&document)?;
             serde_json::to_string(&summary).map_err(CliError::Encode)
         }
+    }
+}
+
+/// Executes one CLI command, including bounded async replay execution commands.
+///
+/// # Errors
+///
+/// Returns [`CliError`] when input validation, replay execution, or JSON
+/// encoding fails.
+pub async fn execute_async(cli: Cli) -> Result<String, CliError> {
+    match cli.command {
+        Command::Replay {
+            command: ReplayCommand::ReferenceApp(args),
+        } => {
+            let plan = replay_plan_from_path(&args.trace)?;
+            let case_database = DatabaseName::parse(args.case_database)
+                .map_err(|_| CliError::InvalidCaseDatabase)?;
+            let config = ReferenceAppReplayConfig::new(
+                case_database,
+                args.reference_app_url,
+                args.fixture_control_url,
+                args.fixture_control_token,
+                args.reset_sequence,
+                args.confirm_sequence,
+                args.webhook_timestamp,
+            )?;
+            let receipt = run_reference_app_replay(&plan, &config).await?;
+            serde_json::to_string(&receipt).map_err(CliError::Encode)
+        }
+        read_only => execute(Cli { command: read_only }),
     }
 }
 
@@ -97,6 +164,12 @@ fn read_trace_document(path: &PathBuf) -> Result<String, CliError> {
     })
 }
 
+fn replay_plan_from_path(path: &PathBuf) -> Result<ReplayPlan, CliError> {
+    let document = read_trace_document(path)?;
+    let trace: CompiledTrace = serde_json::from_str(&document)?;
+    ReplayPlan::from_trace(&trace).map_err(CliError::ReplayPlan)
+}
+
 #[derive(Debug, Error)]
 pub enum CliError {
     #[error("could not read trace {path}: {source}")]
@@ -108,6 +181,14 @@ pub enum CliError {
     InvalidTrace(#[from] serde_json::Error),
     #[error("compiled trace cannot be replayed by this runtime: {0}")]
     ReplayPlan(#[from] ReplayPlanError),
+    #[error("reference app replay requires async execution")]
+    AsyncCommand,
+    #[error("invalid generated case database")]
+    InvalidCaseDatabase,
+    #[error("reference app replay configuration is invalid: {0}")]
+    ReferenceAppReplayConfig(#[from] ReferenceAppReplayConfigError),
+    #[error("reference app replay failed: {0}")]
+    ReferenceAppReplay(#[from] ReferenceAppReplayError),
     #[error("could not encode trace summary: {0}")]
     Encode(serde_json::Error),
 }

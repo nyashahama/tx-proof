@@ -12,6 +12,7 @@ serde_json.workspace = true
 thiserror.workspace = true
 tiv-core = { path = "../tiv-core" }
 tiv-runtime = { path = "../tiv-runtime" }
+tokio.workspace = true
 
 [[bin]]
 name = "tiv"
