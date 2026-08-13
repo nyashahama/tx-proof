@@ -114,6 +114,70 @@ pub enum ReplayOperation {
     ConfirmPaymentIntent { payment_intent_id: String },
 }
 
+/// The executable script shape currently supported by the reference app spike.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReferenceReplayScript {
+    fixture_seed: Seed,
+    expected_payment_intent_id: String,
+}
+
+impl ReferenceReplayScript {
+    /// Derives the reference app replay script from a runtime plan without
+    /// hard-coding fixture identities in the executor.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReferenceReplayScriptError`] when the plan is not the current
+    /// commit-then-close checkout shape supported by the reference app replay.
+    pub fn from_plan(plan: &ReplayPlan) -> Result<Self, ReferenceReplayScriptError> {
+        let steps = plan.steps();
+        if steps.len() != 2 {
+            return Err(ReferenceReplayScriptError::UnexpectedStepCount {
+                actual: steps.len(),
+            });
+        }
+        let ReplayOperation::DriveCheckout {
+            captured_payment_intent_id,
+        } = steps[0].operation()
+        else {
+            return Err(ReferenceReplayScriptError::ExpectedDriveCheckout);
+        };
+        let ReplayOperation::ConfirmPaymentIntent { payment_intent_id } = steps[1].operation()
+        else {
+            return Err(ReferenceReplayScriptError::ExpectedConfirmPaymentIntent);
+        };
+        if captured_payment_intent_id != payment_intent_id {
+            return Err(ReferenceReplayScriptError::PaymentIntentMismatch);
+        }
+        Ok(Self {
+            fixture_seed: plan.seed(),
+            expected_payment_intent_id: captured_payment_intent_id.clone(),
+        })
+    }
+
+    #[must_use]
+    pub const fn fixture_seed(&self) -> Seed {
+        self.fixture_seed
+    }
+
+    #[must_use]
+    pub fn expected_payment_intent_id(&self) -> &str {
+        &self.expected_payment_intent_id
+    }
+}
+
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+pub enum ReferenceReplayScriptError {
+    #[error("reference replay requires exactly two trace steps, got {actual}")]
+    UnexpectedStepCount { actual: usize },
+    #[error("first replay step must drive checkout")]
+    ExpectedDriveCheckout,
+    #[error("second replay step must confirm the PaymentIntent")]
+    ExpectedConfirmPaymentIntent,
+    #[error("confirm step targets a different PaymentIntent than checkout produced")]
+    PaymentIntentMismatch,
+}
+
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
 pub enum ReplayPlanError {
     #[error("drive checkout action {0:?} did not capture a PaymentIntent ID")]

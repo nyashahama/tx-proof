@@ -849,7 +849,7 @@ mod tests {
     use tiv_core::{decision::Seed, trace::CompiledTrace};
     use tiv_stripe_pi::{FaultOutcome, PaymentIntentFixture, http::serve_http1_connection};
 
-    use crate::replay::{ReplayOperation, ReplayPlan};
+    use crate::replay::{ReferenceReplayScript, ReferenceReplayScriptError, ReplayPlan};
     use tokio::{net::TcpListener, sync::Mutex, time::timeout};
 
     use super::*;
@@ -1199,62 +1199,6 @@ mod tests {
         ]
     }
 
-    #[derive(Clone, Debug, Eq, PartialEq)]
-    struct ReferenceAppReplayScript {
-        fixture_seed: Seed,
-        expected_payment_intent_id: String,
-    }
-
-    impl ReferenceAppReplayScript {
-        const fn fixture_seed(&self) -> Seed {
-            self.fixture_seed
-        }
-
-        fn expected_payment_intent_id(&self) -> &str {
-            &self.expected_payment_intent_id
-        }
-    }
-
-    #[derive(Clone, Debug, Error, Eq, PartialEq)]
-    enum ReferenceAppReplayScriptError {
-        #[error("reference app replay requires exactly two trace steps, got {actual}")]
-        UnexpectedStepCount { actual: usize },
-        #[error("first replay step must drive checkout")]
-        ExpectedDriveCheckout,
-        #[error("second replay step must confirm the PaymentIntent")]
-        ExpectedConfirmPaymentIntent,
-        #[error("confirm step targets a different PaymentIntent than checkout produced")]
-        PaymentIntentMismatch,
-    }
-
-    fn reference_app_replay_script(
-        plan: &ReplayPlan,
-    ) -> Result<ReferenceAppReplayScript, ReferenceAppReplayScriptError> {
-        let steps = plan.steps();
-        if steps.len() != 2 {
-            return Err(ReferenceAppReplayScriptError::UnexpectedStepCount {
-                actual: steps.len(),
-            });
-        }
-        let ReplayOperation::DriveCheckout {
-            captured_payment_intent_id,
-        } = steps[0].operation()
-        else {
-            return Err(ReferenceAppReplayScriptError::ExpectedDriveCheckout);
-        };
-        let ReplayOperation::ConfirmPaymentIntent { payment_intent_id } = steps[1].operation()
-        else {
-            return Err(ReferenceAppReplayScriptError::ExpectedConfirmPaymentIntent);
-        };
-        if captured_payment_intent_id != payment_intent_id {
-            return Err(ReferenceAppReplayScriptError::PaymentIntentMismatch);
-        }
-        Ok(ReferenceAppReplayScript {
-            fixture_seed: plan.seed(),
-            expected_payment_intent_id: captured_payment_intent_id.clone(),
-        })
-    }
-
     fn committed_replay_plan() -> ReplayPlan {
         replay_plan_from_json(include_str!("../../../../spike/compiled-trace-v1.json"))
     }
@@ -1267,7 +1211,8 @@ mod tests {
     #[test]
     fn reference_app_replay_script_is_derived_from_the_committed_trace_plan() {
         let plan = committed_replay_plan();
-        let script = reference_app_replay_script(&plan).expect("the committed trace is executable");
+        let script =
+            ReferenceReplayScript::from_plan(&plan).expect("the committed trace is executable");
 
         assert_eq!(script.fixture_seed(), Seed::new(7));
         assert_eq!(
@@ -1294,8 +1239,8 @@ mod tests {
         );
 
         assert_eq!(
-            reference_app_replay_script(&incomplete_plan),
-            Err(ReferenceAppReplayScriptError::UnexpectedStepCount { actual: 1 })
+            ReferenceReplayScript::from_plan(&incomplete_plan),
+            Err(ReferenceReplayScriptError::UnexpectedStepCount { actual: 1 })
         );
     }
 
@@ -1380,7 +1325,8 @@ mod tests {
         plan: &ReplayPlan,
         reset_sequence: u64,
     ) -> SnapshotReport {
-        let script = reference_app_replay_script(plan).expect("the trace has a supported script");
+        let script =
+            ReferenceReplayScript::from_plan(plan).expect("the trace has a supported script");
         let client = reqwest::Client::new();
         let control_base = std::env::var("TIV_FIXTURE_CONTROL_URL")
             .unwrap_or_else(|_| "http://127.0.0.1:12112".to_owned());
@@ -1436,7 +1382,7 @@ mod tests {
         client: &reqwest::Client,
         app_base: &str,
         case_name: &DatabaseName,
-        script: &ReferenceAppReplayScript,
+        script: &ReferenceReplayScript,
     ) {
         let checkout = client
             .post(format!("{app_base}/checkout"))
