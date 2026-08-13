@@ -59,7 +59,7 @@ pub enum ReplayCommand {
     Inspect { path: PathBuf },
     /// Execute the committed reference-app checkout path against loopback services.
     ReferenceApp(ReferenceAppReplayArgs),
-    /// Provision, reset, and replay the reference app into bounded evidence.
+    /// Run three fresh-baseline reference attempts into bounded evidence.
     ReferenceAppEvidence(ReferenceAppEvidenceArgs),
 }
 
@@ -93,7 +93,7 @@ pub struct ReferenceAppReplayArgs {
 
 #[derive(Clone, Debug, PartialEq, Args)]
 pub struct ReferenceAppEvidenceArgs {
-    /// Compiled trace JSON document to replay twice.
+    /// Compiled trace JSON document to replay three times.
     #[arg(long)]
     pub trace: PathBuf,
     /// Loopback host port for the isolated `PostgreSQL` service.

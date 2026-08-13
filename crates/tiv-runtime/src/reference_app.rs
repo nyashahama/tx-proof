@@ -8,7 +8,7 @@ use std::{
 
 use serde::Deserialize;
 use thiserror::Error;
-use tiv_core::result::FailureIdentity;
+use tiv_core::result::{AttemptResult, FailureIdentity};
 use tokio::{
     io::{AsyncRead, AsyncReadExt},
     process::Command,
@@ -445,8 +445,8 @@ struct PortBinding {
     host_port: String,
 }
 
-/// Provisions one reference database pair, runs both replay legs around a
-/// template reset, and returns allowlisted same-failure evidence.
+/// Provisions one reference database pair, runs three replay attempts from
+/// fresh baseline clones, and returns allowlisted reproduction evidence.
 ///
 /// The known reference application completes database work synchronously
 /// before each HTTP response. Therefore completion of the replay driver's
@@ -455,8 +455,10 @@ struct PortBinding {
 ///
 /// # Errors
 ///
-/// Returns [`ReferenceAppEvidenceError`] when `PostgreSQL` safety checks, replay,
-/// oracle evaluation, reset identity, or evidence coherence fails.
+/// Returns [`ReferenceAppEvidenceError`] when `PostgreSQL` safety checks,
+/// replay, oracle evaluation, either reset identity, or evidence coherence
+/// fails. Operational failures abort without an evidence document; only
+/// completed oracle outcomes contribute to reproduction classification.
 pub async fn run_reference_app_evidence(
     plan: &ReplayPlan,
     config: &ReferenceAppEvidenceConfig,
@@ -496,14 +498,11 @@ pub async fn run_reference_app_evidence(
     let case_name = provisioned.case_name().clone();
     let first_database_oid = provisioned.case_target().identity().database_oid();
 
-    let first_timestamp = current_unix_timestamp()?;
-    let first_config = config.replay_config(case_name.clone(), 1, 2, first_timestamp)?;
-    let first_receipt = run_reference_app_replay(plan, &first_config).await?;
-    let first_provider_object_count = first_receipt.provider_payment_intents().len();
-    let first_report = evaluate_completed_replay(&postgres, &case_name, first_receipt).await?;
-    let first_failure = provider_uniqueness_failure(&first_report)?;
+    let (first_provider_object_count, first_report) =
+        run_reference_app_attempt(&postgres, plan, config, &case_name, 1, 2).await?;
+    let (expected_failure, first_attempt) = provider_uniqueness_attempt(&first_report)?;
 
-    let reset_target = postgres
+    let first_reset_target = postgres
         .reset_case_from_template(
             provisioned.into_case_target(),
             &baseline_target,
@@ -511,22 +510,56 @@ pub async fn run_reference_app_evidence(
         )
         .await
         .map_err(ReferenceAppEvidenceError::postgres)?;
-    let reset_database_oid = reset_target.identity().database_oid();
+    let second_database_oid = first_reset_target.identity().database_oid();
 
-    let replay_timestamp = current_unix_timestamp()?;
-    let replay_config = config.replay_config(case_name.clone(), 3, 4, replay_timestamp)?;
-    let replay_receipt = run_reference_app_replay(plan, &replay_config).await?;
-    let replay_report = evaluate_completed_replay(&postgres, &case_name, replay_receipt).await?;
-    let replay_failure = provider_uniqueness_failure(&replay_report)?;
+    let (second_provider_object_count, second_report) =
+        run_reference_app_attempt(&postgres, plan, config, &case_name, 3, 4).await?;
+    let (_, second_attempt) = provider_uniqueness_attempt(&second_report)?;
+
+    let second_reset_target = postgres
+        .reset_case_from_template(first_reset_target, &baseline_target, Uuid::new_v4())
+        .await
+        .map_err(ReferenceAppEvidenceError::postgres)?;
+    let third_database_oid = second_reset_target.identity().database_oid();
+
+    let (third_provider_object_count, third_report) =
+        run_reference_app_attempt(&postgres, plan, config, &case_name, 5, 6).await?;
+    let (_, third_attempt) = provider_uniqueness_attempt(&third_report)?;
+
+    let attempts = [first_attempt, second_attempt, third_attempt];
 
     TruthSpikeEvidence::new(
-        first_provider_object_count,
-        first_database_oid,
-        reset_database_oid,
-        &first_failure,
-        &replay_failure,
+        [
+            first_provider_object_count,
+            second_provider_object_count,
+            third_provider_object_count,
+        ],
+        [first_database_oid, second_database_oid, third_database_oid],
+        &expected_failure,
+        &attempts,
     )
     .map_err(ReferenceAppEvidenceError::Evidence)
+}
+
+async fn run_reference_app_attempt(
+    postgres: &TruthSpikePostgres,
+    plan: &ReplayPlan,
+    config: &ReferenceAppEvidenceConfig,
+    case_name: &DatabaseName,
+    reset_sequence: u64,
+    confirm_sequence: u64,
+) -> Result<(usize, SnapshotReport), ReferenceAppEvidenceError> {
+    let timestamp = current_unix_timestamp()?;
+    let replay_config = config.replay_config(
+        case_name.clone(),
+        reset_sequence,
+        confirm_sequence,
+        timestamp,
+    )?;
+    let receipt = run_reference_app_replay(plan, &replay_config).await?;
+    let provider_object_count = receipt.provider_payment_intents().len();
+    let report = evaluate_completed_replay(postgres, case_name, receipt).await?;
+    Ok((provider_object_count, report))
 }
 
 fn current_unix_timestamp() -> Result<i64, ReferenceAppEvidenceError> {
@@ -562,22 +595,25 @@ async fn evaluate_completed_replay(
         .map_err(ReferenceAppEvidenceError::postgres)
 }
 
-fn provider_uniqueness_failure(
+fn provider_uniqueness_attempt(
     report: &SnapshotReport,
-) -> Result<FailureIdentity, ReferenceAppEvidenceError> {
+) -> Result<(FailureIdentity, AttemptResult), ReferenceAppEvidenceError> {
     let outcome = report
         .outcome(PROVIDER_UNIQUENESS_ID)
-        .ok_or(ReferenceAppEvidenceError::MissingProviderUniquenessFailure)?;
-    let InvariantVerdict::Violated(witnesses) = outcome.verdict() else {
-        return Err(ReferenceAppEvidenceError::MissingProviderUniquenessFailure);
-    };
-    if witnesses.len() != 1
-        || witnesses[0].operation_id() != OPERATION_ID
-        || witnesses[0].provider_object_count() != 2
-    {
-        return Err(ReferenceAppEvidenceError::UnexpectedProviderUniquenessWitness);
+        .ok_or(ReferenceAppEvidenceError::MissingProviderUniquenessOutcome)?;
+    let identity = outcome.identity().clone();
+    match outcome.verdict() {
+        InvariantVerdict::Held => Ok((identity, AttemptResult::Held)),
+        InvariantVerdict::Violated(witnesses) => {
+            if witnesses.len() != 1
+                || witnesses[0].operation_id() != OPERATION_ID
+                || witnesses[0].provider_object_count() != 2
+            {
+                return Err(ReferenceAppEvidenceError::UnexpectedProviderUniquenessWitness);
+            }
+            Ok((identity.clone(), AttemptResult::Violation(identity)))
+        }
     }
-    Ok(outcome.identity().clone())
 }
 
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
@@ -604,8 +640,8 @@ pub enum ReferenceAppEvidenceError {
     InvalidProviderProjection,
     #[error("the system clock could not produce a valid webhook timestamp")]
     InvalidSystemTime,
-    #[error("provider-object-unique did not fail after reference replay")]
-    MissingProviderUniquenessFailure,
+    #[error("the reference oracle omitted provider-object-unique")]
+    MissingProviderUniquenessOutcome,
     #[error("provider-object-unique returned an unexpected bounded witness")]
     UnexpectedProviderUniquenessWitness,
     #[error("reference replay evidence was incoherent: {0}")]

@@ -108,10 +108,17 @@ TIV_POSTGRES_APPLICATION_PASSWORD=tiv-app-local-only-password \
 The command provisions a generated case database, installs a sequenced
 `commit_then_close`/`normal` fault plan, drives the application checkout, signs
 and delivers the fixture's exact raw webhook bytes, observes two provider and
-local objects for `op_1`, runs the five-query snapshot, resets from the sealed
-template, and requires the replayed failure identity to match. Standard output
-is one allowlisted JSON evidence document; PostgreSQL passwords, the fixture
-control token, raw webhook material, and generated database names are omitted.
+local objects for `op_1`, and runs the five-query snapshot. It repeats that
+exact trace three times, cloning the sealed baseline before attempts two and
+three, then classifies the expected invariant/checkpoint identity as `stable`
+(3/3), `reproducible` (2/3), or `inconclusive` (0/3 or 1/3). Standard output is
+one schema-v2 allowlisted JSON evidence document containing the three provider
+counts, two database-reset transitions, failure identity, match count, and
+classification; PostgreSQL passwords, the fixture control token, raw webhook
+material, and generated database names are omitted.
+Only completed oracle attempts contribute to that classification. An
+attestation, transport, PostgreSQL, reset, or oracle-execution error aborts the
+command without emitting evidence instead of being relabeled `inconclusive`.
 Before sending either database password, the command bypasses ambient remote
 Docker contexts and uses the local `/var/run/docker.sock` control plane to
 attest the expected running Compose project and all three healthy service

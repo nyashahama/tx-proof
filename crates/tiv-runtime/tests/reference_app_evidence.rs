@@ -48,7 +48,7 @@ async fn evidence_config_rejects_invalid_postgres_credentials_before_execution()
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires the isolated reference-app Compose project"]
-async fn evidence_run_provisions_resets_and_replays_the_same_failure_identity() {
+async fn evidence_run_provisions_three_fresh_attempts_and_classifies_the_same_failure_identity() {
     let postgres_port = std::env::var("TIV_POSTGRES_TEST_PORT")
         .ok()
         .and_then(|value| value.parse().ok())
@@ -75,23 +75,31 @@ async fn evidence_run_provisions_resets_and_replays_the_same_failure_identity() 
 
     let evidence = run_reference_app_evidence(&plan, &config)
         .await
-        .expect("the two-leg reference replay emits coherent evidence");
+        .expect("the three-attempt reference replay emits coherent evidence");
     let encoded = evidence
         .to_pretty_json()
         .expect("the bounded evidence serializes");
     let value: serde_json::Value = serde_json::from_str(&encoded).expect("the evidence is JSON");
 
-    assert_eq!(value["schema_version"], 1);
-    assert_eq!(value["provider_object_count"], 2);
+    assert_eq!(value["schema_version"], 2);
+    assert_eq!(
+        value["provider_object_counts"],
+        serde_json::json!([2, 2, 2])
+    );
     assert_eq!(
         value["failure_identity"]["invariant_id"],
         "provider-object-unique"
     );
-    assert_eq!(value["fresh_replay_same_identity"], true);
-    assert_ne!(
-        value["database_reset"]["before_oid"],
-        value["database_reset"]["after_oid"]
-    );
+    assert_eq!(value["reproduction"]["attempt_count"], 3);
+    assert_eq!(value["reproduction"]["matching_failure_count"], 3);
+    assert_eq!(value["reproduction"]["classification"], "stable");
+    let resets = value["database_resets"]
+        .as_array()
+        .expect("database resets are an array");
+    assert_eq!(resets.len(), 2);
+    assert_ne!(resets[0]["before_oid"], resets[0]["after_oid"]);
+    assert_ne!(resets[1]["before_oid"], resets[1]["after_oid"]);
+    assert_eq!(resets[0]["after_oid"], resets[1]["before_oid"]);
     assert!(!encoded.contains("run-scoped-control-token"));
     assert!(!encoded.contains("tiv-app-local-only-password"));
 }

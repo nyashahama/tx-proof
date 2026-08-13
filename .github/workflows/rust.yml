@@ -152,7 +152,7 @@ jobs:
             --file spike/reference-app.compose.yaml \
             up --detach --build --wait
 
-      - name: Prove the executable reference application counterexample and replay
+      - name: Prove three fresh-baseline reference application attempts
         env:
           TIV_FIXTURE_CONTROL_TOKEN: run-scoped-control-token
           TIV_POSTGRES_ADMIN_PASSWORD: tiv-local-only-password
@@ -167,11 +167,16 @@ jobs:
             --fixture-control-url http://127.0.0.1:12112 \
             | tee ci-evidence/reference-app-evidence.json
           jq -e '
-            .schema_version == 1 and
-            .provider_object_count == 2 and
+            .schema_version == 2 and
+            .provider_object_counts == [2, 2, 2] and
             .failure_identity.invariant_id == "provider-object-unique" and
-            .fresh_replay_same_identity == true and
-            .database_reset.before_oid != .database_reset.after_oid
+            .failure_identity.checkpoint_id == "checkout-quiescent" and
+            .reproduction.attempt_count == 3 and
+            .reproduction.matching_failure_count == 3 and
+            .reproduction.classification == "stable" and
+            (.database_resets | length) == 2 and
+            all(.database_resets[]; .before_oid != .after_oid) and
+            .database_resets[0].after_oid == .database_resets[1].before_oid
           ' ci-evidence/reference-app-evidence.json
 
       - name: Capture isolated service logs after a failure

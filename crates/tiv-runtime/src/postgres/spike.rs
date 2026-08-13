@@ -893,7 +893,7 @@ mod tests {
     };
 
     use reqwest::StatusCode;
-    use tiv_core::{decision::Seed, trace::CompiledTrace};
+    use tiv_core::{decision::Seed, result::AttemptResult, trace::CompiledTrace};
     use tiv_stripe_pi::{FaultOutcome, PaymentIntentFixture, http::serve_http1_connection};
 
     use crate::replay::{
@@ -990,7 +990,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore = "requires the isolated tiv-truth-spike-postgres Compose project"]
-    async fn full_commit_close_reset_and_replay_chain_has_one_failure_identity() {
+    async fn full_commit_close_three_attempt_chain_has_one_failure_identity() {
         let postgres = test_postgres().await;
         let suffix = Uuid::new_v4().simple().to_string()[..16].to_owned();
         let provisioned = postgres
@@ -1005,21 +1005,37 @@ mod tests {
         let first_identity = provider_uniqueness_failure(&first_report)
             .identity()
             .clone();
-        let reset_target = postgres
+        let second_case_target = postgres
             .reset_case_from_template(dirty_case_target, &baseline_target, Uuid::new_v4())
             .await
             .expect("the marked case resets from the sealed template");
-        let reset_database_oid = reset_target.identity().database_oid();
-        let (replay_report, _replayed_case_target) =
-            run_buggy_checkout(&postgres, reset_target).await;
-        let replay_identity = provider_uniqueness_failure(&replay_report).identity();
+        let second_database_oid = second_case_target.identity().database_oid();
+        let (second_report, second_dirty_case_target) =
+            run_buggy_checkout(&postgres, second_case_target).await;
+        let second_identity = provider_uniqueness_failure(&second_report)
+            .identity()
+            .clone();
+        let third_case_target = postgres
+            .reset_case_from_template(second_dirty_case_target, &baseline_target, Uuid::new_v4())
+            .await
+            .expect("the second marked case resets from the sealed template");
+        let third_database_oid = third_case_target.identity().database_oid();
+        let (third_report, _third_dirty_case_target) =
+            run_buggy_checkout(&postgres, third_case_target).await;
+        let third_identity = provider_uniqueness_failure(&third_report)
+            .identity()
+            .clone();
+        let attempts = [
+            AttemptResult::Violation(first_identity.clone()),
+            AttemptResult::Violation(second_identity),
+            AttemptResult::Violation(third_identity),
+        ];
 
         let evidence = TruthSpikeEvidence::new(
-            2,
-            first_database_oid,
-            reset_database_oid,
+            [2, 2, 2],
+            [first_database_oid, second_database_oid, third_database_oid],
             &first_identity,
-            replay_identity,
+            &attempts,
         )
         .expect("the observed chain forms coherent bounded evidence");
         let encoded = evidence
@@ -1347,7 +1363,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore = "requires the isolated reference-app Compose project"]
-    async fn real_reference_app_replays_commit_close_with_the_same_failure_identity() {
+    async fn real_reference_app_runs_three_fresh_commit_close_attempts() {
         let postgres = test_reference_postgres().await;
         let suffix = Uuid::new_v4().simple().to_string()[..16].to_owned();
         let provisioned = postgres
@@ -1363,7 +1379,7 @@ mod tests {
         let first_identity = provider_uniqueness_failure(&first_report)
             .identity()
             .clone();
-        let reset_target = postgres
+        let second_case_target = postgres
             .reset_case_from_template(
                 provisioned.into_case_target(),
                 &baseline_target,
@@ -1371,16 +1387,31 @@ mod tests {
             )
             .await
             .expect("the real app case resets from the sealed template");
-        let reset_database_oid = reset_target.identity().database_oid();
+        let second_database_oid = second_case_target.identity().database_oid();
 
-        let replay_report = run_reference_app_checkout(&postgres, &case_name, &plan, 3).await;
-        let replay_identity = provider_uniqueness_failure(&replay_report).identity();
+        let second_report = run_reference_app_checkout(&postgres, &case_name, &plan, 3).await;
+        let second_identity = provider_uniqueness_failure(&second_report)
+            .identity()
+            .clone();
+        let third_case_target = postgres
+            .reset_case_from_template(second_case_target, &baseline_target, Uuid::new_v4())
+            .await
+            .expect("the second real app case resets from the sealed template");
+        let third_database_oid = third_case_target.identity().database_oid();
+        let third_report = run_reference_app_checkout(&postgres, &case_name, &plan, 5).await;
+        let third_identity = provider_uniqueness_failure(&third_report)
+            .identity()
+            .clone();
+        let attempts = [
+            AttemptResult::Violation(first_identity.clone()),
+            AttemptResult::Violation(second_identity),
+            AttemptResult::Violation(third_identity),
+        ];
         let evidence = TruthSpikeEvidence::new(
-            2,
-            first_database_oid,
-            reset_database_oid,
+            [2, 2, 2],
+            [first_database_oid, second_database_oid, third_database_oid],
             &first_identity,
-            replay_identity,
+            &attempts,
         )
         .expect("the real application path forms coherent bounded evidence");
         let encoded = evidence

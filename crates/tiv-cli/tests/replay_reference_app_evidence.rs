@@ -38,12 +38,24 @@ fn reference_app_evidence_command_ignores_remote_docker_context_and_emits_the_co
     );
     let value: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("stdout is one JSON evidence document");
-    assert_eq!(value["schema_version"], 1);
-    assert_eq!(value["provider_object_count"], 2);
+    assert_eq!(value["schema_version"], 2);
+    assert_eq!(
+        value["provider_object_counts"],
+        serde_json::json!([2, 2, 2])
+    );
     assert_eq!(
         value["failure_identity"]["invariant_id"],
         "provider-object-unique"
     );
-    assert_eq!(value["fresh_replay_same_identity"], true);
+    assert_eq!(value["reproduction"]["attempt_count"], 3);
+    assert_eq!(value["reproduction"]["matching_failure_count"], 3);
+    assert_eq!(value["reproduction"]["classification"], "stable");
+    assert_eq!(
+        value["database_resets"]
+            .as_array()
+            .expect("database resets are an array")
+            .len(),
+        2
+    );
     assert!(!String::from_utf8_lossy(&output.stdout).contains("password"));
 }
