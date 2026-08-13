@@ -1,0 +1,434 @@
+{
+  "$defs": {
+    "DatabaseStrategy": {
+      "enum": [
+        "template_then_dump_fallback"
+      ],
+      "type": "string"
+    },
+    "DriverMethod": {
+      "enum": [
+        "POST"
+      ],
+      "type": "string"
+    },
+    "InvariantExpectation": {
+      "enum": [
+        "zero_rows"
+      ],
+      "type": "string"
+    },
+    "ProcessCutPoint": {
+      "enum": [
+        "client_request_forwarded",
+        "client_response_observed",
+        "webhook_request_forwarded",
+        "webhook_response_observed",
+        "sql_probe"
+      ],
+      "type": "string"
+    },
+    "RawComposeConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "application_service": {
+          "type": "string"
+        },
+        "files": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "health_timeout": {
+          "type": "string"
+        },
+        "health_url": {
+          "type": "string"
+        },
+        "postgres_service": {
+          "type": "string"
+        },
+        "worker_services": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "files",
+        "application_service",
+        "postgres_service",
+        "worker_services",
+        "health_url",
+        "health_timeout"
+      ],
+      "type": "object"
+    },
+    "RawDatabaseConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "admin_url_env": {
+          "type": "string"
+        },
+        "baseline_database": {
+          "type": "string"
+        },
+        "case_database": {
+          "type": "string"
+        },
+        "case_url_env": {
+          "type": "string"
+        },
+        "invariant_role": {
+          "type": "string"
+        },
+        "lock_timeout": {
+          "type": "string"
+        },
+        "quiescence_sql": {
+          "type": "string"
+        },
+        "quiescence_stable_for": {
+          "type": "string"
+        },
+        "quiescence_timeout": {
+          "type": "string"
+        },
+        "statement_timeout": {
+          "type": "string"
+        },
+        "strategy": {
+          "$ref": "#/$defs/DatabaseStrategy"
+        }
+      },
+      "required": [
+        "admin_url_env",
+        "case_url_env",
+        "strategy",
+        "case_database",
+        "baseline_database",
+        "invariant_role",
+        "quiescence_sql",
+        "quiescence_stable_for",
+        "quiescence_timeout",
+        "statement_timeout",
+        "lock_timeout"
+      ],
+      "type": "object"
+    },
+    "RawDriverConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "body_file": {
+          "type": "string"
+        },
+        "method": {
+          "$ref": "#/$defs/DriverMethod"
+        },
+        "timeout": {
+          "type": "string"
+        },
+        "url": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "method",
+        "url",
+        "body_file",
+        "timeout"
+      ],
+      "type": "object"
+    },
+    "RawFaultConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "process": {
+          "$ref": "#/$defs/RawProcessFaultConfig"
+        },
+        "stripe_api": {
+          "$ref": "#/$defs/RawStripeApiFaultConfig"
+        },
+        "webhooks": {
+          "$ref": "#/$defs/RawWebhookFaultConfig"
+        }
+      },
+      "required": [
+        "webhooks",
+        "stripe_api",
+        "process"
+      ],
+      "type": "object"
+    },
+    "RawInvariantConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "expect": {
+          "$ref": "#/$defs/InvariantExpectation"
+        },
+        "id": {
+          "type": "string"
+        },
+        "sql_file": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "sql_file",
+        "expect"
+      ],
+      "type": "object"
+    },
+    "RawProcessFaultConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "cut_points": {
+          "items": {
+            "$ref": "#/$defs/ProcessCutPoint"
+          },
+          "type": "array"
+        },
+        "max_kills_per_case": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "service": {
+          "type": "string"
+        },
+        "sql_probe_file": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "service",
+        "max_kills_per_case",
+        "cut_points",
+        "sql_probe_file"
+      ],
+      "type": "object"
+    },
+    "RawRunConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "artifact_dir": {
+          "type": "string"
+        },
+        "case_timeout": {
+          "type": "string"
+        },
+        "cases": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_actions_per_case": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "parallelism": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "seed": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "cases",
+        "seed",
+        "max_actions_per_case",
+        "case_timeout",
+        "parallelism",
+        "artifact_dir"
+      ],
+      "type": "object"
+    },
+    "RawSafetyConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "database_name_prefix": {
+          "type": "string"
+        },
+        "deny_live_stripe_keys": {
+          "type": "boolean"
+        },
+        "deny_public_ips": {
+          "type": "boolean"
+        },
+        "max_database_bytes": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "mode": {
+          "$ref": "#/$defs/SafetyMode"
+        },
+        "require_database_marker": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "mode",
+        "deny_public_ips",
+        "deny_live_stripe_keys",
+        "database_name_prefix",
+        "require_database_marker",
+        "max_database_bytes"
+      ],
+      "type": "object"
+    },
+    "RawStripeApiFaultConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "outcomes": {
+          "items": {
+            "$ref": "#/$defs/StripeApiOutcome"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "outcomes"
+      ],
+      "type": "object"
+    },
+    "RawStripeConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "adapter": {
+          "$ref": "#/$defs/StripeAdapter"
+        },
+        "api_version": {
+          "type": "string"
+        },
+        "application_base_url": {
+          "type": "string"
+        },
+        "webhook_secret_env": {
+          "type": "string"
+        },
+        "webhook_url": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "adapter",
+        "api_version",
+        "application_base_url",
+        "webhook_url",
+        "webhook_secret_env"
+      ],
+      "type": "object"
+    },
+    "RawWebhookFaultConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "allow_drop": {
+          "type": "boolean"
+        },
+        "allow_reorder": {
+          "type": "boolean"
+        },
+        "delay_ms": {
+          "items": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "type": "array"
+        },
+        "duplicate_max": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "duplicate_max",
+        "allow_reorder",
+        "allow_drop",
+        "delay_ms"
+      ],
+      "type": "object"
+    },
+    "SafetyMode": {
+      "enum": [
+        "local_disposable_only"
+      ],
+      "type": "string"
+    },
+    "StripeAdapter": {
+      "enum": [
+        "payment_intent_v1"
+      ],
+      "type": "string"
+    },
+    "StripeApiOutcome": {
+      "enum": [
+        "normal",
+        "pre_execute_429",
+        "pre_execute_500",
+        "post_execute_500",
+        "commit_then_close",
+        "commit_then_delay"
+      ],
+      "type": "string"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "compose": {
+      "$ref": "#/$defs/RawComposeConfig"
+    },
+    "database": {
+      "$ref": "#/$defs/RawDatabaseConfig"
+    },
+    "driver": {
+      "$ref": "#/$defs/RawDriverConfig"
+    },
+    "faults": {
+      "$ref": "#/$defs/RawFaultConfig"
+    },
+    "invariants": {
+      "items": {
+        "$ref": "#/$defs/RawInvariantConfig"
+      },
+      "type": "array"
+    },
+    "run": {
+      "$ref": "#/$defs/RawRunConfig"
+    },
+    "safety": {
+      "$ref": "#/$defs/RawSafetyConfig"
+    },
+    "schema_version": {
+      "const": 1,
+      "type": "integer"
+    },
+    "stripe": {
+      "$ref": "#/$defs/RawStripeConfig"
+    }
+  },
+  "required": [
+    "schema_version",
+    "run",
+    "safety",
+    "compose",
+    "database",
+    "stripe",
+    "driver",
+    "faults",
+    "invariants"
+  ],
+  "title": "TxProof configuration v1",
+  "type": "object"
+}

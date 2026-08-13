@@ -11,6 +11,8 @@ use serde::Serialize;
 use thiserror::Error;
 use tiv_core::trace::CompiledTrace;
 use tiv_runtime::{
+    config::ProcessEnvironment,
+    doctor::{DoctorError, run_doctor},
     postgres::safety::DatabaseName,
     reference_app::{
         ReferenceAppEvidenceConfig, ReferenceAppEvidenceConfigError, ReferenceAppEvidenceError,
@@ -41,6 +43,8 @@ pub struct Cli {
 
 #[derive(Debug, PartialEq, Subcommand)]
 pub enum Command {
+    /// Validate configuration and inspect local Compose readiness without mutation.
+    Doctor(DoctorArgs),
     /// Inspect replay readiness without executing customer code.
     Replay {
         #[command(subcommand)]
@@ -51,6 +55,13 @@ pub enum Command {
         #[command(subcommand)]
         command: TraceCommand,
     },
+}
+
+#[derive(Clone, Debug, PartialEq, Args)]
+pub struct DoctorArgs {
+    /// Typed TOML configuration to validate and inspect.
+    #[arg(long, default_value = "tiv.toml")]
+    pub config: PathBuf,
 }
 
 #[derive(Debug, PartialEq, Subcommand)]
@@ -129,7 +140,8 @@ pub fn execute(cli: Cli) -> Result<String, CliError> {
             let plan = replay_plan_from_path(&path)?;
             serde_json::to_string(&plan).map_err(CliError::Encode)
         }
-        Command::Replay {
+        Command::Doctor(_)
+        | Command::Replay {
             command: ReplayCommand::ReferenceApp(_) | ReplayCommand::ReferenceAppEvidence(_),
         } => Err(CliError::AsyncCommand),
         Command::Trace {
@@ -150,6 +162,10 @@ pub fn execute(cli: Cli) -> Result<String, CliError> {
 /// encoding fails.
 pub async fn execute_async(cli: Cli) -> Result<String, CliError> {
     match cli.command {
+        Command::Doctor(args) => {
+            let report = run_doctor(&args.config, &ProcessEnvironment).await?;
+            report.to_pretty_json().map_err(CliError::Encode)
+        }
         Command::Replay {
             command: ReplayCommand::ReferenceApp(args),
         } => {
@@ -245,8 +261,10 @@ pub enum CliError {
     InvalidTrace(#[from] serde_json::Error),
     #[error("compiled trace cannot be replayed by this runtime: {0}")]
     ReplayPlan(#[from] ReplayPlanError),
-    #[error("reference app replay requires async execution")]
+    #[error("this command requires async execution")]
     AsyncCommand,
+    #[error("doctor preflight failed: {0}")]
+    Doctor(#[from] DoctorError),
     #[error("invalid generated case database")]
     InvalidCaseDatabase,
     #[error("required environment variable {0} is missing or invalid")]
@@ -263,4 +281,16 @@ pub enum CliError {
     ReferenceAppEvidence(#[from] ReferenceAppEvidenceError),
     #[error("could not encode trace summary: {0}")]
     Encode(serde_json::Error),
+}
+
+impl CliError {
+    /// Maps outer-boundary failures onto the documented non-overlapping CLI
+    /// exit contract.
+    #[must_use]
+    pub fn exit_code(&self) -> u8 {
+        match self {
+            Self::Doctor(error) if error.is_infrastructure_failure() => 3,
+            _ => 2,
+        }
+    }
 }

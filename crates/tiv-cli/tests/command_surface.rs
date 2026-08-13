@@ -1,7 +1,28 @@
 use clap::Parser;
 use tiv_cli::{
-    Cli, Command, ReferenceAppEvidenceArgs, ReferenceAppReplayArgs, ReplayCommand, TraceCommand,
+    Cli, Command, DoctorArgs, ReferenceAppEvidenceArgs, ReferenceAppReplayArgs, ReplayCommand,
+    TraceCommand,
 };
+
+#[test]
+fn the_cli_exposes_doctor_with_a_safe_default_config_path() {
+    let default = Cli::try_parse_from(["tiv", "doctor"]).expect("the doctor command parses");
+    assert_eq!(
+        default.command,
+        Command::Doctor(DoctorArgs {
+            config: "tiv.toml".into(),
+        })
+    );
+
+    let explicit = Cli::try_parse_from(["tiv", "doctor", "--config", "safe/tiv.toml"])
+        .expect("the explicit doctor config parses");
+    assert_eq!(
+        explicit.command,
+        Command::Doctor(DoctorArgs {
+            config: "safe/tiv.toml".into(),
+        })
+    );
+}
 
 #[test]
 fn the_cli_exposes_only_the_narrow_trace_validation_command_for_this_slice() {

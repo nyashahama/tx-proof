@@ -12,7 +12,7 @@ async fn main() -> ExitCode {
         }
         Err(error) => {
             eprintln!("error: {error}");
-            ExitCode::from(2)
+            ExitCode::from(error.exit_code())
         }
     }
 }
