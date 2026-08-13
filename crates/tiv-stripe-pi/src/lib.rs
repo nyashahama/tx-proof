@@ -63,7 +63,9 @@ pub struct InvalidOperationId;
 pub struct CreatePaymentIntent {
     amount_minor: i64,
     currency: String,
-    operation_id: Option<OperationId>,
+    capture_method: Option<String>,
+    metadata: BTreeMap<String, String>,
+    receipt_email: Option<String>,
 }
 
 impl CreatePaymentIntent {
@@ -89,20 +91,60 @@ impl CreatePaymentIntent {
         Ok(Self {
             amount_minor,
             currency,
-            operation_id: None,
+            capture_method: None,
+            metadata: BTreeMap::new(),
+            receipt_email: None,
         })
     }
 
     #[must_use]
-    pub fn with_operation_id(mut self, operation_id: OperationId) -> Self {
-        self.operation_id = Some(operation_id);
+    pub fn with_operation_id(mut self, operation_id: &OperationId) -> Self {
+        self.metadata
+            .insert("operation_id".to_owned(), operation_id.as_str().to_owned());
         self
+    }
+
+    pub(crate) fn set_capture_method(
+        &mut self,
+        capture_method: impl Into<String>,
+    ) -> Result<(), InvalidCreateRequest> {
+        let capture_method = capture_method.into();
+        if !matches!(capture_method.as_str(), "automatic" | "manual") {
+            return Err(InvalidCreateRequest::InvalidCaptureMethod);
+        }
+        self.capture_method = Some(capture_method);
+        Ok(())
+    }
+
+    pub(crate) fn insert_metadata(
+        &mut self,
+        key: &'static str,
+        value: impl Into<String>,
+    ) -> Result<(), InvalidOperationId> {
+        let value = OperationId::new(value)?;
+        self.metadata
+            .insert(key.to_owned(), value.as_str().to_owned());
+        Ok(())
+    }
+
+    pub(crate) fn set_receipt_email(
+        &mut self,
+        receipt_email: impl Into<String>,
+    ) -> Result<(), InvalidCreateRequest> {
+        let receipt_email = receipt_email.into();
+        if receipt_email.trim().is_empty() || receipt_email.chars().count() > 320 {
+            return Err(InvalidCreateRequest::InvalidReceiptEmail);
+        }
+        self.receipt_email = Some(receipt_email);
+        Ok(())
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InvalidCreateRequest {
+    InvalidCaptureMethod,
     InvalidCurrency,
+    InvalidReceiptEmail,
     NonPositiveAmount,
 }
 
@@ -121,7 +163,7 @@ pub struct PaymentIntent {
     id: String,
     amount_minor: i64,
     currency: String,
-    operation_id: Option<OperationId>,
+    metadata: BTreeMap<String, String>,
     status: PaymentIntentStatus,
 }
 
@@ -138,7 +180,12 @@ impl PaymentIntent {
 
     #[must_use]
     pub fn operation_id(&self) -> Option<&str> {
-        self.operation_id.as_ref().map(OperationId::as_str)
+        self.metadata.get("operation_id").map(String::as_str)
+    }
+
+    #[must_use]
+    pub fn metadata_value(&self, key: &str) -> Option<&str> {
+        self.metadata.get(key).map(String::as_str)
     }
 
     #[must_use]
@@ -313,15 +360,11 @@ struct PaymentIntentWire<'a> {
     id: &'a str,
     object: &'static str,
     amount: i64,
+    amount_received: i64,
+    client_secret: String,
     currency: &'a str,
     status: &'static str,
-    metadata: PaymentIntentMetadataWire<'a>,
-}
-
-#[derive(Serialize)]
-struct PaymentIntentMetadataWire<'a> {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    operation_id: Option<&'a str>,
+    metadata: &'a BTreeMap<String, String>,
 }
 
 fn payment_intent_json(payment_intent: &PaymentIntent) -> Result<Vec<u8>, FixtureError> {
@@ -329,17 +372,32 @@ fn payment_intent_json(payment_intent: &PaymentIntent) -> Result<Vec<u8>, Fixtur
         PaymentIntentStatus::RequiresConfirmation => "requires_confirmation",
         PaymentIntentStatus::Succeeded => "succeeded",
     };
-    serde_json::to_vec(&PaymentIntentWire {
+    serde_json::to_vec(&payment_intent_wire(payment_intent, status))
+        .map_err(|_| FixtureError::Serialization)
+}
+
+fn payment_intent_wire<'a>(
+    payment_intent: &'a PaymentIntent,
+    status: &'static str,
+) -> PaymentIntentWire<'a> {
+    PaymentIntentWire {
         id: &payment_intent.id,
         object: "payment_intent",
         amount: payment_intent.amount_minor,
+        amount_received: if status == "succeeded" {
+            payment_intent.amount_minor
+        } else {
+            0
+        },
+        client_secret: payment_intent_client_secret(&payment_intent.id),
         currency: &payment_intent.currency,
         status,
-        metadata: PaymentIntentMetadataWire {
-            operation_id: payment_intent.operation_id(),
-        },
-    })
-    .map_err(|_| FixtureError::Serialization)
+        metadata: &payment_intent.metadata,
+    }
+}
+
+fn payment_intent_client_secret(id: &str) -> String {
+    format!("{id}_secret_tiv")
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -530,6 +588,7 @@ pub struct PaymentIntentSnapshot {
     amount_minor: i64,
     currency: String,
     status: &'static str,
+    metadata: BTreeMap<String, String>,
     operation_id: Option<String>,
 }
 
@@ -558,6 +617,11 @@ impl PaymentIntentSnapshot {
     pub fn operation_id(&self) -> Option<&str> {
         self.operation_id.as_deref()
     }
+
+    #[must_use]
+    pub fn metadata_value(&self, key: &str) -> Option<&str> {
+        self.metadata.get(key).map(String::as_str)
+    }
 }
 
 impl From<&PaymentIntent> for PaymentIntentSnapshot {
@@ -571,6 +635,7 @@ impl From<&PaymentIntent> for PaymentIntentSnapshot {
             amount_minor: payment_intent.amount_minor(),
             currency: payment_intent.currency().to_owned(),
             status,
+            metadata: payment_intent.metadata.clone(),
             operation_id: payment_intent.operation_id().map(str::to_owned),
         }
     }
@@ -749,7 +814,7 @@ impl PaymentIntentFixture {
             id: self.payment_intent_id(sequence),
             amount_minor: request.amount_minor,
             currency: request.currency.clone(),
-            operation_id: request.operation_id.clone(),
+            metadata: request.metadata.clone(),
             status: PaymentIntentStatus::RequiresConfirmation,
         };
         self.payment_intents.push(payment_intent.clone());
@@ -808,16 +873,7 @@ impl PaymentIntentFixture {
                 object: "event",
                 event_type: "payment_intent.succeeded",
                 data: EventDataWire {
-                    object: PaymentIntentWire {
-                        id: &payment_intent.id,
-                        object: "payment_intent",
-                        amount: payment_intent.amount_minor,
-                        currency: &payment_intent.currency,
-                        status: "succeeded",
-                        metadata: PaymentIntentMetadataWire {
-                            operation_id: payment_intent.operation_id(),
-                        },
-                    },
+                    object: payment_intent_wire(payment_intent, "succeeded"),
                 },
             })
             .map_err(|_| FixtureError::Serialization)?;

@@ -62,7 +62,7 @@ fn signed_fixture_webhook_is_decoded_into_the_same_operation_relation() {
             IdempotencyKey::new("op-1-attempt-1").expect("the key is valid"),
             CreatePaymentIntent::new(2_500, "usd")
                 .expect("the create is valid")
-                .with_operation_id(OperationId::new("op_1").expect("the operation ID is valid")),
+                .with_operation_id(&OperationId::new("op_1").expect("the operation ID is valid")),
             FaultOutcome::Normal,
         )
         .expect("the provider object is created");

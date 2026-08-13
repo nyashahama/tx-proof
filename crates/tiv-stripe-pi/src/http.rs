@@ -85,69 +85,10 @@ async fn handle_request(
         return Ok(response(StatusCode::NOT_FOUND, b"not found".as_slice()));
     }
 
-    let Some(key) = request
-        .headers()
-        .get("Idempotency-Key")
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_owned)
-        .and_then(|value| IdempotencyKey::new(value).ok())
-    else {
-        return Ok(response(StatusCode::BAD_REQUEST, "invalid idempotency key"));
+    let (key, create) = match create_request_from_http(request).await {
+        Ok(create_request) => create_request,
+        Err(rejection) => return Ok(rejection.into_response()),
     };
-    if request
-        .headers()
-        .get(CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        != Some("application/x-www-form-urlencoded")
-    {
-        return Ok(response(
-            StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            "unsupported content type",
-        ));
-    }
-
-    let collected = match Limited::new(request.into_body(), MAX_REQUEST_BODY_BYTES)
-        .collect()
-        .await
-    {
-        Ok(collected) => collected.to_bytes(),
-        Err(_) => return Ok(response(StatusCode::PAYLOAD_TOO_LARGE, "body too large")),
-    };
-    let mut fields = BTreeMap::new();
-    for (name, value) in form_urlencoded::parse(&collected) {
-        let name = name.into_owned();
-        if !matches!(
-            name.as_str(),
-            "amount" | "currency" | "metadata[operation_id]"
-        ) || fields.insert(name, value.into_owned()).is_some()
-        {
-            return Ok(response(StatusCode::BAD_REQUEST, "invalid form parameters"));
-        }
-    }
-    if !matches!(fields.len(), 2 | 3) {
-        return Ok(response(StatusCode::BAD_REQUEST, "invalid form parameters"));
-    }
-    let Some(amount_minor) = fields
-        .get("amount")
-        .and_then(|amount| amount.parse::<i64>().ok())
-    else {
-        return Ok(response(StatusCode::BAD_REQUEST, "invalid amount"));
-    };
-    let Some(currency) = fields.get("currency") else {
-        return Ok(response(StatusCode::BAD_REQUEST, "invalid currency"));
-    };
-    let Ok(mut create) = CreatePaymentIntent::new(amount_minor, currency) else {
-        return Ok(response(StatusCode::BAD_REQUEST, "invalid create request"));
-    };
-    if let Some(operation_id) = fields.get("metadata[operation_id]") {
-        let Ok(operation_id) = OperationId::new(operation_id) else {
-            return Ok(response(
-                StatusCode::BAD_REQUEST,
-                "invalid operation metadata",
-            ));
-        };
-        create = create.with_operation_id(operation_id);
-    }
 
     let result = backend.create_data_plane(key, create).await;
     match result {
@@ -181,6 +122,144 @@ async fn handle_request(
             StatusCode::SERVICE_UNAVAILABLE,
             "fixture fault plan unavailable",
         )),
+    }
+}
+
+async fn create_request_from_http(
+    request: Request<Incoming>,
+) -> Result<(IdempotencyKey, CreatePaymentIntent), RequestRejection> {
+    let key = idempotency_key(&request)?;
+    ensure_form_content_type(&request)?;
+    let collected = collect_limited_body(request).await?;
+    let fields = parse_form_fields(&collected)?;
+    let create = create_payment_intent(&fields)?;
+    Ok((key, create))
+}
+
+fn idempotency_key(request: &Request<Incoming>) -> Result<IdempotencyKey, RequestRejection> {
+    request
+        .headers()
+        .get("Idempotency-Key")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned)
+        .and_then(|value| IdempotencyKey::new(value).ok())
+        .ok_or(RequestRejection::bad_request("invalid idempotency key"))
+}
+
+fn ensure_form_content_type(request: &Request<Incoming>) -> Result<(), RequestRejection> {
+    if request
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        != Some("application/x-www-form-urlencoded")
+    {
+        return Err(RequestRejection::new(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "unsupported content type",
+        ));
+    }
+    Ok(())
+}
+
+async fn collect_limited_body(request: Request<Incoming>) -> Result<Bytes, RequestRejection> {
+    match Limited::new(request.into_body(), MAX_REQUEST_BODY_BYTES)
+        .collect()
+        .await
+    {
+        Ok(collected) => Ok(collected.to_bytes()),
+        Err(_) => Err(RequestRejection::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "body too large",
+        )),
+    }
+}
+
+fn parse_form_fields(collected: &[u8]) -> Result<BTreeMap<String, String>, RequestRejection> {
+    let mut fields = BTreeMap::new();
+    for (name, value) in form_urlencoded::parse(collected) {
+        let name = name.into_owned();
+        if !matches!(
+            name.as_str(),
+            "amount"
+                | "currency"
+                | "capture_method"
+                | "metadata[channel]"
+                | "metadata[operation_id]"
+                | "metadata[payment_id]"
+                | "receipt_email"
+        ) || fields.insert(name, value.into_owned()).is_some()
+        {
+            return Err(RequestRejection::bad_request("invalid form parameters"));
+        }
+    }
+    if fields.len() < 2 {
+        return Err(RequestRejection::bad_request("invalid form parameters"));
+    }
+    Ok(fields)
+}
+
+fn create_payment_intent(
+    fields: &BTreeMap<String, String>,
+) -> Result<CreatePaymentIntent, RequestRejection> {
+    let Some(amount_minor) = fields
+        .get("amount")
+        .and_then(|amount| amount.parse::<i64>().ok())
+    else {
+        return Err(RequestRejection::bad_request("invalid amount"));
+    };
+    let Some(currency) = fields.get("currency") else {
+        return Err(RequestRejection::bad_request("invalid currency"));
+    };
+    let Ok(mut create) = CreatePaymentIntent::new(amount_minor, currency.to_ascii_lowercase())
+    else {
+        return Err(RequestRejection::bad_request("invalid create request"));
+    };
+    if let Some(capture_method) = fields.get("capture_method")
+        && create.set_capture_method(capture_method).is_err()
+    {
+        return Err(RequestRejection::bad_request("invalid capture method"));
+    }
+    if let Some(operation_id) = fields.get("metadata[operation_id]") {
+        let Ok(operation_id) = OperationId::new(operation_id) else {
+            return Err(RequestRejection::bad_request("invalid operation metadata"));
+        };
+        create = create.with_operation_id(&operation_id);
+    }
+    if let Some(channel) = fields.get("metadata[channel]")
+        && create.insert_metadata("channel", channel).is_err()
+    {
+        return Err(RequestRejection::bad_request("invalid metadata"));
+    }
+    if let Some(payment_id) = fields.get("metadata[payment_id]")
+        && create.insert_metadata("payment_id", payment_id).is_err()
+    {
+        return Err(RequestRejection::bad_request("invalid metadata"));
+    }
+    if let Some(receipt_email) = fields.get("receipt_email")
+        && create.set_receipt_email(receipt_email).is_err()
+    {
+        return Err(RequestRejection::bad_request("invalid receipt email"));
+    }
+    Ok(create)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RequestRejection {
+    status: StatusCode,
+    body: &'static str,
+}
+
+impl RequestRejection {
+    const fn new(status: StatusCode, body: &'static str) -> Self {
+        Self { status, body }
+    }
+
+    const fn bad_request(body: &'static str) -> Self {
+        Self::new(StatusCode::BAD_REQUEST, body)
+    }
+
+    fn into_response(self) -> Response<ResponseBody> {
+        response(self.status, self.body)
     }
 }
 

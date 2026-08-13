@@ -234,5 +234,5 @@ async fn invalid_data_plane_requests_do_not_consume_the_fault_plan() {
 fn valid_create() -> CreatePaymentIntent {
     CreatePaymentIntent::new(2_500, "usd")
         .expect("the create is valid")
-        .with_operation_id(OperationId::new("op_1").expect("the operation ID is valid"))
+        .with_operation_id(&OperationId::new("op_1").expect("the operation ID is valid"))
 }

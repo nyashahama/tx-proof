@@ -206,6 +206,8 @@ async fn decode_provider_response(
     if response.object != "payment_intent"
         || !response.id.starts_with("pi_tiv_")
         || response.amount != operation.amount_minor()
+        || response.amount_received != 0
+        || !response.client_secret.starts_with(&response.id)
         || response.currency != operation.currency()
         || response.status != "requires_confirmation"
         || response.metadata.operation_id != operation.operation_id()
@@ -227,6 +229,8 @@ struct PaymentIntentWire {
     id: String,
     object: String,
     amount: i64,
+    amount_received: i64,
+    client_secret: String,
     currency: String,
     status: String,
     metadata: PaymentIntentMetadataWire,
@@ -298,6 +302,8 @@ pub fn parse_succeeded_webhook(
         || payment_intent.object != "payment_intent"
         || !payment_intent.id.starts_with("pi_tiv_")
         || payment_intent.amount <= 0
+        || payment_intent.amount_received != payment_intent.amount
+        || !payment_intent.client_secret.starts_with(&payment_intent.id)
         || payment_intent.currency.len() != 3
         || !payment_intent
             .currency

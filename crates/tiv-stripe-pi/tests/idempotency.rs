@@ -146,9 +146,9 @@ fn operation_metadata_is_part_of_the_idempotent_request_identity() {
     let mut fixture = PaymentIntentFixture::new(Seed::new(42));
     let key = IdempotencyKey::new("checkout-order-42").expect("the test key is valid");
     let first_request = valid_create(2_500, "usd")
-        .with_operation_id(OperationId::new("op_1").expect("the operation ID is valid"));
+        .with_operation_id(&OperationId::new("op_1").expect("the operation ID is valid"));
     let different_request = valid_create(2_500, "usd")
-        .with_operation_id(OperationId::new("op_2").expect("the operation ID is valid"));
+        .with_operation_id(&OperationId::new("op_2").expect("the operation ID is valid"));
 
     fixture
         .create(key.clone(), first_request, FaultOutcome::Normal)
