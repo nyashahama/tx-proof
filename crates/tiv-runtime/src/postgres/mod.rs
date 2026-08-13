@@ -1,4 +1,3 @@
 pub mod oracle;
 pub mod safety;
-#[cfg(test)]
-mod spike;
+pub(crate) mod spike;

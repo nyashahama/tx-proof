@@ -94,20 +94,34 @@ docker compose \
 Then run the real application path:
 
 ```sh
-TIV_COMPOSE_PROJECT=tiv-reference-app-spike \
-TIV_FIXTURE_CONTROL_URL=http://127.0.0.1:12112 \
-TIV_POSTGRES_TEST_PORT=15432 \
-TIV_REFERENCE_APP_URL=http://127.0.0.1:18080 \
-  cargo test -p tiv-runtime \
-    postgres::spike::tests::real_reference_app_replays_commit_close_with_the_same_failure_identity \
-    -- --ignored --test-threads=1
+TIV_FIXTURE_CONTROL_TOKEN=run-scoped-control-token \
+TIV_POSTGRES_ADMIN_PASSWORD=tiv-local-only-password \
+TIV_POSTGRES_APPLICATION_PASSWORD=tiv-app-local-only-password \
+  cargo run --quiet -p tiv-cli --bin tiv -- \
+    replay reference-app-evidence \
+    --trace spike/compiled-trace-v1.json \
+    --postgres-port 15432 \
+    --reference-app-url http://127.0.0.1:18080 \
+    --fixture-control-url http://127.0.0.1:12112
 ```
 
-The test provisions a generated case database, installs a sequenced
+The command provisions a generated case database, installs a sequenced
 `commit_then_close`/`normal` fault plan, drives the application checkout, signs
 and delivers the fixture's exact raw webhook bytes, observes two provider and
 local objects for `op_1`, runs the five-query snapshot, resets from the sealed
-template, and requires the replayed failure identity to match.
+template, and requires the replayed failure identity to match. Standard output
+is one allowlisted JSON evidence document; PostgreSQL passwords, the fixture
+control token, raw webhook material, and generated database names are omitted.
+Before sending either database password, the command bypasses ambient remote
+Docker contexts and uses the local `/var/run/docker.sock` control plane to
+attest the expected running Compose project and all three healthy service
+containers, including each image, command, purpose label, and exact loopback
+port binding. Every Docker inspection has bounded output, a ten-second command
+deadline, and explicit kill/reap cleanup on timeout.
+
+The reference stack must be fresh for each evidence command because fixture
+control commands are strictly sequenced. Reset it with the scoped `down` command
+below before starting another run.
 
 Remove only this exact disposable project when finished:
 

@@ -1,4 +1,10 @@
-use std::{collections::BTreeMap, error::Error, fmt, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap,
+    error::Error,
+    fmt,
+    sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use bytes::Bytes;
 use hmac::{Hmac, KeyInit, Mac};
@@ -261,6 +267,15 @@ pub fn verify_webhook_signature(
         .strip_prefix("t=")
         .and_then(|value| value.parse::<i64>().ok())
         .ok_or(ReferenceAppError::InvalidWebhookSignature)?;
+    let timestamp_seconds =
+        u64::try_from(timestamp).map_err(|_| ReferenceAppError::InvalidWebhookSignature)?;
+    let now_seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| ReferenceAppError::InvalidWebhookSignature)?
+        .as_secs();
+    if now_seconds.abs_diff(timestamp_seconds) > WEBHOOK_TIMESTAMP_TOLERANCE_SECONDS {
+        return Err(ReferenceAppError::InvalidWebhookSignature);
+    }
     let signature = signature
         .strip_prefix("v1=")
         .and_then(|value| hex::decode(value).ok())
@@ -340,6 +355,7 @@ struct ProviderEventDataWire {
 
 const MAX_APP_REQUEST_BODY_BYTES: usize = 16 * 1024;
 const CONTROL_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
+const WEBHOOK_TIMESTAMP_TOLERANCE_SECONDS: u64 = 300;
 
 type AppResponseBody = Full<Bytes>;
 

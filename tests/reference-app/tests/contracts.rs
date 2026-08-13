@@ -1,4 +1,7 @@
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
@@ -36,9 +39,9 @@ fn only_generated_case_database_names_are_accepted() {
 }
 
 #[test]
-fn webhook_verification_covers_the_exact_raw_bytes() {
+fn webhook_verification_covers_the_exact_raw_bytes_and_rejects_stale_signatures() {
     let secret = b"whsec_test_secret";
-    let timestamp = 1_700_000_000_i64;
+    let timestamp = current_unix_timestamp();
     let raw_body = br#"{"id":"evt_1","type":"payment_intent.succeeded"}"#;
     let signature = signature_header(timestamp, raw_body, secret);
 
@@ -51,6 +54,12 @@ fn webhook_verification_covers_the_exact_raw_bytes() {
         )
         .is_err(),
         "even semantically equivalent byte changes must fail verification"
+    );
+    let stale_timestamp = timestamp - 301;
+    let stale_signature = signature_header(stale_timestamp, raw_body, secret);
+    assert!(
+        verify_webhook_signature(raw_body, &stale_signature, secret).is_err(),
+        "a correctly signed webhook outside the five-minute tolerance must fail"
     );
 }
 
@@ -70,7 +79,7 @@ fn signed_fixture_webhook_is_decoded_into_the_same_operation_relation() {
         .confirm(created.id())
         .expect("the provider object confirms");
     let attempt = fixture.events()[0]
-        .webhook_attempt(1_700_000_000, b"whsec_test_secret")
+        .webhook_attempt(current_unix_timestamp(), b"whsec_test_secret")
         .expect("the event is signed");
 
     let observed = parse_succeeded_webhook(
@@ -144,4 +153,14 @@ fn signature_header(timestamp: i64, body: &[u8], secret: &[u8]) -> String {
         "t={timestamp},v1={}",
         hex::encode(signer.finalize().into_bytes())
     )
+}
+
+fn current_unix_timestamp() -> i64 {
+    i64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("the system clock is after the Unix epoch")
+            .as_secs(),
+    )
+    .expect("the current Unix timestamp fits in i64")
 }

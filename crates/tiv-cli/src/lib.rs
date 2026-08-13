@@ -1,6 +1,10 @@
 //! Command-line composition root for `TxProof`.
 
-use std::{fs, path::PathBuf};
+use std::{
+    fs,
+    path::PathBuf,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use clap::{Args, Parser, Subcommand};
 use serde::Serialize;
@@ -8,6 +12,10 @@ use thiserror::Error;
 use tiv_core::trace::CompiledTrace;
 use tiv_runtime::{
     postgres::safety::DatabaseName,
+    reference_app::{
+        ReferenceAppEvidenceConfig, ReferenceAppEvidenceConfigError, ReferenceAppEvidenceError,
+        run_reference_app_evidence,
+    },
     replay::{
         ReferenceAppReplayConfig, ReferenceAppReplayConfigError, ReferenceAppReplayError,
         ReplayPlan, ReplayPlanError, run_reference_app_replay,
@@ -51,6 +59,8 @@ pub enum ReplayCommand {
     Inspect { path: PathBuf },
     /// Execute the committed reference-app checkout path against loopback services.
     ReferenceApp(ReferenceAppReplayArgs),
+    /// Provision, reset, and replay the reference app into bounded evidence.
+    ReferenceAppEvidence(ReferenceAppEvidenceArgs),
 }
 
 #[derive(Clone, Debug, PartialEq, Args)]
@@ -77,8 +87,27 @@ pub struct ReferenceAppReplayArgs {
     #[arg(long, default_value_t = 2)]
     pub confirm_sequence: u64,
     /// Synthetic webhook timestamp used by the fixture.
-    #[arg(long, default_value_t = 1_700_000_000)]
-    pub webhook_timestamp: i64,
+    #[arg(long)]
+    pub webhook_timestamp: Option<i64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Args)]
+pub struct ReferenceAppEvidenceArgs {
+    /// Compiled trace JSON document to replay twice.
+    #[arg(long)]
+    pub trace: PathBuf,
+    /// Loopback host port for the isolated `PostgreSQL` service.
+    #[arg(long, default_value_t = 15_432)]
+    pub postgres_port: u16,
+    /// Administrative role for the isolated `PostgreSQL` service.
+    #[arg(long, default_value = "tiv_admin")]
+    pub postgres_admin_role: String,
+    /// Loopback URL for the real reference application.
+    #[arg(long)]
+    pub reference_app_url: String,
+    /// Loopback URL for the fixture control listener.
+    #[arg(long)]
+    pub fixture_control_url: String,
 }
 
 #[derive(Debug, PartialEq, Subcommand)]
@@ -101,7 +130,7 @@ pub fn execute(cli: Cli) -> Result<String, CliError> {
             serde_json::to_string(&plan).map_err(CliError::Encode)
         }
         Command::Replay {
-            command: ReplayCommand::ReferenceApp(_),
+            command: ReplayCommand::ReferenceApp(_) | ReplayCommand::ReferenceAppEvidence(_),
         } => Err(CliError::AsyncCommand),
         Command::Trace {
             command: TraceCommand::Validate { path },
@@ -127,6 +156,9 @@ pub async fn execute_async(cli: Cli) -> Result<String, CliError> {
             let plan = replay_plan_from_path(&args.trace)?;
             let case_database = DatabaseName::parse(args.case_database)
                 .map_err(|_| CliError::InvalidCaseDatabase)?;
+            let webhook_timestamp = args
+                .webhook_timestamp
+                .map_or_else(current_unix_timestamp, Ok)?;
             let config = ReferenceAppReplayConfig::new(
                 case_database,
                 args.reference_app_url,
@@ -134,10 +166,30 @@ pub async fn execute_async(cli: Cli) -> Result<String, CliError> {
                 args.fixture_control_token,
                 args.reset_sequence,
                 args.confirm_sequence,
-                args.webhook_timestamp,
+                webhook_timestamp,
             )?;
             let receipt = run_reference_app_replay(&plan, &config).await?;
             serde_json::to_string(&receipt).map_err(CliError::Encode)
+        }
+        Command::Replay {
+            command: ReplayCommand::ReferenceAppEvidence(args),
+        } => {
+            let plan = replay_plan_from_path(&args.trace)?;
+            let admin_password = required_env("TIV_POSTGRES_ADMIN_PASSWORD")?;
+            let application_password = required_env("TIV_POSTGRES_APPLICATION_PASSWORD")?;
+            let fixture_control_token = required_env("TIV_FIXTURE_CONTROL_TOKEN")?;
+            let config = ReferenceAppEvidenceConfig::attest(
+                args.postgres_port,
+                args.postgres_admin_role,
+                admin_password,
+                application_password,
+                args.reference_app_url,
+                args.fixture_control_url,
+                fixture_control_token,
+            )
+            .await?;
+            let evidence = run_reference_app_evidence(&plan, &config).await?;
+            evidence.to_pretty_json().map_err(CliError::Encode)
         }
         read_only => execute(Cli { command: read_only }),
     }
@@ -170,6 +222,18 @@ fn replay_plan_from_path(path: &PathBuf) -> Result<ReplayPlan, CliError> {
     ReplayPlan::from_trace(&trace).map_err(CliError::ReplayPlan)
 }
 
+fn required_env(name: &'static str) -> Result<String, CliError> {
+    std::env::var(name).map_err(|_| CliError::MissingEnvironmentVariable(name))
+}
+
+fn current_unix_timestamp() -> Result<i64, CliError> {
+    let seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| CliError::InvalidSystemTime)?
+        .as_secs();
+    i64::try_from(seconds).map_err(|_| CliError::InvalidSystemTime)
+}
+
 #[derive(Debug, Error)]
 pub enum CliError {
     #[error("could not read trace {path}: {source}")]
@@ -185,10 +249,18 @@ pub enum CliError {
     AsyncCommand,
     #[error("invalid generated case database")]
     InvalidCaseDatabase,
+    #[error("required environment variable {0} is missing or invalid")]
+    MissingEnvironmentVariable(&'static str),
+    #[error("the system clock could not produce a valid webhook timestamp")]
+    InvalidSystemTime,
     #[error("reference app replay configuration is invalid: {0}")]
     ReferenceAppReplayConfig(#[from] ReferenceAppReplayConfigError),
     #[error("reference app replay failed: {0}")]
     ReferenceAppReplay(#[from] ReferenceAppReplayError),
+    #[error("reference app evidence configuration is invalid: {0}")]
+    ReferenceAppEvidenceConfig(#[from] ReferenceAppEvidenceConfigError),
+    #[error("reference app evidence run failed: {0}")]
+    ReferenceAppEvidence(#[from] ReferenceAppEvidenceError),
     #[error("could not encode trace summary: {0}")]
     Encode(serde_json::Error),
 }

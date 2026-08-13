@@ -1,5 +1,7 @@
 use clap::Parser;
-use tiv_cli::{Cli, Command, ReferenceAppReplayArgs, ReplayCommand, TraceCommand};
+use tiv_cli::{
+    Cli, Command, ReferenceAppEvidenceArgs, ReferenceAppReplayArgs, ReplayCommand, TraceCommand,
+};
 
 #[test]
 fn the_cli_exposes_only_the_narrow_trace_validation_command_for_this_slice() {
@@ -65,7 +67,38 @@ fn the_cli_exposes_reference_app_replay_execution_for_prepared_case_databases() 
                 fixture_control_token: "run-scoped-control-token".to_owned(),
                 reset_sequence: 1,
                 confirm_sequence: 2,
-                webhook_timestamp: 1_700_000_000,
+                webhook_timestamp: None,
+            }),
+        }
+    );
+}
+
+#[test]
+fn the_cli_exposes_a_self_contained_reference_app_evidence_run() {
+    let cli = Cli::try_parse_from([
+        "tiv",
+        "replay",
+        "reference-app-evidence",
+        "--trace",
+        "compiled-trace.json",
+        "--postgres-port",
+        "15432",
+        "--reference-app-url",
+        "http://127.0.0.1:18080",
+        "--fixture-control-url",
+        "http://127.0.0.1:12112",
+    ])
+    .expect("the self-contained evidence command parses");
+
+    assert_eq!(
+        cli.command,
+        Command::Replay {
+            command: ReplayCommand::ReferenceAppEvidence(ReferenceAppEvidenceArgs {
+                trace: "compiled-trace.json".into(),
+                postgres_port: 15_432,
+                postgres_admin_role: "tiv_admin".to_owned(),
+                reference_app_url: "http://127.0.0.1:18080".to_owned(),
+                fixture_control_url: "http://127.0.0.1:12112".to_owned(),
             }),
         }
     );

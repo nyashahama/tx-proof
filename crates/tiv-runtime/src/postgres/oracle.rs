@@ -5,6 +5,8 @@ use tiv_core::{
 };
 use tokio_postgres::{Client, IsolationLevel};
 
+use crate::replay::ReferenceAppReplayCompletion;
+
 const CHECKPOINT_ID: &str = "checkout-quiescent";
 const PROVIDER_UNIQUENESS_ID: &str = "provider-object-unique";
 const MAX_WITNESS_ROWS: usize = 100;
@@ -28,6 +30,12 @@ pub struct QuiescencePermit {
 impl QuiescencePermit {
     #[cfg(test)]
     pub(super) const fn after_synthetic_driver_stopped() -> Self {
+        Self { _private: () }
+    }
+
+    pub(crate) const fn after_reference_app_replay_completed(
+        _completion: ReferenceAppReplayCompletion,
+    ) -> Self {
         Self { _private: () }
     }
 }

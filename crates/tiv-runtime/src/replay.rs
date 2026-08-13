@@ -284,7 +284,7 @@ pub enum ReferenceAppReplayConfigError {
 }
 
 /// Result of one reference app replay execution.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Debug, Eq, PartialEq, Serialize)]
 pub struct ReferenceAppReplayReceipt {
     fixture_seed: u64,
     expected_payment_intent_id: String,
@@ -292,6 +292,8 @@ pub struct ReferenceAppReplayReceipt {
     fixture_control_isolated: bool,
     delivered_webhook_count: usize,
     provider_payment_intents: Vec<ReferenceProviderPaymentIntent>,
+    #[serde(skip)]
+    completion: ReferenceAppReplayCompletion,
 }
 
 impl ReferenceAppReplayReceipt {
@@ -324,6 +326,20 @@ impl ReferenceAppReplayReceipt {
     pub fn provider_payment_intents(&self) -> &[ReferenceProviderPaymentIntent] {
         &self.provider_payment_intents
     }
+
+    pub(crate) fn into_oracle_input(
+        self,
+    ) -> (
+        Vec<ReferenceProviderPaymentIntent>,
+        ReferenceAppReplayCompletion,
+    ) {
+        (self.provider_payment_intents, self.completion)
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct ReferenceAppReplayCompletion {
+    _private: (),
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -396,6 +412,7 @@ pub async fn run_reference_app_replay(
         fixture_control_isolated,
         delivered_webhook_count: attempts.len(),
         provider_payment_intents,
+        completion: ReferenceAppReplayCompletion { _private: () },
     })
 }
 

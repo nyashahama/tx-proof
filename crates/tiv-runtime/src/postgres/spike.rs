@@ -15,7 +15,9 @@ use super::{
 };
 
 const APPLICATION_ROLE: &str = "tiv_app";
-const EXPECTED_CLUSTER_NAME: &str = "tiv-truth-spike-postgres";
+#[cfg(test)]
+const TRUTH_SPIKE_CLUSTER_NAME: &str = "tiv-truth-spike-postgres";
+const REFERENCE_APP_CLUSTER_NAME: &str = "tiv-reference-app-postgres";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BaselineTarget {
@@ -35,10 +37,12 @@ pub struct SpikePostgresConfig {
     admin_role: String,
     admin_password: String,
     application_password: String,
+    expected_cluster_name: &'static str,
 }
 
 impl SpikePostgresConfig {
     #[must_use]
+    #[cfg(test)]
     pub fn loopback(
         port: u16,
         admin_role: impl Into<String>,
@@ -50,6 +54,23 @@ impl SpikePostgresConfig {
             admin_role: admin_role.into(),
             admin_password: admin_password.into(),
             application_password: application_password.into(),
+            expected_cluster_name: TRUTH_SPIKE_CLUSTER_NAME,
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn loopback_reference_app(
+        port: u16,
+        admin_role: impl Into<String>,
+        admin_password: impl Into<String>,
+        application_password: impl Into<String>,
+    ) -> Self {
+        Self {
+            endpoint: DatabaseEndpoint::loopback(port),
+            admin_role: admin_role.into(),
+            admin_password: admin_password.into(),
+            application_password: application_password.into(),
+            expected_cluster_name: REFERENCE_APP_CLUSTER_NAME,
         }
     }
 }
@@ -85,7 +106,7 @@ impl TruthSpikePostgres {
         session.close().await?;
         let row = probe?;
         if row.get::<_, i32>(0) != 1
-            || row.get::<_, &str>(1) != EXPECTED_CLUSTER_NAME
+            || row.get::<_, &str>(1) != postgres.config.expected_cluster_name
             || row.get::<_, &str>(2) != postgres.config.admin_role
         {
             return Err(SpikePostgresError::UnexpectedServerIdentity);
@@ -153,6 +174,7 @@ impl TruthSpikePostgres {
     /// matches, exactly two distinct provider objects are supplied, and both
     /// local rows commit atomically. The returned target must be freshly
     /// verified again before another persistent mutation.
+    #[cfg(test)]
     pub async fn insert_buggy_payment_pair(
         &self,
         expected: DatabaseTarget<Unverified>,
@@ -175,6 +197,7 @@ impl TruthSpikePostgres {
             .await
     }
 
+    #[cfg(test)]
     async fn insert_verified_buggy_payment_pair(
         &self,
         verified: DatabaseTarget<Verified>,
@@ -312,6 +335,22 @@ impl TruthSpikePostgres {
                     )
                     .await?;
             }
+            let unsafe_membership = session
+                .client()
+                .query_opt(
+                    "SELECT 1::integer \
+                     FROM pg_auth_members AS membership \
+                     JOIN pg_roles AS granted_role ON granted_role.oid = membership.roleid \
+                     JOIN pg_roles AS member_role ON member_role.oid = membership.member \
+                     WHERE granted_role.rolname = $1 OR member_role.rolname = $1 \
+                     LIMIT 1",
+                    &[&APPLICATION_ROLE],
+                )
+                .await?
+                .is_some();
+            if unsafe_membership {
+                return Err(SpikePostgresError::UnsafeApplicationRole);
+            }
             session
                 .client()
                 .batch_execute(
@@ -333,7 +372,8 @@ impl TruthSpikePostgres {
                 .batch_execute(&format!(
                     "ALTER ROLE {APPLICATION_ROLE} PASSWORD {quoted_password}"
                 ))
-                .await
+                .await?;
+            Ok::<(), SpikePostgresError>(())
         }
         .await;
         session.close().await?;
@@ -666,6 +706,7 @@ impl TruthSpikePostgres {
         .await
     }
 
+    #[cfg(test)]
     async fn connect_application_database(
         &self,
         database_name: &DatabaseName,
@@ -787,6 +828,9 @@ pub enum SpikePostgresError {
     PostResetIdentityMismatch,
     #[error("sealed baseline identity did not match the scoped run")]
     BaselineIdentityMismatch,
+    #[error("the application role has unexpected inherited memberships")]
+    UnsafeApplicationRole,
+    #[cfg(test)]
     #[error("the synthetic bug requires two distinct provider objects")]
     InvalidBugState,
     #[error("PostgreSQL server is not the isolated truth-spike cluster")]
@@ -843,7 +887,10 @@ fn parse_baseline_catalog_marker(
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::Arc, time::Duration};
+    use std::{
+        sync::Arc,
+        time::{Duration, SystemTime, UNIX_EPOCH},
+    };
 
     use reqwest::StatusCode;
     use tiv_core::{decision::Seed, trace::CompiledTrace};
@@ -1007,6 +1054,179 @@ mod tests {
             .await;
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires the isolated tiv-truth-spike-postgres Compose project"]
+    async fn preexisting_application_role_membership_blocks_provisioning() {
+        let postgres = test_postgres().await;
+        postgres
+            .ensure_application_role()
+            .await
+            .expect("the initial isolated application role is safe");
+        let mut maintenance = postgres
+            .connect_database("postgres")
+            .await
+            .expect("the isolated maintenance database is reachable");
+        maintenance
+            .client()
+            .batch_execute(
+                "DROP ROLE IF EXISTS tiv_unexpected_member_role; \
+                 CREATE ROLE tiv_unexpected_member_role; \
+                 GRANT tiv_unexpected_member_role TO tiv_app;",
+            )
+            .await
+            .expect("the test installs one unexpected membership");
+        maintenance
+            .close()
+            .await
+            .expect("the maintenance session closes");
+
+        let suffix = Uuid::new_v4().simple().to_string()[..16].to_owned();
+        let port = std::env::var("TIV_POSTGRES_TEST_PORT")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(15_432);
+        let rotating_postgres = TruthSpikePostgres::connect(SpikePostgresConfig::loopback(
+            port,
+            "tiv_admin",
+            "tiv-local-only-password",
+            "unexpected-new-password",
+        ))
+        .await
+        .expect("the isolated maintenance identity is unchanged");
+        let result = rotating_postgres
+            .provision_reference_databases(&suffix, test_project())
+            .await;
+
+        let mut cleanup = postgres
+            .connect_database("postgres")
+            .await
+            .expect("the isolated maintenance database remains reachable");
+        let generated_database_count = cleanup
+            .client()
+            .query_one(
+                "SELECT COUNT(*)::bigint FROM pg_database \
+                 WHERE datname IN ($1, $2)",
+                &[&format!("tiv_base_{suffix}"), &format!("tiv_case_{suffix}")],
+            )
+            .await
+            .expect("the generated database names are observable")
+            .get::<_, i64>(0);
+        cleanup
+            .client()
+            .batch_execute(
+                "REVOKE tiv_unexpected_member_role FROM tiv_app; \
+                 DROP ROLE tiv_unexpected_member_role;",
+            )
+            .await
+            .expect("the test membership is removed");
+        cleanup.close().await.expect("the cleanup session closes");
+
+        let old_password_session = postgres
+            .connect_database_as("postgres", APPLICATION_ROLE, "tiv-app-local-only-password")
+            .await
+            .expect("the rejected provisioning did not rotate the application password");
+        old_password_session
+            .close()
+            .await
+            .expect("the application session closes");
+        assert!(
+            postgres
+                .connect_database_as("postgres", APPLICATION_ROLE, "unexpected-new-password")
+                .await
+                .is_err(),
+            "the rejected provisioning must not install the proposed password"
+        );
+
+        assert!(matches!(
+            result,
+            Err(SpikePostgresError::UnsafeApplicationRole)
+        ));
+        assert_eq!(generated_database_count, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires the isolated tiv-truth-spike-postgres Compose project"]
+    async fn preexisting_member_of_application_role_blocks_provisioning() {
+        let postgres = test_postgres().await;
+        postgres
+            .ensure_application_role()
+            .await
+            .expect("the initial isolated application role is safe");
+        let mut maintenance = postgres
+            .connect_database("postgres")
+            .await
+            .expect("the isolated maintenance database is reachable");
+        maintenance
+            .client()
+            .batch_execute(
+                "DROP ROLE IF EXISTS tiv_unexpected_app_member; \
+                 CREATE ROLE tiv_unexpected_app_member; \
+                 GRANT tiv_app TO tiv_unexpected_app_member;",
+            )
+            .await
+            .expect("the test installs one unexpected application-role member");
+        maintenance
+            .close()
+            .await
+            .expect("the maintenance session closes");
+
+        let suffix = Uuid::new_v4().simple().to_string()[..16].to_owned();
+        let result = postgres
+            .provision_reference_databases(&suffix, test_project())
+            .await;
+
+        let mut cleanup = postgres
+            .connect_database("postgres")
+            .await
+            .expect("the isolated maintenance database remains reachable");
+        let generated_database_count = cleanup
+            .client()
+            .query_one(
+                "SELECT COUNT(*)::bigint FROM pg_database \
+                 WHERE datname IN ($1, $2)",
+                &[&format!("tiv_base_{suffix}"), &format!("tiv_case_{suffix}")],
+            )
+            .await
+            .expect("the generated database names are observable")
+            .get::<_, i64>(0);
+        cleanup
+            .client()
+            .batch_execute(
+                "REVOKE tiv_app FROM tiv_unexpected_app_member; \
+                 DROP ROLE tiv_unexpected_app_member;",
+            )
+            .await
+            .expect("the test membership is removed");
+        cleanup.close().await.expect("the cleanup session closes");
+
+        assert!(matches!(
+            result,
+            Err(SpikePostgresError::UnsafeApplicationRole)
+        ));
+        assert_eq!(generated_database_count, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires the isolated tiv-truth-spike-postgres Compose project"]
+    async fn reference_app_connection_rejects_the_generic_truth_spike_cluster() {
+        let port = std::env::var("TIV_POSTGRES_TEST_PORT")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(15_432);
+        let result = TruthSpikePostgres::connect(SpikePostgresConfig::loopback_reference_app(
+            port,
+            "tiv_admin",
+            "tiv-local-only-password",
+            "tiv-app-local-only-password",
+        ))
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(SpikePostgresError::UnexpectedServerIdentity)
+        ));
+    }
+
     async fn assert_application_role_contract(
         postgres: &TruthSpikePostgres,
         case_name: &DatabaseName,
@@ -1128,7 +1348,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore = "requires the isolated reference-app Compose project"]
     async fn real_reference_app_replays_commit_close_with_the_same_failure_identity() {
-        let postgres = test_postgres().await;
+        let postgres = test_reference_postgres().await;
         let suffix = Uuid::new_v4().simple().to_string()[..16].to_owned();
         let provisioned = postgres
             .provision_reference_databases(&suffix, test_project())
@@ -1185,6 +1405,21 @@ mod tests {
         ))
         .await
         .expect("the isolated PostgreSQL fixture is healthy")
+    }
+
+    async fn test_reference_postgres() -> TruthSpikePostgres {
+        let port = std::env::var("TIV_POSTGRES_TEST_PORT")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(15_432);
+        TruthSpikePostgres::connect(SpikePostgresConfig::loopback_reference_app(
+            port,
+            "tiv_admin",
+            "tiv-local-only-password",
+            "tiv-app-local-only-password",
+        ))
+        .await
+        .expect("the isolated reference PostgreSQL fixture is healthy")
     }
 
     fn test_project() -> ComposeProjectId {
@@ -1339,7 +1574,7 @@ mod tests {
             "run-scoped-control-token",
             reset_sequence,
             reset_sequence + 1,
-            1_700_000_000,
+            current_unix_timestamp(),
         )
         .expect("the reference app replay config is valid");
         let receipt = run_reference_app_replay(plan, &config)
@@ -1375,5 +1610,15 @@ mod tests {
 
     fn quiescence() -> QuiescencePermit {
         QuiescencePermit::after_synthetic_driver_stopped()
+    }
+
+    fn current_unix_timestamp() -> i64 {
+        i64::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("the system clock is after the Unix epoch")
+                .as_secs(),
+        )
+        .expect("the current Unix timestamp fits in i64")
     }
 }

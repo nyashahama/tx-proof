@@ -1,7 +1,7 @@
 services:
   postgres:
     image: postgres:18.4-bookworm
-    command: ["postgres", "-c", "cluster_name=tiv-truth-spike-postgres"]
+    command: ["postgres", "-c", "cluster_name=tiv-reference-app-postgres"]
     environment:
       POSTGRES_DB: postgres
       POSTGRES_INITDB_ARGS: --data-checksums
