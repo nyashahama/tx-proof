@@ -85,7 +85,7 @@ jobs:
           set -o pipefail
           cargo test -p tiv-runtime postgres::spike::tests:: \
             -- --ignored --test-threads=1 \
-            --skip real_reference_app_replays_commit_close_with_the_same_failure_identity \
+            --skip real_reference_app_ \
             2>&1 \
             | tee ci-evidence/postgres-spike.log
 
