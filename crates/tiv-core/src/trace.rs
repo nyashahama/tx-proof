@@ -5,9 +5,11 @@ use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 use crate::{
     decision::Seed,
     ids::{EventId, InvalidProviderId, PaymentIntentId},
+    plan::{PlanActionKind, PlannedCase, ProviderOutcome},
 };
 
 pub const TRACE_SCHEMA_VERSION: u16 = 1;
+pub const CASE_TRACE_SCHEMA_VERSION: u16 = 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(transparent)]
@@ -42,6 +44,42 @@ impl ActionId {
         Self(value)
     }
 }
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(transparent)]
+pub struct ProviderGateId(u64);
+
+impl ProviderGateId {
+    /// Creates a fixture gate identifier captured from the control plane.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidProviderGateId`] when the identifier is zero.
+    pub const fn new(value: u64) -> Result<Self, InvalidProviderGateId> {
+        if value == 0 {
+            return Err(InvalidProviderGateId);
+        }
+        Ok(Self(value))
+    }
+
+    #[must_use]
+    pub const fn value(self) -> u64 {
+        self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for ProviderGateId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Self::new(u64::deserialize(deserializer)?)
+            .map_err(|_| D::Error::custom("provider gate ID must be non-zero"))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InvalidProviderGateId;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 pub enum OutputSlot {
@@ -170,6 +208,104 @@ impl CapturedValue {
             Self::EventId(_) => OutputSlot::EventId,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+pub enum CaseOutputSlot {
+    PaymentIntentId,
+    EventId,
+    ProviderGateId,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+pub enum CaseInputSlot {
+    PaymentIntentId,
+    ProviderGateId,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CaseOutputRef {
+    action_id: ActionId,
+    slot: CaseOutputSlot,
+}
+
+impl CaseOutputRef {
+    #[must_use]
+    pub const fn new(action_id: ActionId, slot: CaseOutputSlot) -> Self {
+        Self { action_id, slot }
+    }
+
+    #[must_use]
+    pub const fn action_id(self) -> ActionId {
+        self.action_id
+    }
+
+    #[must_use]
+    pub const fn slot(self) -> CaseOutputSlot {
+        self.slot
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum CaseCapturedValue {
+    PaymentIntentId(PaymentIntentId),
+    EventId(EventId),
+    ProviderGateId(ProviderGateId),
+}
+
+impl CaseCapturedValue {
+    /// Creates a captured `PaymentIntent` identifier for a full case trace.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidProviderId`] when the identifier is malformed.
+    pub fn payment_intent_id(value: impl Into<String>) -> Result<Self, InvalidProviderId> {
+        PaymentIntentId::new(value).map(Self::PaymentIntentId)
+    }
+
+    /// Creates a captured event identifier for a full case trace.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidProviderId`] when the identifier is malformed.
+    pub fn event_id(value: impl Into<String>) -> Result<Self, InvalidProviderId> {
+        EventId::new(value).map(Self::EventId)
+    }
+
+    /// Creates a captured provider control gate identifier.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidProviderGateId`] when the identifier is zero.
+    pub const fn provider_gate_id(value: u64) -> Result<Self, InvalidProviderGateId> {
+        match ProviderGateId::new(value) {
+            Ok(value) => Ok(Self::ProviderGateId(value)),
+            Err(error) => Err(error),
+        }
+    }
+
+    const fn kind(&self) -> CaseOutputSlot {
+        match self {
+            Self::PaymentIntentId(_) => CaseOutputSlot::PaymentIntentId,
+            Self::EventId(_) => CaseOutputSlot::EventId,
+            Self::ProviderGateId(_) => CaseOutputSlot::ProviderGateId,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CaseActionInput {
+    slot: CaseInputSlot,
+    source: CaseOutputRef,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CaseCapturedOutput {
+    output_ref: CaseOutputRef,
+    value: CaseCapturedValue,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -464,6 +600,366 @@ impl ReplayAction<'_> {
             .find(|captured| captured.output_ref == source)
             .map(|captured| &captured.value)
     }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CompiledCaseAction {
+    id: ActionId,
+    logical_sequence: u32,
+    dependencies: BTreeSet<ActionId>,
+    decision_number: u64,
+    eligible_count: usize,
+    kind: PlanActionKind,
+    inputs: Vec<CaseActionInput>,
+    declared_outputs: BTreeSet<CaseOutputSlot>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct CompiledCaseTrace {
+    schema_version: u16,
+    planned_case: PlannedCase,
+    actions: Vec<CompiledCaseAction>,
+    captured: Vec<CaseCapturedOutput>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CompiledCaseTraceWire {
+    schema_version: u16,
+    planned_case: PlannedCase,
+    actions: Vec<CompiledCaseAction>,
+    captured: Vec<CaseCapturedOutput>,
+}
+
+impl<'de> Deserialize<'de> for CompiledCaseTrace {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = CompiledCaseTraceWire::deserialize(deserializer)?;
+        if wire.schema_version != CASE_TRACE_SCHEMA_VERSION {
+            return Err(D::Error::custom(format_args!(
+                "unsupported case trace schema version {}; expected {CASE_TRACE_SCHEMA_VERSION}",
+                wire.schema_version
+            )));
+        }
+        let expected = CaseTraceMaterializer::materialize(
+            &wire.planned_case,
+            wire.captured
+                .iter()
+                .map(|captured| (captured.output_ref, captured.value.clone())),
+        )
+        .map_err(|error| {
+            D::Error::custom(format_args!("invalid materialized case trace: {error:?}"))
+        })?;
+        let received = Self {
+            schema_version: wire.schema_version,
+            planned_case: wire.planned_case,
+            actions: wire.actions,
+            captured: wire.captured,
+        };
+        if received != expected {
+            return Err(D::Error::custom(
+                "materialized case actions do not match the validated plan",
+            ));
+        }
+        Ok(received)
+    }
+}
+
+impl CompiledCaseTrace {
+    #[must_use]
+    pub const fn schema_version(&self) -> u16 {
+        self.schema_version
+    }
+
+    #[must_use]
+    pub const fn planned_case(&self) -> &PlannedCase {
+        &self.planned_case
+    }
+
+    #[must_use]
+    pub const fn action_count(&self) -> usize {
+        self.actions.len()
+    }
+
+    #[must_use]
+    pub fn replay_action(&self, action_id: ActionId) -> Option<ReplayCaseAction<'_>> {
+        self.actions
+            .iter()
+            .find(|action| action.id == action_id)
+            .map(|action| ReplayCaseAction {
+                action,
+                captured: &self.captured,
+            })
+    }
+
+    pub fn replay_actions(&self) -> impl Iterator<Item = ReplayCaseAction<'_>> {
+        self.actions.iter().map(|action| ReplayCaseAction {
+            action,
+            captured: &self.captured,
+        })
+    }
+
+    #[must_use]
+    pub fn resolve(&self, output_ref: CaseOutputRef) -> Option<&CaseCapturedValue> {
+        self.captured
+            .iter()
+            .find(|captured| captured.output_ref == output_ref)
+            .map(|captured| &captured.value)
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct ReplayCaseAction<'a> {
+    action: &'a CompiledCaseAction,
+    captured: &'a [CaseCapturedOutput],
+}
+
+impl ReplayCaseAction<'_> {
+    #[must_use]
+    pub const fn id(&self) -> ActionId {
+        self.action.id
+    }
+
+    #[must_use]
+    pub const fn logical_sequence(&self) -> u32 {
+        self.action.logical_sequence
+    }
+
+    #[must_use]
+    pub fn dependencies(&self) -> &BTreeSet<ActionId> {
+        &self.action.dependencies
+    }
+
+    #[must_use]
+    pub const fn decision_number(&self) -> u64 {
+        self.action.decision_number
+    }
+
+    #[must_use]
+    pub const fn eligible_count(&self) -> usize {
+        self.action.eligible_count
+    }
+
+    #[must_use]
+    pub const fn kind(&self) -> &PlanActionKind {
+        &self.action.kind
+    }
+
+    #[must_use]
+    pub fn input(&self, slot: CaseInputSlot) -> Option<&CaseCapturedValue> {
+        let source = self
+            .action
+            .inputs
+            .iter()
+            .find(|input| input.slot == slot)?
+            .source;
+        self.captured
+            .iter()
+            .find(|captured| captured.output_ref == source)
+            .map(|captured| &captured.value)
+    }
+}
+
+pub struct CaseTraceMaterializer;
+
+impl CaseTraceMaterializer {
+    /// Returns the exact dynamic values the executor must capture.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CaseTraceMaterializationError`] when the planned case is not
+    /// the valid deterministic result of its embedded specification.
+    pub fn required_outputs(
+        planned_case: &PlannedCase,
+    ) -> Result<Vec<CaseOutputRef>, CaseTraceMaterializationError> {
+        planned_case
+            .validate()
+            .map_err(|_| CaseTraceMaterializationError::InvalidPlannedCase)?;
+        Ok(materialize_case_actions(planned_case)?
+            .iter()
+            .flat_map(|action| {
+                action
+                    .declared_outputs
+                    .iter()
+                    .map(|&slot| CaseOutputRef::new(action.id, slot))
+            })
+            .collect())
+    }
+
+    /// Binds every reserved external value to a complete, validated case plan.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CaseTraceMaterializationError`] when the plan is invalid or a
+    /// captured output is missing, duplicated, unexpected, or has the wrong
+    /// type.
+    pub fn materialize<I>(
+        planned_case: &PlannedCase,
+        captured: I,
+    ) -> Result<CompiledCaseTrace, CaseTraceMaterializationError>
+    where
+        I: IntoIterator<Item = (CaseOutputRef, CaseCapturedValue)>,
+    {
+        planned_case
+            .validate()
+            .map_err(|_| CaseTraceMaterializationError::InvalidPlannedCase)?;
+        let actions = materialize_case_actions(planned_case)?;
+        let declared_outputs = actions
+            .iter()
+            .flat_map(|action| {
+                action
+                    .declared_outputs
+                    .iter()
+                    .map(|&slot| CaseOutputRef::new(action.id, slot))
+            })
+            .collect::<BTreeSet<_>>();
+        let mut captured_outputs = BTreeMap::new();
+        for (output_ref, value) in captured {
+            if captured_outputs.insert(output_ref, value).is_some() {
+                return Err(CaseTraceMaterializationError::DuplicateOutput(output_ref));
+            }
+        }
+        if let Some(&unexpected) = captured_outputs
+            .keys()
+            .find(|output_ref| !declared_outputs.contains(output_ref))
+        {
+            return Err(CaseTraceMaterializationError::UnexpectedOutput(unexpected));
+        }
+        for output_ref in declared_outputs {
+            let value = captured_outputs
+                .get(&output_ref)
+                .ok_or(CaseTraceMaterializationError::MissingOutput(output_ref))?;
+            if value.kind() != output_ref.slot {
+                return Err(CaseTraceMaterializationError::OutputTypeMismatch {
+                    output_ref,
+                    actual: value.kind(),
+                });
+            }
+        }
+        Ok(CompiledCaseTrace {
+            schema_version: CASE_TRACE_SCHEMA_VERSION,
+            planned_case: planned_case.clone(),
+            actions,
+            captured: captured_outputs
+                .into_iter()
+                .map(|(output_ref, value)| CaseCapturedOutput { output_ref, value })
+                .collect(),
+        })
+    }
+}
+
+fn materialize_case_actions(
+    planned_case: &PlannedCase,
+) -> Result<Vec<CompiledCaseAction>, CaseTraceMaterializationError> {
+    let mut active_payment_intent = None;
+    let mut held_provider_gate = None;
+    let mut actions = Vec::with_capacity(planned_case.actions().len());
+
+    for planned in planned_case.actions() {
+        let mut inputs = Vec::new();
+        let mut declared_outputs = BTreeSet::new();
+        match *planned.kind() {
+            PlanActionKind::DriveCheckout { outcome }
+            | PlanActionKind::RetryBusinessRequest { outcome } => {
+                if provider_create_commits(outcome) {
+                    let output = CaseOutputRef::new(planned.id(), CaseOutputSlot::PaymentIntentId);
+                    declared_outputs.insert(CaseOutputSlot::PaymentIntentId);
+                    active_payment_intent = Some(output);
+                }
+                if outcome == ProviderOutcome::CommitThenDelay {
+                    let output = CaseOutputRef::new(planned.id(), CaseOutputSlot::ProviderGateId);
+                    declared_outputs.insert(CaseOutputSlot::ProviderGateId);
+                    held_provider_gate = Some(output);
+                }
+            }
+            PlanActionKind::RetrievePaymentIntent
+            | PlanActionKind::ConfirmPaymentIntent { .. }
+            | PlanActionKind::RetryProviderRequest { .. }
+            | PlanActionKind::GenerateProviderEvent => {
+                inputs.push(CaseActionInput {
+                    slot: CaseInputSlot::PaymentIntentId,
+                    source: active_payment_intent.ok_or(
+                        CaseTraceMaterializationError::MissingDynamicSource {
+                            action_id: planned.id(),
+                            input: CaseInputSlot::PaymentIntentId,
+                        },
+                    )?,
+                });
+                if matches!(*planned.kind(), PlanActionKind::GenerateProviderEvent) {
+                    declared_outputs.insert(CaseOutputSlot::EventId);
+                }
+                if matches!(
+                    *planned.kind(),
+                    PlanActionKind::ConfirmPaymentIntent {
+                        outcome: ProviderOutcome::CommitThenDelay
+                    } | PlanActionKind::RetryProviderRequest {
+                        outcome: ProviderOutcome::CommitThenDelay
+                    }
+                ) {
+                    let output = CaseOutputRef::new(planned.id(), CaseOutputSlot::ProviderGateId);
+                    declared_outputs.insert(CaseOutputSlot::ProviderGateId);
+                    held_provider_gate = Some(output);
+                }
+            }
+            PlanActionKind::ReleaseProviderGate => {
+                inputs.push(CaseActionInput {
+                    slot: CaseInputSlot::ProviderGateId,
+                    source: held_provider_gate.take().ok_or(
+                        CaseTraceMaterializationError::MissingDynamicSource {
+                            action_id: planned.id(),
+                            input: CaseInputSlot::ProviderGateId,
+                        },
+                    )?,
+                });
+            }
+            PlanActionKind::DeliverWebhook
+            | PlanActionKind::DuplicateWebhook
+            | PlanActionKind::DelayWebhook { .. }
+            | PlanActionKind::ReorderWebhooks
+            | PlanActionKind::DropWebhook
+            | PlanActionKind::KillApplication { .. }
+            | PlanActionKind::RestartAndAwaitHealth
+            | PlanActionKind::WaitForQuiescence
+            | PlanActionKind::CheckCheckpoint { .. } => {}
+        }
+        actions.push(CompiledCaseAction {
+            id: planned.id(),
+            logical_sequence: planned.logical_sequence(),
+            dependencies: planned.dependencies().clone(),
+            decision_number: planned.decision_number(),
+            eligible_count: planned.eligible_count(),
+            kind: *planned.kind(),
+            inputs,
+            declared_outputs,
+        });
+    }
+    Ok(actions)
+}
+
+const fn provider_create_commits(outcome: ProviderOutcome) -> bool {
+    !matches!(
+        outcome,
+        ProviderOutcome::PreExecute429 | ProviderOutcome::PreExecute500
+    )
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CaseTraceMaterializationError {
+    InvalidPlannedCase,
+    DuplicateOutput(CaseOutputRef),
+    MissingOutput(CaseOutputRef),
+    UnexpectedOutput(CaseOutputRef),
+    OutputTypeMismatch {
+        output_ref: CaseOutputRef,
+        actual: CaseOutputSlot,
+    },
+    MissingDynamicSource {
+        action_id: ActionId,
+        input: CaseInputSlot,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
