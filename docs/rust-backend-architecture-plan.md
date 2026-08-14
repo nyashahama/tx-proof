@@ -316,6 +316,15 @@ The action vocabulary is intentionally closed in v0:
 
 Async outcomes may fill values already reserved by the plan, but do not request new random choices.
 
+A business action carries an action-scoped provider script, rather than one
+provider outcome. This is required because the reference checkout performs one
+internal retry after a transport close before the business request returns.
+The v1 script is bounded to one call, or exactly two calls where the first is
+`commit_then_close`; each committed call reserves a distinct, occurrence-indexed
+PaymentIntent output in the compiled trace. The terminal script outcome drives
+the next business phase, while ambiguity and provider-object cardinality include
+every call in the script.
+
 ### Fixture
 
 The fixture is a single-writer actor. Its state includes:

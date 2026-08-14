@@ -9,8 +9,8 @@ use crate::{
     trace::ActionId,
 };
 
-pub const PLAN_SCHEMA_VERSION: u16 = 2;
-pub const CAMPAIGN_SCHEMA_VERSION: u16 = 2;
+pub const PLAN_SCHEMA_VERSION: u16 = 3;
+pub const CAMPAIGN_SCHEMA_VERSION: u16 = 3;
 pub const MAX_ACTIONS_PER_CASE: u32 = 40;
 pub const MAX_CASES: u32 = 500;
 pub const PAYMENT_INTENT_V1_API_VERSION: &str = "2026-02-25.clover";
@@ -88,6 +88,107 @@ impl ProviderOutcome {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InvalidProviderOutcomeScript {
+    RetryWithoutTransportFailure,
+}
+
+/// The exact provider calls one application action is expected to make.
+///
+/// The v1 reference application retries one transport failure at most once.
+/// HTTP error responses are observable responses and therefore cannot start
+/// the optional second call.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderOutcomeScript {
+    first: ProviderOutcome,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    retry: Option<ProviderOutcome>,
+}
+
+impl ProviderOutcomeScript {
+    #[must_use]
+    pub const fn single(outcome: ProviderOutcome) -> Self {
+        Self {
+            first: outcome,
+            retry: None,
+        }
+    }
+
+    /// Creates the two-call script exercised by the reference application's
+    /// changed-idempotency-key retry.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidProviderOutcomeScript`] unless the first call closes
+    /// its connection after committing.
+    pub const fn with_transport_retry(
+        first: ProviderOutcome,
+        retry: ProviderOutcome,
+    ) -> Result<Self, InvalidProviderOutcomeScript> {
+        if !matches!(first, ProviderOutcome::CommitThenClose) {
+            return Err(InvalidProviderOutcomeScript::RetryWithoutTransportFailure);
+        }
+        Ok(Self {
+            first,
+            retry: Some(retry),
+        })
+    }
+
+    pub fn outcomes(self) -> impl Iterator<Item = ProviderOutcome> {
+        [Some(self.first), self.retry].into_iter().flatten()
+    }
+
+    #[must_use]
+    pub const fn terminal_outcome(self) -> ProviderOutcome {
+        match self.retry {
+            Some(retry) => retry,
+            None => self.first,
+        }
+    }
+
+    #[must_use]
+    pub const fn committed_count(self) -> u8 {
+        let first = if self.first.commits() { 1 } else { 0 };
+        let retry = match self.retry {
+            Some(outcome) if outcome.commits() => 1,
+            Some(_) | None => 0,
+        };
+        first + retry
+    }
+
+    const fn has_ambiguous_commit(self) -> bool {
+        (self.first.commits() && self.first.response_is_ambiguous())
+            || match self.retry {
+                Some(outcome) => outcome.commits() && outcome.response_is_ambiguous(),
+                None => false,
+            }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProviderOutcomeScriptWire {
+    first: ProviderOutcome,
+    retry: Option<ProviderOutcome>,
+}
+
+impl<'de> Deserialize<'de> for ProviderOutcomeScript {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = ProviderOutcomeScriptWire::deserialize(deserializer)?;
+        match wire.retry {
+            Some(retry) => Self::with_transport_retry(wire.first, retry),
+            None => Ok(Self::single(wire.first)),
+        }
+        .map_err(|error| {
+            D::Error::custom(format_args!("invalid provider outcome script: {error:?}"))
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProcessCutPoint {
@@ -113,22 +214,36 @@ pub enum Checkpoint {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PlanActionKind {
-    DriveCheckout { outcome: ProviderOutcome },
+    DriveCheckout {
+        provider_script: ProviderOutcomeScript,
+    },
     RetrievePaymentIntent,
     ReleaseProviderGate,
-    RetryBusinessRequest { outcome: ProviderOutcome },
-    ConfirmPaymentIntent { outcome: ProviderOutcome },
-    RetryProviderRequest { outcome: ProviderOutcome },
+    RetryBusinessRequest {
+        provider_script: ProviderOutcomeScript,
+    },
+    ConfirmPaymentIntent {
+        provider_script: ProviderOutcomeScript,
+    },
+    RetryProviderRequest {
+        provider_script: ProviderOutcomeScript,
+    },
     GenerateProviderEvent,
     DeliverWebhook,
     DuplicateWebhook,
-    DelayWebhook { milliseconds: u64 },
+    DelayWebhook {
+        milliseconds: u64,
+    },
     ReorderWebhooks,
     DropWebhook,
-    KillApplication { cut_point: ProcessCutPoint },
+    KillApplication {
+        cut_point: ProcessCutPoint,
+    },
     RestartAndAwaitHealth,
     WaitForQuiescence,
-    CheckCheckpoint { checkpoint: Checkpoint },
+    CheckCheckpoint {
+        checkpoint: Checkpoint,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -598,14 +713,15 @@ fn eligible_actions(state: ModelState, spec: &PlanSpec) -> Vec<PlanActionKind> {
             .provider_outcomes
             .iter()
             .copied()
-            .map(|outcome| PlanActionKind::DriveCheckout { outcome })
+            .flat_map(|outcome| business_scripts(spec, outcome))
+            .map(|provider_script| PlanActionKind::DriveCheckout { provider_script })
             .collect(),
         Phase::CheckoutRetryable {
             attempts,
             ambiguous,
         } => {
-            let mut actions = retry_outcomes(spec, attempts)
-                .map(|outcome| PlanActionKind::RetryBusinessRequest { outcome })
+            let mut actions = retry_business_scripts(spec, attempts)
+                .map(|provider_script| PlanActionKind::RetryBusinessRequest { provider_script })
                 .collect::<Vec<_>>();
             if ambiguous {
                 actions.push(PlanActionKind::RetrievePaymentIntent);
@@ -619,14 +735,16 @@ fn eligible_actions(state: ModelState, spec: &PlanSpec) -> Vec<PlanActionKind> {
             .provider_outcomes
             .iter()
             .copied()
-            .map(|outcome| PlanActionKind::ConfirmPaymentIntent { outcome })
+            .map(ProviderOutcomeScript::single)
+            .map(|provider_script| PlanActionKind::ConfirmPaymentIntent { provider_script })
             .collect(),
         Phase::ConfirmRetryable {
             attempts,
             ambiguous,
         } => {
             let mut actions = retry_outcomes(spec, attempts)
-                .map(|outcome| PlanActionKind::RetryProviderRequest { outcome })
+                .map(ProviderOutcomeScript::single)
+                .map(|provider_script| PlanActionKind::RetryProviderRequest { provider_script })
                 .collect::<Vec<_>>();
             if ambiguous {
                 actions.push(PlanActionKind::RetrievePaymentIntent);
@@ -653,6 +771,33 @@ fn eligible_actions(state: ModelState, spec: &PlanSpec) -> Vec<PlanActionKind> {
     }
 
     actions
+}
+
+fn business_scripts(
+    spec: &PlanSpec,
+    first: ProviderOutcome,
+) -> impl Iterator<Item = ProviderOutcomeScript> + '_ {
+    let mut scripts = Vec::new();
+    if first == ProviderOutcome::CommitThenClose {
+        scripts.extend(spec.provider_outcomes.iter().copied().map(|retry| {
+            ProviderOutcomeScript::with_transport_retry(first, retry)
+                .expect("the first outcome is a transport close")
+        }));
+    } else {
+        scripts.push(ProviderOutcomeScript::single(first));
+    }
+    scripts.into_iter()
+}
+
+fn retry_business_scripts(
+    spec: &PlanSpec,
+    attempts: u8,
+) -> impl Iterator<Item = ProviderOutcomeScript> + '_ {
+    spec.provider_outcomes
+        .iter()
+        .copied()
+        .filter(move |outcome| attempts < 2 || *outcome == ProviderOutcome::Normal)
+        .flat_map(|outcome| business_scripts(spec, outcome))
 }
 
 fn retry_outcomes(spec: &PlanSpec, attempts: u8) -> impl Iterator<Item = ProviderOutcome> + '_ {
@@ -743,13 +888,12 @@ fn apply_action(mut state: ModelState, action: PlanActionKind) -> Option<ModelSt
     }
 
     if let Some(phase) = apply_provider_action(state.phase, action) {
-        if matches!(
-            action,
-            PlanActionKind::DriveCheckout { outcome }
-                | PlanActionKind::RetryBusinessRequest { outcome }
-                if outcome.commits()
-        ) {
-            state.provider_objects = state.provider_objects.checked_add(1)?;
+        if let PlanActionKind::DriveCheckout { provider_script }
+        | PlanActionKind::RetryBusinessRequest { provider_script } = action
+        {
+            state.provider_objects = state
+                .provider_objects
+                .checked_add(provider_script.committed_count())?;
         }
         state.phase = phase;
         return Some(state);
@@ -778,13 +922,13 @@ fn apply_action(mut state: ModelState, action: PlanActionKind) -> Option<ModelSt
 
 fn apply_provider_action(phase: Phase, action: PlanActionKind) -> Option<Phase> {
     match (phase, action) {
-        (Phase::Start, PlanActionKind::DriveCheckout { outcome }) => {
-            Some(provider_create_phase(outcome, 0))
+        (Phase::Start, PlanActionKind::DriveCheckout { provider_script }) => {
+            Some(provider_create_phase(provider_script, 0))
         }
         (
             Phase::CheckoutRetryable { attempts, .. },
-            PlanActionKind::RetryBusinessRequest { outcome },
-        ) => Some(provider_create_phase(outcome, attempts + 1)),
+            PlanActionKind::RetryBusinessRequest { provider_script },
+        ) => Some(provider_create_phase(provider_script, attempts + 1)),
         (Phase::CheckoutResponseHeld, PlanActionKind::ReleaseProviderGate) => {
             Some(Phase::PaymentIntentKnown)
         }
@@ -794,13 +938,13 @@ fn apply_provider_action(phase: Phase, action: PlanActionKind) -> Option<Phase> 
             },
             PlanActionKind::RetrievePaymentIntent,
         ) => Some(Phase::PaymentIntentKnown),
-        (Phase::PaymentIntentKnown, PlanActionKind::ConfirmPaymentIntent { outcome }) => {
-            Some(provider_confirm_phase(outcome, 0))
+        (Phase::PaymentIntentKnown, PlanActionKind::ConfirmPaymentIntent { provider_script }) => {
+            Some(provider_confirm_phase(provider_script, 0))
         }
         (
             Phase::ConfirmRetryable { attempts, .. },
-            PlanActionKind::RetryProviderRequest { outcome },
-        ) => Some(provider_confirm_phase(outcome, attempts + 1)),
+            PlanActionKind::RetryProviderRequest { provider_script },
+        ) => Some(provider_confirm_phase(provider_script, attempts + 1)),
         (Phase::ConfirmResponseHeld, PlanActionKind::ReleaseProviderGate)
         | (
             Phase::ConfirmRetryable {
@@ -841,24 +985,24 @@ fn apply_event_action(phase: Phase, action: PlanActionKind) -> Option<Phase> {
     Some(Phase::Events(events))
 }
 
-fn provider_create_phase(outcome: ProviderOutcome, attempts: u8) -> Phase {
-    match outcome {
+fn provider_create_phase(provider_script: ProviderOutcomeScript, attempts: u8) -> Phase {
+    match provider_script.terminal_outcome() {
         ProviderOutcome::Normal => Phase::PaymentIntentKnown,
         ProviderOutcome::CommitThenDelay => Phase::CheckoutResponseHeld,
         _ => Phase::CheckoutRetryable {
             attempts,
-            ambiguous: outcome.commits() && outcome.response_is_ambiguous(),
+            ambiguous: provider_script.has_ambiguous_commit(),
         },
     }
 }
 
-fn provider_confirm_phase(outcome: ProviderOutcome, attempts: u8) -> Phase {
-    match outcome {
+fn provider_confirm_phase(provider_script: ProviderOutcomeScript, attempts: u8) -> Phase {
+    match provider_script.terminal_outcome() {
         ProviderOutcome::Normal => Phase::Confirmed,
         ProviderOutcome::CommitThenDelay => Phase::ConfirmResponseHeld,
         _ => Phase::ConfirmRetryable {
             attempts,
-            ambiguous: outcome.commits() && outcome.response_is_ambiguous(),
+            ambiguous: provider_script.has_ambiguous_commit(),
         },
     }
 }

@@ -5,7 +5,13 @@ use std::{
 
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
-use tiv_core::decision::Seed;
+use tiv_core::{
+    decision::Seed,
+    plan::{
+        ActionBudget, CasePlanCompiler, PlanActionKind, PlanSpec, ProviderOutcome,
+        ProviderOutcomeScript,
+    },
+};
 use tiv_reference_app::{
     CheckoutOperation, ReferenceDatabaseName, create_with_changed_retry_key,
     parse_succeeded_webhook, verify_webhook_signature,
@@ -98,14 +104,15 @@ fn signed_fixture_webhook_is_decoded_into_the_same_operation_relation() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ambiguous_transport_failure_is_retried_with_a_changed_key() {
-    let fixture = Arc::new(Mutex::new(ManagedFixture::new(Seed::new(42))));
+    let (seed, provider_script) = compiled_changed_key_retry_script();
+    let fixture = Arc::new(Mutex::new(ManagedFixture::new(seed)));
     fixture
         .lock()
         .await
         .reset(
             1,
-            Seed::new(42),
-            vec![FaultOutcome::CommitThenClose, FaultOutcome::Normal],
+            seed,
+            provider_script.outcomes().map(fixture_outcome).collect(),
         )
         .expect("the fault plan is installed");
     let listener = TcpListener::bind("127.0.0.1:0")
@@ -137,11 +144,51 @@ async fn ambiguous_transport_failure_is_retried_with_a_changed_key() {
         .expect("the two-connection fixture stops")
         .expect("the fixture task does not panic");
     let snapshot = fixture.lock().await.snapshot();
-    assert_eq!(snapshot.payment_intents().len(), 2);
+    assert_eq!(
+        snapshot.payment_intents().len(),
+        usize::from(provider_script.committed_count()),
+        "the action-scoped plan must count every provider object committed by one business request"
+    );
     assert_ne!(
         snapshot.payment_intents()[0].id(),
         snapshot.payment_intents()[1].id()
     );
+}
+
+fn compiled_changed_key_retry_script() -> (Seed, ProviderOutcomeScript) {
+    for raw_seed in 0..512 {
+        let seed = Seed::new(raw_seed);
+        let plan = CasePlanCompiler::compile(&PlanSpec::payment_intent_v1(
+            seed,
+            ActionBudget::new(40).unwrap(),
+        ))
+        .expect("the v1 plan is feasible");
+        for action in plan.actions() {
+            let (PlanActionKind::DriveCheckout { provider_script }
+            | PlanActionKind::RetryBusinessRequest { provider_script }) = action.kind()
+            else {
+                continue;
+            };
+            let script = *provider_script;
+            if script.outcomes().collect::<Vec<_>>()
+                == [ProviderOutcome::CommitThenClose, ProviderOutcome::Normal]
+            {
+                return (seed, script);
+            }
+        }
+    }
+    panic!("the deterministic seed corpus must compile the changed-key retry script");
+}
+
+const fn fixture_outcome(outcome: ProviderOutcome) -> FaultOutcome {
+    match outcome {
+        ProviderOutcome::Normal => FaultOutcome::Normal,
+        ProviderOutcome::PreExecute429 => FaultOutcome::PreExecute429,
+        ProviderOutcome::PreExecute500 => FaultOutcome::PreExecute500,
+        ProviderOutcome::PostExecute500 => FaultOutcome::PostExecute500,
+        ProviderOutcome::CommitThenClose => FaultOutcome::CommitThenClose,
+        ProviderOutcome::CommitThenDelay => FaultOutcome::CommitThenDelay,
+    }
 }
 
 fn signature_header(timestamp: i64, body: &[u8], secret: &[u8]) -> String {

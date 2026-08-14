@@ -1,6 +1,6 @@
 use tiv_core::{
     decision::Seed,
-    plan::{ActionBudget, CasePlanCompiler, PlanActionKind, PlanSpec, ProviderOutcome},
+    plan::{ActionBudget, CasePlanCompiler, PlanActionKind, PlanSpec},
 };
 use tiv_stripe_pi::{CreatePaymentIntent, FaultOutcome, IdempotencyKey, PaymentIntentFixture};
 
@@ -15,8 +15,8 @@ fn planned_event_cardinality_matches_the_real_fixture_projection() {
         let committed_objects = plan
             .actions()
             .iter()
-            .filter(|action| committed_business_create(action.kind()))
-            .count();
+            .map(|action| committed_business_create(action.kind()))
+            .sum::<usize>();
         let planned_events = plan
             .actions()
             .iter()
@@ -52,19 +52,12 @@ fn planned_event_cardinality_matches_the_real_fixture_projection() {
     }
 }
 
-fn committed_business_create(kind: &PlanActionKind) -> bool {
-    matches!(
-        kind,
-        PlanActionKind::DriveCheckout {
-            outcome: ProviderOutcome::Normal
-                | ProviderOutcome::PostExecute500
-                | ProviderOutcome::CommitThenClose
-                | ProviderOutcome::CommitThenDelay
-        } | PlanActionKind::RetryBusinessRequest {
-            outcome: ProviderOutcome::Normal
-                | ProviderOutcome::PostExecute500
-                | ProviderOutcome::CommitThenClose
-                | ProviderOutcome::CommitThenDelay
+fn committed_business_create(kind: &PlanActionKind) -> usize {
+    match kind {
+        PlanActionKind::DriveCheckout { provider_script }
+        | PlanActionKind::RetryBusinessRequest { provider_script } => {
+            usize::from(provider_script.committed_count())
         }
-    )
+        _ => 0,
+    }
 }

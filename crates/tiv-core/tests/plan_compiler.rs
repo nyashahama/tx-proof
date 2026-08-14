@@ -5,10 +5,77 @@ use tiv_core::{
     plan::{
         ActionBudget, CasePlanCompiler, Checkpoint, PlanActionKind, PlanCompileError, PlanSpec,
         PlanValidationError, PlannedAction, PlannedCase, ProcessCutPoint, ProcessFaultSpec,
-        ProviderOutcome, SCHEDULER_ALGORITHM, WebhookFaultSpec,
+        ProviderOutcome, ProviderOutcomeScript, SCHEDULER_ALGORITHM, WebhookFaultSpec,
     },
     trace::ActionId,
 };
+
+#[test]
+fn provider_scripts_match_the_reference_apps_single_transport_retry_policy() {
+    let script = ProviderOutcomeScript::with_transport_retry(
+        ProviderOutcome::CommitThenClose,
+        ProviderOutcome::Normal,
+    )
+    .expect("a transport close may be followed by one retry");
+
+    assert_eq!(
+        script.outcomes().collect::<Vec<_>>(),
+        vec![ProviderOutcome::CommitThenClose, ProviderOutcome::Normal]
+    );
+    assert_eq!(script.committed_count(), 2);
+    assert!(
+        ProviderOutcomeScript::with_transport_retry(
+            ProviderOutcome::PostExecute500,
+            ProviderOutcome::Normal,
+        )
+        .is_err(),
+        "an HTTP 500 is a response, so the reference app does not retry it internally"
+    );
+    assert!(
+        serde_json::from_value::<ProviderOutcomeScript>(serde_json::json!({
+            "first": "post_execute_500",
+            "retry": "normal"
+        }))
+        .is_err(),
+        "untrusted scripts must revalidate the same retry boundary"
+    );
+}
+
+#[test]
+fn compiled_business_actions_include_the_apps_internal_transport_retry() {
+    let mut saw_transport_retry = false;
+    for seed in 0..512 {
+        let plan = CasePlanCompiler::compile(&PlanSpec::payment_intent_v1(
+            Seed::new(seed),
+            ActionBudget::new(40).unwrap(),
+        ))
+        .expect("the v1 plan is feasible");
+
+        for action in plan.actions() {
+            let (PlanActionKind::DriveCheckout {
+                provider_script: script,
+            }
+            | PlanActionKind::RetryBusinessRequest {
+                provider_script: script,
+            }) = action.kind()
+            else {
+                continue;
+            };
+            let outcomes = script.outcomes().collect::<Vec<_>>();
+            if outcomes[0] == ProviderOutcome::CommitThenClose {
+                saw_transport_retry = true;
+                assert_eq!(
+                    outcomes.len(),
+                    2,
+                    "the reference app always performs its internal retry before the business action ends"
+                );
+            } else {
+                assert_eq!(outcomes.len(), 1);
+            }
+        }
+    }
+    assert!(saw_transport_retry);
+}
 
 #[test]
 fn the_same_seed_and_spec_compile_to_the_same_plan() {
@@ -27,14 +94,14 @@ fn the_same_seed_and_spec_compile_to_the_same_plan() {
 }
 
 #[test]
-fn the_v2_plan_artifact_matches_its_golden_contract() {
+fn the_v3_plan_artifact_matches_its_golden_contract() {
     let spec = PlanSpec::payment_intent_v1(Seed::new(42), ActionBudget::new(40).unwrap());
     let plan = CasePlanCompiler::compile(&spec).expect("the v1 plan is feasible");
     let actual = format!("{}\n", serde_json::to_string_pretty(&plan).unwrap());
 
     assert_eq!(
         actual,
-        include_str!("golden/planned-case-v2.json"),
+        include_str!("golden/planned-case-v3.json"),
         "intentional plan wire changes require an explicit golden update"
     );
     let decoded: PlannedCase = serde_json::from_str(&actual).expect("the golden plan revalidates");
@@ -71,19 +138,13 @@ fn generated_plans_are_state_valid_bounded_and_serial() {
         let mut application_was_killed = false;
         let mut provider_gate_is_held = false;
         for action in plan.actions() {
+            if action_provider_script(action.kind())
+                .is_some_and(|script| script.terminal_outcome() == ProviderOutcome::CommitThenDelay)
+            {
+                provider_gate_is_held = true;
+                continue;
+            }
             match action.kind() {
-                PlanActionKind::DriveCheckout {
-                    outcome: ProviderOutcome::CommitThenDelay,
-                }
-                | PlanActionKind::RetryBusinessRequest {
-                    outcome: ProviderOutcome::CommitThenDelay,
-                }
-                | PlanActionKind::ConfirmPaymentIntent {
-                    outcome: ProviderOutcome::CommitThenDelay,
-                }
-                | PlanActionKind::RetryProviderRequest {
-                    outcome: ProviderOutcome::CommitThenDelay,
-                } => provider_gate_is_held = true,
                 PlanActionKind::ReleaseProviderGate => {
                     assert!(
                         provider_gate_is_held,
@@ -141,23 +202,14 @@ fn generated_events_match_committed_provider_objects_before_reorder() {
         let committed_provider_objects = plan
             .actions()
             .iter()
-            .filter(|action| {
-                matches!(
-                    action.kind(),
-                    PlanActionKind::DriveCheckout {
-                        outcome: ProviderOutcome::Normal
-                            | ProviderOutcome::PostExecute500
-                            | ProviderOutcome::CommitThenClose
-                            | ProviderOutcome::CommitThenDelay
-                    } | PlanActionKind::RetryBusinessRequest {
-                        outcome: ProviderOutcome::Normal
-                            | ProviderOutcome::PostExecute500
-                            | ProviderOutcome::CommitThenClose
-                            | ProviderOutcome::CommitThenDelay
-                    }
-                )
+            .filter_map(|action| match action.kind() {
+                PlanActionKind::DriveCheckout { provider_script }
+                | PlanActionKind::RetryBusinessRequest { provider_script } => {
+                    Some(usize::from(provider_script.committed_count()))
+                }
+                _ => None,
             })
-            .count();
+            .sum::<usize>();
         let generated_events = plan
             .actions()
             .iter()
@@ -198,11 +250,11 @@ fn the_seeded_compiler_reaches_every_v1_fault_family() {
 
         for action in plan.actions() {
             match action.kind() {
-                PlanActionKind::DriveCheckout { outcome }
-                | PlanActionKind::RetryBusinessRequest { outcome }
-                | PlanActionKind::ConfirmPaymentIntent { outcome }
-                | PlanActionKind::RetryProviderRequest { outcome } => {
-                    provider_outcomes.insert(*outcome);
+                PlanActionKind::DriveCheckout { provider_script }
+                | PlanActionKind::RetryBusinessRequest { provider_script }
+                | PlanActionKind::ConfirmPaymentIntent { provider_script }
+                | PlanActionKind::RetryProviderRequest { provider_script } => {
+                    provider_outcomes.extend(provider_script.outcomes());
                 }
                 PlanActionKind::DuplicateWebhook => saw_duplicate = true,
                 PlanActionKind::DelayWebhook { .. } => saw_delay = true,
@@ -247,6 +299,16 @@ fn the_seeded_compiler_reaches_every_v1_fault_family() {
             ProcessCutPoint::SqlProbe,
         ])
     );
+}
+
+const fn action_provider_script(kind: &PlanActionKind) -> Option<ProviderOutcomeScript> {
+    match kind {
+        PlanActionKind::DriveCheckout { provider_script }
+        | PlanActionKind::RetryBusinessRequest { provider_script }
+        | PlanActionKind::ConfirmPaymentIntent { provider_script }
+        | PlanActionKind::RetryProviderRequest { provider_script } => Some(*provider_script),
+        _ => None,
+    }
 }
 
 #[test]
@@ -332,8 +394,8 @@ fn deserialization_rejects_a_tampered_or_state_invalid_plan() {
 
     assert!(serde_json::from_value::<PlannedCase>(incompatible).is_err());
 
-    let plan = CasePlanCompiler::compile(&spec).expect("the v2 plan is feasible");
+    let plan = CasePlanCompiler::compile(&spec).expect("the v3 plan is feasible");
     let mut obsolete = serde_json::to_value(plan).unwrap();
-    obsolete["schema_version"] = serde_json::json!(1);
+    obsolete["schema_version"] = serde_json::json!(2);
     assert!(serde_json::from_value::<PlannedCase>(obsolete).is_err());
 }

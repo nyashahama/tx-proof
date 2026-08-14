@@ -475,12 +475,15 @@ impl CaseEffectAdapter for HeldCheckoutHttpAdapter {
     ) -> CaseEffectFuture<'a, Self::Error> {
         Box::pin(async move {
             match request.action().kind() {
-                PlanActionKind::DriveCheckout {
-                    outcome: ProviderOutcome::CommitThenDelay,
+                PlanActionKind::DriveCheckout { provider_script }
+                | PlanActionKind::RetryBusinessRequest { provider_script }
+                    if *provider_script
+                        == tiv_core::plan::ProviderOutcomeScript::single(
+                            ProviderOutcome::CommitThenDelay,
+                        ) =>
+                {
+                    self.start_held_checkout(&request).await
                 }
-                | PlanActionKind::RetryBusinessRequest {
-                    outcome: ProviderOutcome::CommitThenDelay,
-                } => self.start_held_checkout(&request).await,
                 PlanActionKind::ReleaseProviderGate => self.release_held_checkout(&request).await,
                 _ => Err(HeldCheckoutHttpError::UnsupportedAction),
             }

@@ -10,7 +10,10 @@ use hyper_util::rt::TokioIo;
 use serde::Deserialize;
 use tiv_core::{
     decision::Seed,
-    plan::{ActionBudget, CasePlanCompiler, PlanActionKind, PlanSpec, ProviderOutcome},
+    plan::{
+        ActionBudget, CasePlanCompiler, PlanActionKind, PlanSpec, ProviderOutcome,
+        ProviderOutcomeScript,
+    },
     trace::{CaseCapturedValue, CaseOutputRef, CaseOutputSlot},
 };
 use tiv_runtime::{
@@ -171,14 +174,16 @@ impl CaseEffectAdapter for CompletingAdapter {
         &'a mut self,
         request: CaseEffectRequest<'a>,
     ) -> CaseEffectFuture<'a, Self::Error> {
-        if matches!(
-            request.action().kind(),
-            PlanActionKind::DriveCheckout {
-                outcome: ProviderOutcome::CommitThenDelay
-            } | PlanActionKind::RetryBusinessRequest {
-                outcome: ProviderOutcome::CommitThenDelay
-            } | PlanActionKind::ReleaseProviderGate
-        ) {
+        let held_business_action = match request.action().kind() {
+            PlanActionKind::DriveCheckout { provider_script }
+            | PlanActionKind::RetryBusinessRequest { provider_script } => {
+                *provider_script == ProviderOutcomeScript::single(ProviderOutcome::CommitThenDelay)
+            }
+            _ => false,
+        };
+        if held_business_action
+            || matches!(request.action().kind(), PlanActionKind::ReleaseProviderGate)
+        {
             return self.held_checkout.execute(request);
         }
 
@@ -329,32 +334,38 @@ async fn start_driver_server(data_address: SocketAddr) -> (SocketAddr, JoinHandl
 }
 
 fn held_checkout_plan() -> tiv_core::plan::PlannedCase {
-    let plan = CasePlanCompiler::compile(&PlanSpec::payment_intent_v1(
-        Seed::new(346),
-        ActionBudget::new(40).unwrap(),
-    ))
-    .expect("the pinned held-checkout plan is feasible");
-    assert!(matches!(
-        plan.actions()
-            .first()
-            .map(tiv_core::plan::PlannedAction::kind),
-        Some(PlanActionKind::DriveCheckout {
-            outcome: ProviderOutcome::CommitThenDelay
+    let plan = (0..4_096)
+        .find_map(|seed| {
+            let plan = CasePlanCompiler::compile(&PlanSpec::payment_intent_v1(
+                Seed::new(seed),
+                ActionBudget::new(40).unwrap(),
+            ))
+            .expect("the candidate held-checkout plan is feasible");
+            let held = match plan
+                .actions()
+                .first()
+                .map(tiv_core::plan::PlannedAction::kind)
+            {
+                Some(PlanActionKind::DriveCheckout { provider_script }) => {
+                    *provider_script
+                        == ProviderOutcomeScript::single(ProviderOutcome::CommitThenDelay)
+                }
+                _ => false,
+            };
+            let immediately_released = matches!(
+                plan.actions()
+                    .get(1)
+                    .map(tiv_core::plan::PlannedAction::kind),
+                Some(PlanActionKind::ReleaseProviderGate)
+            );
+            (held && immediately_released).then_some(plan)
         })
-    ));
+        .expect("the deterministic seed corpus contains a held-checkout plan");
     assert!(matches!(
         plan.actions()
             .get(1)
             .map(tiv_core::plan::PlannedAction::kind),
         Some(PlanActionKind::ReleaseProviderGate)
-    ));
-    assert!(matches!(
-        plan.actions()
-            .get(2)
-            .map(tiv_core::plan::PlannedAction::kind),
-        Some(PlanActionKind::ConfirmPaymentIntent {
-            outcome: ProviderOutcome::Normal
-        })
     ));
     plan
 }

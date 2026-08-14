@@ -1,0 +1,231 @@
+{
+  "schema_version": 3,
+  "scheduler_algorithm": "rand/0.10.2/random_range+rand_chacha/0.10.0/ChaCha20Rng-seed_from_u64",
+  "spec": {
+    "seed": 42,
+    "max_actions": 40,
+    "provider_adapter": "payment_intent_v1",
+    "provider_api_version": "2026-02-25.clover",
+    "provider_outcomes": [
+      "normal",
+      "pre_execute_429",
+      "pre_execute_500",
+      "post_execute_500",
+      "commit_then_close",
+      "commit_then_delay"
+    ],
+    "webhook_faults": {
+      "duplicate_max": 3,
+      "delays_millis": [
+        0,
+        10,
+        100,
+        1000,
+        5000
+      ],
+      "allow_reorder": true,
+      "allow_drop": true
+    },
+    "process_faults": {
+      "cut_points": [
+        "client_request_forwarded",
+        "client_response_observed",
+        "webhook_request_forwarded",
+        "webhook_response_observed",
+        "sql_probe"
+      ],
+      "max_kills": 1
+    }
+  },
+  "decision_count": 15,
+  "actions": [
+    {
+      "id": 1,
+      "logical_sequence": 1,
+      "dependencies": [],
+      "decision_number": 0,
+      "eligible_count": 11,
+      "kind": {
+        "kind": "drive_checkout",
+        "provider_script": {
+          "first": "commit_then_close",
+          "retry": "commit_then_delay"
+        }
+      }
+    },
+    {
+      "id": 2,
+      "logical_sequence": 2,
+      "dependencies": [
+        1
+      ],
+      "decision_number": 1,
+      "eligible_count": 3,
+      "kind": {
+        "kind": "kill_application",
+        "cut_point": "client_request_forwarded"
+      }
+    },
+    {
+      "id": 3,
+      "logical_sequence": 3,
+      "dependencies": [
+        2
+      ],
+      "decision_number": 2,
+      "eligible_count": 1,
+      "kind": {
+        "kind": "restart_and_await_health"
+      }
+    },
+    {
+      "id": 4,
+      "logical_sequence": 4,
+      "dependencies": [
+        3
+      ],
+      "decision_number": 3,
+      "eligible_count": 1,
+      "kind": {
+        "kind": "release_provider_gate"
+      }
+    },
+    {
+      "id": 5,
+      "logical_sequence": 5,
+      "dependencies": [
+        4
+      ],
+      "decision_number": 4,
+      "eligible_count": 6,
+      "kind": {
+        "kind": "confirm_payment_intent",
+        "provider_script": {
+          "first": "normal"
+        }
+      }
+    },
+    {
+      "id": 6,
+      "logical_sequence": 6,
+      "dependencies": [
+        5
+      ],
+      "decision_number": 5,
+      "eligible_count": 1,
+      "kind": {
+        "kind": "generate_provider_event"
+      }
+    },
+    {
+      "id": 7,
+      "logical_sequence": 7,
+      "dependencies": [
+        6
+      ],
+      "decision_number": 6,
+      "eligible_count": 1,
+      "kind": {
+        "kind": "generate_provider_event"
+      }
+    },
+    {
+      "id": 8,
+      "logical_sequence": 8,
+      "dependencies": [
+        7
+      ],
+      "decision_number": 7,
+      "eligible_count": 8,
+      "kind": {
+        "kind": "delay_webhook",
+        "milliseconds": 0
+      }
+    },
+    {
+      "id": 9,
+      "logical_sequence": 9,
+      "dependencies": [
+        8
+      ],
+      "decision_number": 8,
+      "eligible_count": 3,
+      "kind": {
+        "kind": "reorder_webhooks"
+      }
+    },
+    {
+      "id": 10,
+      "logical_sequence": 10,
+      "dependencies": [
+        9
+      ],
+      "decision_number": 9,
+      "eligible_count": 2,
+      "kind": {
+        "kind": "deliver_webhook"
+      }
+    },
+    {
+      "id": 11,
+      "logical_sequence": 11,
+      "dependencies": [
+        10
+      ],
+      "decision_number": 10,
+      "eligible_count": 3,
+      "kind": {
+        "kind": "drop_webhook"
+      }
+    },
+    {
+      "id": 12,
+      "logical_sequence": 12,
+      "dependencies": [
+        11
+      ],
+      "decision_number": 11,
+      "eligible_count": 2,
+      "kind": {
+        "kind": "duplicate_webhook"
+      }
+    },
+    {
+      "id": 13,
+      "logical_sequence": 13,
+      "dependencies": [
+        12
+      ],
+      "decision_number": 12,
+      "eligible_count": 2,
+      "kind": {
+        "kind": "duplicate_webhook"
+      }
+    },
+    {
+      "id": 14,
+      "logical_sequence": 14,
+      "dependencies": [
+        13
+      ],
+      "decision_number": 13,
+      "eligible_count": 2,
+      "kind": {
+        "kind": "wait_for_quiescence"
+      }
+    },
+    {
+      "id": 15,
+      "logical_sequence": 15,
+      "dependencies": [
+        14
+      ],
+      "decision_number": 14,
+      "eligible_count": 1,
+      "kind": {
+        "kind": "check_checkpoint",
+        "checkpoint": "final"
+      }
+    }
+  ]
+}

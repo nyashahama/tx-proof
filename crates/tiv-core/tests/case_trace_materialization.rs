@@ -7,6 +7,44 @@ use tiv_core::{
     },
 };
 
+#[test]
+fn one_business_action_reserves_each_committed_provider_object_separately() {
+    let (plan, action_id) = (0..512)
+        .find_map(|seed| {
+            let plan = CasePlanCompiler::compile(&PlanSpec::payment_intent_v1(
+                Seed::new(seed),
+                ActionBudget::new(40).unwrap(),
+            ))
+            .expect("the v1 plan is feasible");
+            let action_id = plan
+                .actions()
+                .iter()
+                .find_map(|action| match action.kind() {
+                    PlanActionKind::DriveCheckout { provider_script }
+                    | PlanActionKind::RetryBusinessRequest { provider_script }
+                        if provider_script.committed_count() == 2 =>
+                    {
+                        Some(action.id())
+                    }
+                    _ => None,
+                })?;
+            Some((plan, action_id))
+        })
+        .expect("the deterministic seed corpus reaches a two-commit business action");
+
+    let outputs = CaseTraceMaterializer::required_outputs(&plan)
+        .expect("the validated plan materializes")
+        .into_iter()
+        .filter(|output| {
+            output.action_id() == action_id && output.slot() == CaseOutputSlot::PaymentIntentId
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(outputs.len(), 2);
+    assert_eq!(outputs[0].occurrence(), 0);
+    assert_eq!(outputs[1].occurrence(), 1);
+}
+
 fn golden_case() -> tiv_core::plan::PlannedCase {
     CasePlanCompiler::compile(&PlanSpec::payment_intent_v1(
         Seed::new(42),
@@ -22,6 +60,10 @@ fn complete_captures() -> Vec<(CaseOutputRef, CaseCapturedValue)> {
             CaseCapturedValue::payment_intent_id("pi_tiv_42_1").unwrap(),
         ),
         (
+            CaseOutputRef::for_occurrence(ActionId::new(1), CaseOutputSlot::PaymentIntentId, 1),
+            CaseCapturedValue::payment_intent_id("pi_tiv_42_2").unwrap(),
+        ),
+        (
             CaseOutputRef::new(ActionId::new(1), CaseOutputSlot::ProviderGateId),
             CaseCapturedValue::provider_gate_id(1).unwrap(),
         ),
@@ -29,19 +71,24 @@ fn complete_captures() -> Vec<(CaseOutputRef, CaseCapturedValue)> {
             CaseOutputRef::new(ActionId::new(6), CaseOutputSlot::EventId),
             CaseCapturedValue::event_id("evt_tiv_42_1").unwrap(),
         ),
+        (
+            CaseOutputRef::new(ActionId::new(7), CaseOutputSlot::EventId),
+            CaseCapturedValue::event_id("evt_tiv_42_2").unwrap(),
+        ),
     ]
 }
 
 #[test]
 fn a_full_planned_case_materializes_every_action_and_dynamic_binding() {
     let plan = golden_case();
-    let payment_intent = complete_captures()[0].1.clone();
-    let gate = complete_captures()[1].1.clone();
+    let first_payment_intent = complete_captures()[0].1.clone();
+    let active_payment_intent = complete_captures()[1].1.clone();
+    let gate = complete_captures()[2].1.clone();
 
     let compiled = CaseTraceMaterializer::materialize(&plan, complete_captures())
         .expect("every reserved output was captured");
 
-    assert_eq!(compiled.schema_version(), 2);
+    assert_eq!(compiled.schema_version(), 3);
     assert_eq!(compiled.action_count(), plan.actions().len());
     assert_eq!(compiled.planned_case(), &plan);
     assert_eq!(
@@ -56,14 +103,21 @@ fn a_full_planned_case_materializes_every_action_and_dynamic_binding() {
             .replay_action(ActionId::new(5))
             .unwrap()
             .input(CaseInputSlot::PaymentIntentId),
-        Some(&payment_intent)
+        Some(&active_payment_intent)
     );
     assert_eq!(
         compiled
             .replay_action(ActionId::new(6))
             .unwrap()
             .input(CaseInputSlot::PaymentIntentId),
-        Some(&payment_intent)
+        Some(&first_payment_intent)
+    );
+    assert_eq!(
+        compiled
+            .replay_action(ActionId::new(7))
+            .unwrap()
+            .input(CaseInputSlot::PaymentIntentId),
+        Some(&active_payment_intent)
     );
     assert!(matches!(
         compiled.replay_action(ActionId::new(2)).unwrap().kind(),
@@ -80,7 +134,7 @@ fn a_materialized_case_round_trips_and_revalidates_the_complete_artifact() {
         .expect("the materialized case revalidates");
 
     assert_eq!(decoded, compiled);
-    assert_eq!(encoded["schema_version"], serde_json::json!(2));
+    assert_eq!(encoded["schema_version"], serde_json::json!(3));
     assert_eq!(
         decoded.resolve(CaseOutputRef::new(
             ActionId::new(6),
@@ -132,17 +186,17 @@ fn deserialization_rejects_tampered_actions_and_invalid_gate_ids() {
     let compiled = CaseTraceMaterializer::materialize(&golden_case(), complete_captures())
         .expect("every reserved output was captured");
     let mut invalid_gate = serde_json::to_value(&compiled).unwrap();
-    invalid_gate["captured"][1]["value"]["ProviderGateId"] = serde_json::json!(0);
+    invalid_gate["captured"][2]["value"]["ProviderGateId"] = serde_json::json!(0);
     assert!(serde_json::from_value::<CompiledCaseTrace>(invalid_gate).is_err());
 
     let mut unsupported = serde_json::to_value(&compiled).unwrap();
-    unsupported["schema_version"] = serde_json::json!(1);
+    unsupported["schema_version"] = serde_json::json!(2);
     assert!(serde_json::from_value::<CompiledCaseTrace>(unsupported).is_err());
 
     let mut encoded = serde_json::to_value(compiled).unwrap();
     encoded["actions"][4]["kind"] = serde_json::json!({
         "kind": "confirm_payment_intent",
-        "outcome": "pre_execute_500"
+        "provider_script": { "first": "pre_execute_500" }
     });
 
     assert!(serde_json::from_value::<CompiledCaseTrace>(encoded).is_err());
@@ -154,8 +208,10 @@ fn capture_requirements_are_exact_and_every_seeded_plan_materializes() {
         CaseTraceMaterializer::required_outputs(&golden_case()).unwrap(),
         vec![
             CaseOutputRef::new(ActionId::new(1), CaseOutputSlot::PaymentIntentId),
+            CaseOutputRef::for_occurrence(ActionId::new(1), CaseOutputSlot::PaymentIntentId, 1),
             CaseOutputRef::new(ActionId::new(1), CaseOutputSlot::ProviderGateId),
             CaseOutputRef::new(ActionId::new(6), CaseOutputSlot::EventId),
+            CaseOutputRef::new(ActionId::new(7), CaseOutputSlot::EventId),
         ]
     );
 

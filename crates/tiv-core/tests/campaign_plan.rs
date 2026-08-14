@@ -22,6 +22,15 @@ fn a_campaign_compiles_distinct_self_validating_cases_in_serial_order() {
     assert_eq!(first, second);
     assert_eq!(first.cases().len(), 20);
     first.validate().expect("the campaign revalidates");
+    let encoded = serde_json::to_value(&first).unwrap();
+    assert_eq!(encoded["schema_version"], 3);
+    assert!(
+        encoded["cases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|case| case["plan"]["schema_version"] == 3)
+    );
 
     let seeds = first
         .cases()
@@ -110,6 +119,6 @@ fn campaign_limits_and_untrusted_artifacts_fail_closed() {
 
     let campaign = CampaignPlanner::compile(&spec).expect("the campaign is feasible");
     let mut obsolete = serde_json::to_value(campaign).unwrap();
-    obsolete["schema_version"] = serde_json::json!(1);
+    obsolete["schema_version"] = serde_json::json!(2);
     assert!(serde_json::from_value::<tiv_core::plan::CampaignPlan>(obsolete).is_err());
 }

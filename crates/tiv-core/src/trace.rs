@@ -9,7 +9,7 @@ use crate::{
 };
 
 pub const TRACE_SCHEMA_VERSION: u16 = 1;
-pub const CASE_TRACE_SCHEMA_VERSION: u16 = 2;
+pub const CASE_TRACE_SCHEMA_VERSION: u16 = 3;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(transparent)]
@@ -228,12 +228,26 @@ pub enum CaseInputSlot {
 pub struct CaseOutputRef {
     action_id: ActionId,
     slot: CaseOutputSlot,
+    occurrence: u8,
 }
 
 impl CaseOutputRef {
     #[must_use]
     pub const fn new(action_id: ActionId, slot: CaseOutputSlot) -> Self {
-        Self { action_id, slot }
+        Self {
+            action_id,
+            slot,
+            occurrence: 0,
+        }
+    }
+
+    #[must_use]
+    pub const fn for_occurrence(action_id: ActionId, slot: CaseOutputSlot, occurrence: u8) -> Self {
+        Self {
+            action_id,
+            slot,
+            occurrence,
+        }
     }
 
     #[must_use]
@@ -244,6 +258,11 @@ impl CaseOutputRef {
     #[must_use]
     pub const fn slot(self) -> CaseOutputSlot {
         self.slot
+    }
+
+    #[must_use]
+    pub const fn occurrence(self) -> u8 {
+        self.occurrence
     }
 }
 
@@ -617,7 +636,7 @@ struct CompiledCaseAction {
     eligible_count: usize,
     kind: PlanActionKind,
     inputs: Vec<CaseActionInput>,
-    declared_outputs: BTreeSet<CaseOutputSlot>,
+    declared_outputs: BTreeSet<CaseOutputRef>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -785,12 +804,7 @@ impl CaseTraceMaterializer {
             .map_err(|_| CaseTraceMaterializationError::InvalidPlannedCase)?;
         Ok(materialize_case_actions(planned_case)?
             .iter()
-            .flat_map(|action| {
-                action
-                    .declared_outputs
-                    .iter()
-                    .map(|&slot| CaseOutputRef::new(action.id, slot))
-            })
+            .flat_map(|action| action.declared_outputs.iter().copied())
             .collect())
     }
 
@@ -814,12 +828,7 @@ impl CaseTraceMaterializer {
         let actions = materialize_case_actions(planned_case)?;
         let declared_outputs = actions
             .iter()
-            .flat_map(|action| {
-                action
-                    .declared_outputs
-                    .iter()
-                    .map(|&slot| CaseOutputRef::new(action.id, slot))
-            })
+            .flat_map(|action| action.declared_outputs.iter().copied())
             .collect::<BTreeSet<_>>();
         let mut captured_outputs = BTreeMap::new();
         for (output_ref, value) in captured {
@@ -860,6 +869,8 @@ fn materialize_case_actions(
     planned_case: &PlannedCase,
 ) -> Result<Vec<CompiledCaseAction>, CaseTraceMaterializationError> {
     let mut active_payment_intent = None;
+    let mut provider_objects = Vec::new();
+    let mut generated_provider_events = 0_usize;
     let mut held_provider_gate = None;
     let mut actions = Vec::with_capacity(planned_case.actions().len());
 
@@ -867,23 +878,20 @@ fn materialize_case_actions(
         let mut inputs = Vec::new();
         let mut declared_outputs = BTreeSet::new();
         match *planned.kind() {
-            PlanActionKind::DriveCheckout { outcome }
-            | PlanActionKind::RetryBusinessRequest { outcome } => {
-                if provider_create_commits(outcome) {
-                    let output = CaseOutputRef::new(planned.id(), CaseOutputSlot::PaymentIntentId);
-                    declared_outputs.insert(CaseOutputSlot::PaymentIntentId);
-                    active_payment_intent = Some(output);
-                }
-                if outcome == ProviderOutcome::CommitThenDelay {
-                    let output = CaseOutputRef::new(planned.id(), CaseOutputSlot::ProviderGateId);
-                    declared_outputs.insert(CaseOutputSlot::ProviderGateId);
-                    held_provider_gate = Some(output);
-                }
+            PlanActionKind::DriveCheckout { provider_script }
+            | PlanActionKind::RetryBusinessRequest { provider_script } => {
+                reserve_business_provider_outputs(
+                    planned.id(),
+                    provider_script,
+                    &mut declared_outputs,
+                    &mut active_payment_intent,
+                    &mut provider_objects,
+                    &mut held_provider_gate,
+                );
             }
             PlanActionKind::RetrievePaymentIntent
             | PlanActionKind::ConfirmPaymentIntent { .. }
-            | PlanActionKind::RetryProviderRequest { .. }
-            | PlanActionKind::GenerateProviderEvent => {
+            | PlanActionKind::RetryProviderRequest { .. } => {
                 inputs.push(CaseActionInput {
                     slot: CaseInputSlot::PaymentIntentId,
                     source: active_payment_intent.ok_or(
@@ -893,21 +901,33 @@ fn materialize_case_actions(
                         },
                     )?,
                 });
-                if matches!(*planned.kind(), PlanActionKind::GenerateProviderEvent) {
-                    declared_outputs.insert(CaseOutputSlot::EventId);
-                }
-                if matches!(
-                    *planned.kind(),
-                    PlanActionKind::ConfirmPaymentIntent {
-                        outcome: ProviderOutcome::CommitThenDelay
-                    } | PlanActionKind::RetryProviderRequest {
-                        outcome: ProviderOutcome::CommitThenDelay
+                let held = match *planned.kind() {
+                    PlanActionKind::ConfirmPaymentIntent { provider_script }
+                    | PlanActionKind::RetryProviderRequest { provider_script } => {
+                        provider_script.terminal_outcome() == ProviderOutcome::CommitThenDelay
                     }
-                ) {
+                    _ => false,
+                };
+                if held {
                     let output = CaseOutputRef::new(planned.id(), CaseOutputSlot::ProviderGateId);
-                    declared_outputs.insert(CaseOutputSlot::ProviderGateId);
+                    declared_outputs.insert(output);
                     held_provider_gate = Some(output);
                 }
+            }
+            PlanActionKind::GenerateProviderEvent => {
+                let source = provider_objects
+                    .get(generated_provider_events)
+                    .copied()
+                    .ok_or(CaseTraceMaterializationError::MissingDynamicSource {
+                        action_id: planned.id(),
+                        input: CaseInputSlot::PaymentIntentId,
+                    })?;
+                generated_provider_events += 1;
+                inputs.push(CaseActionInput {
+                    slot: CaseInputSlot::PaymentIntentId,
+                    source,
+                });
+                declared_outputs.insert(CaseOutputRef::new(planned.id(), CaseOutputSlot::EventId));
             }
             PlanActionKind::ReleaseProviderGate => {
                 inputs.push(CaseActionInput {
@@ -942,6 +962,34 @@ fn materialize_case_actions(
         });
     }
     Ok(actions)
+}
+
+fn reserve_business_provider_outputs(
+    action_id: ActionId,
+    provider_script: crate::plan::ProviderOutcomeScript,
+    declared_outputs: &mut BTreeSet<CaseOutputRef>,
+    active_payment_intent: &mut Option<CaseOutputRef>,
+    provider_objects: &mut Vec<CaseOutputRef>,
+    held_provider_gate: &mut Option<CaseOutputRef>,
+) {
+    for (occurrence, outcome) in provider_script.outcomes().enumerate() {
+        if !provider_create_commits(outcome) {
+            continue;
+        }
+        let output = CaseOutputRef::for_occurrence(
+            action_id,
+            CaseOutputSlot::PaymentIntentId,
+            u8::try_from(occurrence).expect("v1 provider scripts have at most two calls"),
+        );
+        declared_outputs.insert(output);
+        *active_payment_intent = Some(output);
+        provider_objects.push(output);
+    }
+    if provider_script.terminal_outcome() == ProviderOutcome::CommitThenDelay {
+        let output = CaseOutputRef::new(action_id, CaseOutputSlot::ProviderGateId);
+        declared_outputs.insert(output);
+        *held_provider_gate = Some(output);
+    }
 }
 
 const fn provider_create_commits(outcome: ProviderOutcome) -> bool {
