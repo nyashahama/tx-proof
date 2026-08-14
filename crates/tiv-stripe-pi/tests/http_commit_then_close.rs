@@ -2,7 +2,10 @@ use std::{sync::Arc, time::Duration};
 
 use reqwest::StatusCode;
 use tiv_core::decision::Seed;
-use tiv_stripe_pi::{FaultOutcome, PaymentIntentFixture, http::serve_http1_connection};
+use tiv_stripe_pi::{
+    CreatePaymentIntent, FaultOutcome, IdempotencyKey, ManagedFixture, PaymentIntentFixture,
+    http::{serve_http1_connection, serve_managed_http1_connection},
+};
 use tokio::{net::TcpListener, sync::Mutex, time::timeout};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -122,6 +125,134 @@ async fn commit_then_close_is_a_real_transport_failure_with_a_cached_retry() {
         .expect("the two-connection server stops")
         .expect("the server task does not panic");
     assert_eq!(fixture.lock().await.payment_intent_count(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn committed_confirmation_close_is_a_real_transport_failure_with_one_event() {
+    let mut model = PaymentIntentFixture::new(Seed::new(42));
+    let created = model
+        .create(
+            IdempotencyKey::new("checkout-order-42").unwrap(),
+            CreatePaymentIntent::new(2_500, "usd").unwrap(),
+            FaultOutcome::Normal,
+        )
+        .expect("the provider object exists before confirmation");
+    let payment_intent_id = created.id().to_owned();
+    let fixture = Arc::new(Mutex::new(model));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server_fixture = Arc::clone(&fixture);
+    let server = tokio::spawn(async move {
+        for outcome in [FaultOutcome::CommitThenClose, FaultOutcome::Normal] {
+            let (stream, _) = listener.accept().await.unwrap();
+            let _result =
+                serve_http1_connection(stream, Arc::clone(&server_fixture), outcome).await;
+        }
+    });
+    let url = format!("http://{address}/v1/payment_intents/{payment_intent_id}/confirm");
+    let client = reqwest::Client::new();
+
+    let first = client
+        .post(&url)
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .body("")
+        .send()
+        .await;
+    assert!(
+        first.is_err(),
+        "the committed confirmation response is lost"
+    );
+    assert_eq!(fixture.lock().await.events().len(), 1);
+
+    let retry = client
+        .post(url)
+        .header("Connection", "close")
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .body("")
+        .send()
+        .await
+        .expect("the confirmation retry receives provider state");
+    assert_eq!(retry.status(), StatusCode::OK);
+    assert_eq!(
+        retry.json::<serde_json::Value>().await.unwrap()["status"],
+        "succeeded"
+    );
+
+    timeout(Duration::from_secs(2), server)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(fixture.lock().await.events().len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn committed_confirmation_delay_waits_for_the_exact_managed_gate() {
+    let mut model = ManagedFixture::new(Seed::new(42));
+    model
+        .reset(
+            1,
+            Seed::new(42),
+            vec![FaultOutcome::Normal, FaultOutcome::CommitThenDelay],
+        )
+        .unwrap();
+    model
+        .create_data_plane(
+            IdempotencyKey::new("checkout-order-42").unwrap(),
+            CreatePaymentIntent::new(2_500, "usd").unwrap(),
+        )
+        .unwrap();
+    let payment_intent_id = model.snapshot().payment_intents()[0].id().to_owned();
+    let fixture = Arc::new(Mutex::new(model));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server_fixture = Arc::clone(&fixture);
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        serve_managed_http1_connection(stream, server_fixture)
+            .await
+            .unwrap();
+    });
+    let request = tokio::spawn(async move {
+        reqwest::Client::new()
+            .post(format!(
+                "http://{address}/v1/payment_intents/{payment_intent_id}/confirm"
+            ))
+            .header("Connection", "close")
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body("")
+            .send()
+            .await
+    });
+
+    let gate_id = timeout(Duration::from_secs(2), async {
+        loop {
+            let snapshot = fixture.lock().await.snapshot();
+            if let Some(gate) = snapshot.held_gates().first() {
+                assert_eq!(snapshot.payment_intents()[0].status(), "succeeded");
+                break gate.gate_id();
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the committed confirmation reaches a held boundary");
+    assert!(!request.is_finished());
+    fixture
+        .lock()
+        .await
+        .release_gate(2, gate_id)
+        .expect("the exact next control command releases the response");
+
+    let response = timeout(Duration::from_secs(2), request)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    timeout(Duration::from_secs(2), server)
+        .await
+        .unwrap()
+        .unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

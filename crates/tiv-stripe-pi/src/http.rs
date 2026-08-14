@@ -46,8 +46,8 @@ pub async fn serve_http1_connection(
 /// Serves one HTTP/1 connection using the fault plan installed through the
 /// local control plane.
 ///
-/// Invalid requests do not consume an outcome. A valid create consumes exactly
-/// one planned outcome.
+/// Invalid requests do not consume an outcome. A valid create or confirm
+/// consumes exactly one planned outcome.
 ///
 /// # Errors
 ///
@@ -94,7 +94,7 @@ async fn handle_request(
         && let Some(payment_intent_id) = confirm_payment_intent_id(request.uri().path())
     {
         let payment_intent_id = payment_intent_id.to_owned();
-        return handle_confirm(request, &backend, &payment_intent_id).await;
+        return handle_confirm(request, &backend, &payment_intent_id, &close_connection).await;
     }
     if request.method() != Method::POST || request.uri().path() != "/v1/payment_intents" {
         return Ok(response(StatusCode::NOT_FOUND, b"not found".as_slice()));
@@ -106,6 +106,7 @@ async fn handle_confirm(
     request: Request<Incoming>,
     backend: &DataPlaneBackend,
     payment_intent_id: &str,
+    close_connection: &Notify,
 ) -> Result<Response<ResponseBody>, FixtureHttpError> {
     if request
         .headers()
@@ -131,7 +132,7 @@ async fn handle_confirm(
             "unsupported confirm parameters",
         ));
     }
-    immediate_provider_result(backend.confirm(payment_intent_id).await)
+    data_plane_result(backend.confirm(payment_intent_id).await, close_connection).await
 }
 
 async fn handle_create(
@@ -203,7 +204,17 @@ async fn handle_create(
         create = create.with_operation_id(operation_id);
     }
 
-    let result = backend.create_data_plane(key, create).await;
+    data_plane_result(
+        backend.create_data_plane(key, create).await,
+        close_connection,
+    )
+    .await
+}
+
+async fn data_plane_result(
+    result: Result<HttpDataPlaneDisposition, DataPlaneExecutionError>,
+    close_connection: &Notify,
+) -> Result<Response<ResponseBody>, FixtureHttpError> {
     match result {
         Ok(HttpDataPlaneDisposition::Response(provider_response)) => {
             data_plane_response(&provider_response)
@@ -252,37 +263,17 @@ impl DataPlaneBackend {
         request: CreatePaymentIntent,
     ) -> Result<HttpDataPlaneDisposition, DataPlaneExecutionError> {
         match self {
-            Self::Fixed { fixture, outcome } => {
-                let disposition = fixture
-                    .lock()
-                    .await
-                    .create_data_plane(key, request, *outcome)
-                    .map_err(DataPlaneExecutionError::Fixture)?;
-                Ok(match disposition {
-                    DataPlaneDisposition::Response(response) => {
-                        HttpDataPlaneDisposition::Response(response)
-                    }
-                    DataPlaneDisposition::CloseConnection => {
-                        HttpDataPlaneDisposition::CloseConnection
-                    }
-                    DataPlaneDisposition::DelayResponse(_) => {
-                        HttpDataPlaneDisposition::UnmanagedDelay
-                    }
-                })
-            }
+            Self::Fixed { fixture, outcome } => fixture
+                .lock()
+                .await
+                .create_data_plane(key, request, *outcome)
+                .map(fixed_disposition)
+                .map_err(DataPlaneExecutionError::Fixture),
             Self::Managed(fixture) => fixture
                 .lock()
                 .await
                 .create_data_plane(key, request)
-                .map(|disposition| match disposition {
-                    ManagedDataPlaneDisposition::Response(response) => {
-                        HttpDataPlaneDisposition::Response(response)
-                    }
-                    ManagedDataPlaneDisposition::CloseConnection => {
-                        HttpDataPlaneDisposition::CloseConnection
-                    }
-                    ManagedDataPlaneDisposition::Held(held) => HttpDataPlaneDisposition::Held(held),
-                })
+                .map(managed_disposition)
                 .map_err(|error| match error {
                     FixtureServiceError::Fixture(error) => DataPlaneExecutionError::Fixture(error),
                     error => DataPlaneExecutionError::Service(error),
@@ -293,18 +284,23 @@ impl DataPlaneBackend {
     async fn confirm(
         &self,
         payment_intent_id: &str,
-    ) -> Result<DataPlaneResponse, DataPlaneExecutionError> {
+    ) -> Result<HttpDataPlaneDisposition, DataPlaneExecutionError> {
         match self {
-            Self::Fixed { fixture, .. } => fixture
+            Self::Fixed { fixture, outcome } => fixture
                 .lock()
                 .await
-                .confirm_data_plane(payment_intent_id)
+                .confirm_data_plane(payment_intent_id, *outcome)
+                .map(fixed_disposition)
                 .map_err(DataPlaneExecutionError::Fixture),
             Self::Managed(fixture) => fixture
                 .lock()
                 .await
                 .confirm_data_plane(payment_intent_id)
-                .map_err(DataPlaneExecutionError::Fixture),
+                .map(managed_disposition)
+                .map_err(|error| match error {
+                    FixtureServiceError::Fixture(error) => DataPlaneExecutionError::Fixture(error),
+                    error => DataPlaneExecutionError::Service(error),
+                }),
         }
     }
 
@@ -324,6 +320,24 @@ impl DataPlaneBackend {
                 .retrieve_data_plane(payment_intent_id)
                 .map_err(DataPlaneExecutionError::Fixture),
         }
+    }
+}
+
+fn fixed_disposition(disposition: DataPlaneDisposition) -> HttpDataPlaneDisposition {
+    match disposition {
+        DataPlaneDisposition::Response(response) => HttpDataPlaneDisposition::Response(response),
+        DataPlaneDisposition::CloseConnection => HttpDataPlaneDisposition::CloseConnection,
+        DataPlaneDisposition::DelayResponse(_) => HttpDataPlaneDisposition::UnmanagedDelay,
+    }
+}
+
+fn managed_disposition(disposition: ManagedDataPlaneDisposition) -> HttpDataPlaneDisposition {
+    match disposition {
+        ManagedDataPlaneDisposition::Response(response) => {
+            HttpDataPlaneDisposition::Response(response)
+        }
+        ManagedDataPlaneDisposition::CloseConnection => HttpDataPlaneDisposition::CloseConnection,
+        ManagedDataPlaneDisposition::Held(held) => HttpDataPlaneDisposition::Held(held),
     }
 }
 

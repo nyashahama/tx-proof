@@ -537,6 +537,13 @@ impl ManagedFixture {
             .fixture
             .create_data_plane(key, request, outcome)
             .map_err(FixtureServiceError::Fixture)?;
+        self.manage_disposition(disposition)
+    }
+
+    fn manage_disposition(
+        &mut self,
+        disposition: DataPlaneDisposition,
+    ) -> Result<ManagedDataPlaneDisposition, FixtureServiceError> {
         match disposition {
             DataPlaneDisposition::Response(response) => {
                 Ok(ManagedDataPlaneDisposition::Response(response))
@@ -582,11 +589,25 @@ impl ManagedFixture {
         Ok(self.snapshot())
     }
 
-    pub(crate) fn confirm_data_plane(
+    /// Executes one confirmation against the next planned provider outcome.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FixtureServiceError::FaultPlanExhausted`] when no outcome is
+    /// left, or wraps a provider fixture error.
+    pub fn confirm_data_plane(
         &mut self,
         payment_intent_id: &str,
-    ) -> Result<DataPlaneResponse, FixtureError> {
-        self.fixture.confirm_data_plane(payment_intent_id)
+    ) -> Result<ManagedDataPlaneDisposition, FixtureServiceError> {
+        let outcome = self
+            .planned_outcomes
+            .pop_front()
+            .ok_or(FixtureServiceError::FaultPlanExhausted)?;
+        let disposition = self
+            .fixture
+            .confirm_data_plane(payment_intent_id, outcome)
+            .map_err(FixtureServiceError::Fixture)?;
+        self.manage_disposition(disposition)
     }
 
     pub(crate) fn retrieve_data_plane(
@@ -1041,12 +1062,43 @@ impl PaymentIntentFixture {
             .ok_or(FixtureError::NotFound)
     }
 
-    fn confirm_data_plane(&mut self, id: &str) -> Result<DataPlaneResponse, FixtureError> {
+    fn confirm_data_plane(
+        &mut self,
+        id: &str,
+        outcome: FaultOutcome,
+    ) -> Result<DataPlaneDisposition, FixtureError> {
+        let pre_execution_response = match outcome {
+            FaultOutcome::PreExecute429 => Some(DataPlaneResponse::json(
+                429,
+                br#"{"error":{"type":"rate_limit_error"}}"#.to_vec(),
+            )),
+            FaultOutcome::PreExecute500 => Some(DataPlaneResponse::json(
+                500,
+                br#"{"error":{"type":"api_error"}}"#.to_vec(),
+            )),
+            FaultOutcome::Normal
+            | FaultOutcome::PostExecute500
+            | FaultOutcome::CommitThenClose
+            | FaultOutcome::CommitThenDelay => None,
+        };
+        if let Some(response) = pre_execution_response {
+            return Ok(DataPlaneDisposition::Response(response));
+        }
+
         let payment_intent = self.confirm(id)?;
-        Ok(DataPlaneResponse::json(
-            200,
-            payment_intent_json(&payment_intent)?,
-        ))
+        let response = if outcome == FaultOutcome::PostExecute500 {
+            DataPlaneResponse::json(500, br#"{"error":{"type":"api_error"}}"#.to_vec())
+        } else {
+            DataPlaneResponse::json(200, payment_intent_json(&payment_intent)?)
+        };
+        Ok(match outcome {
+            FaultOutcome::CommitThenClose => DataPlaneDisposition::CloseConnection,
+            FaultOutcome::CommitThenDelay => DataPlaneDisposition::DelayResponse(response),
+            FaultOutcome::Normal
+            | FaultOutcome::PreExecute429
+            | FaultOutcome::PreExecute500
+            | FaultOutcome::PostExecute500 => DataPlaneDisposition::Response(response),
+        })
     }
 
     fn retrieve_data_plane(&self, id: &str) -> Result<DataPlaneResponse, FixtureError> {

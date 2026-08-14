@@ -165,6 +165,61 @@ fn the_fault_plan_is_consumed_only_by_valid_provider_creates() {
 }
 
 #[test]
+fn planned_confirm_outcomes_reach_the_same_observable_boundaries_as_create() {
+    for (outcome, expected_status, expected_disposition) in [
+        (FaultOutcome::Normal, "succeeded", "response_200"),
+        (
+            FaultOutcome::PreExecute429,
+            "requires_confirmation",
+            "response_429",
+        ),
+        (
+            FaultOutcome::PreExecute500,
+            "requires_confirmation",
+            "response_500",
+        ),
+        (FaultOutcome::PostExecute500, "succeeded", "response_500"),
+        (
+            FaultOutcome::CommitThenClose,
+            "succeeded",
+            "close_connection",
+        ),
+        (FaultOutcome::CommitThenDelay, "succeeded", "held_response"),
+    ] {
+        let mut fixture = ManagedFixture::new(Seed::new(42));
+        fixture
+            .reset(1, Seed::new(42), vec![FaultOutcome::Normal, outcome])
+            .expect("the create and confirm outcomes are installed");
+        fixture
+            .create_data_plane(
+                IdempotencyKey::new("op-1-attempt-1").expect("the key is valid"),
+                valid_create(),
+            )
+            .expect("the normal create returns a provider object");
+        let payment_intent_id = fixture.snapshot().payment_intents()[0].id().to_owned();
+
+        let disposition = fixture
+            .confirm_data_plane(&payment_intent_id)
+            .expect("the planned confirm outcome executes");
+        let actual_disposition = match disposition {
+            ManagedDataPlaneDisposition::Response(response) => {
+                format!("response_{}", response.status_code())
+            }
+            ManagedDataPlaneDisposition::CloseConnection => "close_connection".to_owned(),
+            ManagedDataPlaneDisposition::Held(_) => "held_response".to_owned(),
+        };
+
+        assert_eq!(actual_disposition, expected_disposition, "{outcome:?}");
+        assert_eq!(
+            fixture.snapshot().payment_intents()[0].status(),
+            expected_status,
+            "{outcome:?}"
+        );
+        assert_eq!(fixture.snapshot().remaining_outcomes(), 0, "{outcome:?}");
+    }
+}
+
+#[test]
 fn confirming_all_exports_lossless_signed_attempts() {
     let mut fixture = ManagedFixture::new(Seed::new(42));
     fixture
