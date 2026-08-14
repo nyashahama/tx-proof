@@ -1,11 +1,18 @@
 //! Stripe `PaymentIntent` fixture for `TxProof`.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::{
+    collections::{BTreeMap, VecDeque},
+    sync::{
+        Arc,
+        atomic::{AtomicU8, Ordering},
+    },
+};
 
 use hmac::{Hmac, KeyInit, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use tiv_core::decision::Seed;
+use tokio::sync::Notify;
 
 pub mod control;
 pub mod http;
@@ -114,6 +121,7 @@ pub enum FaultOutcome {
     PreExecute500,
     PostExecute500,
     CommitThenClose,
+    CommitThenDelay,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -196,6 +204,97 @@ impl DataPlaneResponse {
 pub enum DataPlaneDisposition {
     Response(DataPlaneResponse),
     CloseConnection,
+    DelayResponse(DataPlaneResponse),
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(transparent)]
+pub struct GateId(u64);
+
+#[derive(Debug)]
+pub enum ManagedDataPlaneDisposition {
+    Response(DataPlaneResponse),
+    CloseConnection,
+    Held(HeldDataPlaneResponse),
+}
+
+#[derive(Debug)]
+pub struct HeldDataPlaneResponse {
+    gate_id: GateId,
+    response: DataPlaneResponse,
+    signal: Arc<GateSignal>,
+}
+
+impl HeldDataPlaneResponse {
+    #[must_use]
+    pub const fn gate_id(&self) -> GateId {
+        self.gate_id
+    }
+
+    /// Waits for the control plane to release this exact response.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HeldResponseCancelled`] when a reset replaces the fixture
+    /// state that owned this gate.
+    pub async fn wait(self) -> Result<DataPlaneResponse, HeldResponseCancelled> {
+        self.signal.wait().await.map(|()| self.response)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HeldResponseCancelled;
+
+impl std::fmt::Display for HeldResponseCancelled {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("held response was cancelled")
+    }
+}
+
+impl std::error::Error for HeldResponseCancelled {}
+
+const GATE_PENDING: u8 = 0;
+const GATE_RELEASED: u8 = 1;
+const GATE_CANCELLED: u8 = 2;
+
+#[derive(Debug)]
+struct GateSignal {
+    state: AtomicU8,
+    notify: Notify,
+}
+
+impl Default for GateSignal {
+    fn default() -> Self {
+        Self {
+            state: AtomicU8::new(GATE_PENDING),
+            notify: Notify::new(),
+        }
+    }
+}
+
+impl GateSignal {
+    fn release(&self) {
+        self.state.store(GATE_RELEASED, Ordering::Release);
+        self.notify.notify_waiters();
+    }
+
+    fn cancel(&self) {
+        self.state.store(GATE_CANCELLED, Ordering::Release);
+        self.notify.notify_waiters();
+    }
+
+    async fn wait(&self) -> Result<(), HeldResponseCancelled> {
+        loop {
+            let notified = self.notify.notified();
+            match self.state.load(Ordering::Acquire) {
+                GATE_RELEASED => return Ok(()),
+                GATE_CANCELLED => return Err(HeldResponseCancelled),
+                GATE_PENDING => {}
+                _ => unreachable!("gate state is private and closed"),
+            }
+            notified.await;
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -375,6 +474,8 @@ pub struct PaymentIntentFixture {
 pub struct ManagedFixture {
     fixture: PaymentIntentFixture,
     planned_outcomes: VecDeque<FaultOutcome>,
+    held_gates: BTreeMap<GateId, Arc<GateSignal>>,
+    next_gate_sequence: u64,
     command_sequence: u64,
 }
 
@@ -384,6 +485,8 @@ impl ManagedFixture {
         Self {
             fixture: PaymentIntentFixture::new(seed),
             planned_outcomes: VecDeque::new(),
+            held_gates: BTreeMap::new(),
+            next_gate_sequence: 0,
             command_sequence: 0,
         }
     }
@@ -405,8 +508,12 @@ impl ManagedFixture {
         if outcomes.is_empty() {
             return Err(FixtureServiceError::EmptyFaultPlan);
         }
+        for signal in self.held_gates.values() {
+            signal.cancel();
+        }
         self.fixture = PaymentIntentFixture::new(seed);
         self.planned_outcomes = outcomes.into();
+        self.held_gates.clear();
         self.command_sequence = command_sequence;
         Ok(self.snapshot())
     }
@@ -421,14 +528,72 @@ impl ManagedFixture {
         &mut self,
         key: IdempotencyKey,
         request: CreatePaymentIntent,
-    ) -> Result<DataPlaneDisposition, FixtureServiceError> {
+    ) -> Result<ManagedDataPlaneDisposition, FixtureServiceError> {
         let outcome = self
             .planned_outcomes
             .pop_front()
             .ok_or(FixtureServiceError::FaultPlanExhausted)?;
-        self.fixture
+        let disposition = self
+            .fixture
             .create_data_plane(key, request, outcome)
-            .map_err(FixtureServiceError::Fixture)
+            .map_err(FixtureServiceError::Fixture)?;
+        match disposition {
+            DataPlaneDisposition::Response(response) => {
+                Ok(ManagedDataPlaneDisposition::Response(response))
+            }
+            DataPlaneDisposition::CloseConnection => {
+                Ok(ManagedDataPlaneDisposition::CloseConnection)
+            }
+            DataPlaneDisposition::DelayResponse(response) => {
+                self.next_gate_sequence = self
+                    .next_gate_sequence
+                    .checked_add(1)
+                    .ok_or(FixtureServiceError::GateSequenceExhausted)?;
+                let gate_id = GateId(self.next_gate_sequence);
+                let signal = Arc::new(GateSignal::default());
+                self.held_gates.insert(gate_id, Arc::clone(&signal));
+                Ok(ManagedDataPlaneDisposition::Held(HeldDataPlaneResponse {
+                    gate_id,
+                    response,
+                    signal,
+                }))
+            }
+        }
+    }
+
+    /// Releases one exact held provider response.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the command is out of sequence or the gate does
+    /// not exist in the current run-scoped fixture state.
+    pub fn release_gate(
+        &mut self,
+        command_sequence: u64,
+        gate_id: GateId,
+    ) -> Result<FixtureSnapshot, FixtureServiceError> {
+        self.require_next_sequence(command_sequence)?;
+        let signal = self
+            .held_gates
+            .remove(&gate_id)
+            .ok_or(FixtureServiceError::GateNotFound)?;
+        signal.release();
+        self.command_sequence = command_sequence;
+        Ok(self.snapshot())
+    }
+
+    pub(crate) fn confirm_data_plane(
+        &mut self,
+        payment_intent_id: &str,
+    ) -> Result<DataPlaneResponse, FixtureError> {
+        self.fixture.confirm_data_plane(payment_intent_id)
+    }
+
+    pub(crate) fn retrieve_data_plane(
+        &self,
+        payment_intent_id: &str,
+    ) -> Result<DataPlaneResponse, FixtureError> {
+        self.fixture.retrieve_data_plane(payment_intent_id)
     }
 
     /// Confirms every provider object and returns signed, losslessly encoded
@@ -479,6 +644,12 @@ impl ManagedFixture {
         FixtureSnapshot {
             command_sequence: self.command_sequence,
             remaining_outcomes: self.planned_outcomes.len(),
+            held_gates: self
+                .held_gates
+                .keys()
+                .copied()
+                .map(|gate_id| HeldGateSnapshot { gate_id })
+                .collect(),
             payment_intents: self
                 .fixture
                 .payment_intents()
@@ -504,6 +675,7 @@ impl ManagedFixture {
 pub struct FixtureSnapshot {
     command_sequence: u64,
     remaining_outcomes: usize,
+    held_gates: Vec<HeldGateSnapshot>,
     payment_intents: Vec<PaymentIntentSnapshot>,
 }
 
@@ -519,8 +691,25 @@ impl FixtureSnapshot {
     }
 
     #[must_use]
+    pub fn held_gates(&self) -> &[HeldGateSnapshot] {
+        &self.held_gates
+    }
+
+    #[must_use]
     pub fn payment_intents(&self) -> &[PaymentIntentSnapshot] {
         &self.payment_intents
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub struct HeldGateSnapshot {
+    gate_id: GateId,
+}
+
+impl HeldGateSnapshot {
+    #[must_use]
+    pub const fn gate_id(&self) -> GateId {
+        self.gate_id
     }
 }
 
@@ -640,6 +829,8 @@ pub enum FixtureServiceError {
     CommandSequenceExhausted,
     EmptyFaultPlan,
     FaultPlanExhausted,
+    GateNotFound,
+    GateSequenceExhausted,
     Fixture(FixtureError),
     UnexpectedCommandSequence { expected: u64, received: u64 },
     WebhookSignature(WebhookSignatureError),
@@ -675,6 +866,7 @@ impl PaymentIntentFixture {
         let execution = self.execute_create(key, request, outcome)?;
         match (execution.disposition, execution.payment_intent) {
             (DataPlaneDisposition::CloseConnection, _) => Err(FixtureError::ConnectionClosed),
+            (DataPlaneDisposition::DelayResponse(_), Some(payment_intent)) => Ok(payment_intent),
             (DataPlaneDisposition::Response(response), Some(payment_intent))
                 if response.status_code == 200 =>
             {
@@ -683,7 +875,8 @@ impl PaymentIntentFixture {
             (DataPlaneDisposition::Response(response), _) if response.status_code == 429 => {
                 Err(FixtureError::RateLimited)
             }
-            (DataPlaneDisposition::Response(_), _) => Err(FixtureError::ServerError),
+            (DataPlaneDisposition::DelayResponse(_), None)
+            | (DataPlaneDisposition::Response(_), _) => Err(FixtureError::ServerError),
         }
     }
 
@@ -733,9 +926,10 @@ impl PaymentIntentFixture {
                 500,
                 br#"{"error":{"type":"api_error"}}"#.to_vec(),
             )),
-            FaultOutcome::Normal | FaultOutcome::PostExecute500 | FaultOutcome::CommitThenClose => {
-                None
-            }
+            FaultOutcome::Normal
+            | FaultOutcome::PostExecute500
+            | FaultOutcome::CommitThenClose
+            | FaultOutcome::CommitThenDelay => None,
         };
         if let Some(response) = pre_execution_response {
             return Ok(CreateExecution {
@@ -766,10 +960,13 @@ impl PaymentIntentFixture {
                 response: response.clone(),
             },
         );
-        let disposition = if outcome == FaultOutcome::CommitThenClose {
-            DataPlaneDisposition::CloseConnection
-        } else {
-            DataPlaneDisposition::Response(response)
+        let disposition = match outcome {
+            FaultOutcome::CommitThenClose => DataPlaneDisposition::CloseConnection,
+            FaultOutcome::CommitThenDelay => DataPlaneDisposition::DelayResponse(response),
+            FaultOutcome::Normal
+            | FaultOutcome::PreExecute429
+            | FaultOutcome::PreExecute500
+            | FaultOutcome::PostExecute500 => DataPlaneDisposition::Response(response),
         };
         Ok(CreateExecution {
             disposition,
@@ -842,6 +1039,22 @@ impl PaymentIntentFixture {
             .find(|payment_intent| payment_intent.id == id)
             .cloned()
             .ok_or(FixtureError::NotFound)
+    }
+
+    fn confirm_data_plane(&mut self, id: &str) -> Result<DataPlaneResponse, FixtureError> {
+        let payment_intent = self.confirm(id)?;
+        Ok(DataPlaneResponse::json(
+            200,
+            payment_intent_json(&payment_intent)?,
+        ))
+    }
+
+    fn retrieve_data_plane(&self, id: &str) -> Result<DataPlaneResponse, FixtureError> {
+        let payment_intent = self.get(id)?;
+        Ok(DataPlaneResponse::json(
+            200,
+            payment_intent_json(&payment_intent)?,
+        ))
     }
 
     #[must_use]

@@ -4,12 +4,104 @@ use reqwest::StatusCode;
 use serde_json::json;
 use tiv_core::decision::Seed;
 use tiv_stripe_pi::{
-    CreatePaymentIntent, DataPlaneDisposition, FaultOutcome, FixtureServiceError, IdempotencyKey,
-    ManagedFixture, OperationId,
+    CreatePaymentIntent, FaultOutcome, FixtureServiceError, IdempotencyKey,
+    ManagedDataPlaneDisposition, ManagedFixture, OperationId,
     control::{ControlToken, WebhookSigningSecret, serve_http1_connection},
     http::serve_managed_http1_connection,
 };
 use tokio::{net::TcpListener, sync::Mutex, time::timeout};
+
+#[tokio::test]
+async fn commit_then_delay_is_observable_until_the_exact_gate_is_released() {
+    let mut fixture = ManagedFixture::new(Seed::new(42));
+    fixture
+        .reset(1, Seed::new(42), vec![FaultOutcome::CommitThenDelay])
+        .expect("the delay plan is installed");
+
+    let held = fixture
+        .create_data_plane(
+            IdempotencyKey::new("op-1-attempt-1").expect("the key is valid"),
+            valid_create(),
+        )
+        .expect("the create commits before it is held");
+    let ManagedDataPlaneDisposition::Held(held) = held else {
+        panic!("commit-then-delay must return an observable held response");
+    };
+    let gate_id = held.gate_id();
+
+    assert_eq!(fixture.snapshot().payment_intents().len(), 1);
+    assert_eq!(fixture.snapshot().held_gates()[0].gate_id(), gate_id);
+    assert_eq!(
+        fixture.release_gate(1, gate_id),
+        Err(FixtureServiceError::UnexpectedCommandSequence {
+            expected: 2,
+            received: 1,
+        })
+    );
+
+    let released = fixture
+        .release_gate(2, gate_id)
+        .expect("the exact next command releases the gate");
+    let response = held
+        .wait()
+        .await
+        .expect("the exact release wakes the held response");
+
+    assert_eq!(released.command_sequence(), 2);
+    assert!(released.held_gates().is_empty());
+    assert_eq!(response.status_code(), 200);
+    assert!(fixture.snapshot().held_gates().is_empty());
+}
+
+#[tokio::test]
+async fn reset_cancels_every_response_held_by_the_previous_fixture_state() {
+    let mut fixture = ManagedFixture::new(Seed::new(42));
+    fixture
+        .reset(1, Seed::new(42), vec![FaultOutcome::CommitThenDelay])
+        .expect("the delay plan is installed");
+    let held = fixture
+        .create_data_plane(
+            IdempotencyKey::new("op-1-attempt-1").expect("the key is valid"),
+            valid_create(),
+        )
+        .expect("the create commits before it is held");
+    let ManagedDataPlaneDisposition::Held(held) = held else {
+        panic!("commit-then-delay must return an observable held response");
+    };
+
+    fixture
+        .reset(2, Seed::new(43), vec![FaultOutcome::Normal])
+        .expect("the next reset replaces fixture state");
+    let cancellation = timeout(Duration::from_millis(100), held.wait())
+        .await
+        .expect("reset must wake the held data task")
+        .expect_err("reset must not release an obsolete response");
+
+    assert_eq!(cancellation.to_string(), "held response was cancelled");
+    assert!(fixture.snapshot().held_gates().is_empty());
+}
+
+#[test]
+fn held_control_state_matches_the_v1_golden_protocol() {
+    let mut fixture = ManagedFixture::new(Seed::new(42));
+    fixture
+        .reset(1, Seed::new(42), vec![FaultOutcome::CommitThenDelay])
+        .expect("the delay plan is installed");
+    let disposition = fixture
+        .create_data_plane(
+            IdempotencyKey::new("op-1-attempt-1").expect("the key is valid"),
+            valid_create(),
+        )
+        .expect("the create commits before it is held");
+    assert!(matches!(disposition, ManagedDataPlaneDisposition::Held(_)));
+
+    let encoded =
+        serde_json::to_string(&fixture.snapshot()).expect("the closed control DTO is serializable");
+    assert_eq!(
+        encoded,
+        include_str!("../../../tests/golden/stripe-fixture-state-v1.json").trim_end()
+    );
+}
 
 #[test]
 fn mutating_control_commands_are_strictly_sequenced() {
@@ -63,8 +155,11 @@ fn the_fault_plan_is_consumed_only_by_valid_provider_creates() {
         )
         .expect("the second planned action executes");
 
-    assert_eq!(first, DataPlaneDisposition::CloseConnection);
-    assert!(matches!(second, DataPlaneDisposition::Response(_)));
+    assert!(matches!(
+        first,
+        ManagedDataPlaneDisposition::CloseConnection
+    ));
+    assert!(matches!(second, ManagedDataPlaneDisposition::Response(_)));
     assert_eq!(fixture.snapshot().payment_intents().len(), 2);
     assert_eq!(fixture.snapshot().remaining_outcomes(), 0);
 }
@@ -165,6 +260,114 @@ async fn the_control_listener_requires_its_run_scoped_token() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_real_data_response_waits_for_its_observed_control_gate() {
+    let fixture = Arc::new(Mutex::new(ManagedFixture::new(Seed::new(42))));
+    fixture
+        .lock()
+        .await
+        .reset(1, Seed::new(42), vec![FaultOutcome::CommitThenDelay])
+        .expect("the delay plan is installed");
+    let token = ControlToken::new("run-scoped-control-token")
+        .expect("the synthetic control token is valid");
+    let secret = WebhookSigningSecret::new("whsec_test_secret")
+        .expect("the synthetic webhook secret is valid");
+    let data_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("a data port is available");
+    let data_address = data_listener
+        .local_addr()
+        .expect("the data listener has an address");
+    let control_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("a control port is available");
+    let control_address = control_listener
+        .local_addr()
+        .expect("the control listener has an address");
+
+    let data_fixture = Arc::clone(&fixture);
+    let data_server = tokio::spawn(async move {
+        let (stream, _) = data_listener.accept().await.expect("a client connects");
+        serve_managed_http1_connection(stream, data_fixture)
+            .await
+            .expect("the held data connection is served");
+    });
+    let control_fixture = Arc::clone(&fixture);
+    let control_server = tokio::spawn(async move {
+        let (stream, _) = control_listener
+            .accept()
+            .await
+            .expect("a control client connects");
+        serve_http1_connection(stream, control_fixture, token, secret)
+            .await
+            .expect("the control connection is served");
+    });
+
+    let data_request = tokio::spawn(async move {
+        reqwest::Client::new()
+            .post(format!("http://{data_address}/v1/payment_intents"))
+            .header("Idempotency-Key", "op-1-attempt-1")
+            .form(&[
+                ("amount", "2500"),
+                ("currency", "usd"),
+                ("metadata[operation_id]", "op_1"),
+            ])
+            .send()
+            .await
+    });
+    let control_client = reqwest::Client::new();
+    let control_base = format!("http://{control_address}/v1/control");
+    let gate_id = timeout(Duration::from_secs(2), async {
+        loop {
+            let state: serde_json::Value = control_client
+                .get(format!("{control_base}/state"))
+                .header("X-Tiv-Control-Token", "run-scoped-control-token")
+                .send()
+                .await
+                .expect("control state is available")
+                .json()
+                .await
+                .expect("control state is JSON");
+            if let Some(gate_id) = state["held_gates"][0]["gate_id"].as_u64() {
+                break gate_id;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the committed response reaches an observable gate");
+    assert!(
+        !data_request.is_finished(),
+        "the response cannot escape before the gate is released"
+    );
+
+    let released: serde_json::Value = control_client
+        .post(format!("{control_base}/release-gate"))
+        .header("X-Tiv-Control-Token", "run-scoped-control-token")
+        .json(&json!({"command_sequence": 2, "gate_id": gate_id}))
+        .send()
+        .await
+        .expect("the release command returns an HTTP response")
+        .error_for_status()
+        .expect("the release command succeeds")
+        .json()
+        .await
+        .expect("the released state is JSON");
+    let response = timeout(Duration::from_secs(2), data_request)
+        .await
+        .expect("the released response arrives")
+        .expect("the data task does not panic")
+        .expect("the response has valid HTTP framing");
+
+    assert_eq!(released["command_sequence"], 2);
+    assert_eq!(released["held_gates"], json!([]));
+    assert_eq!(response.status(), StatusCode::OK);
+    drop(response);
+    drop(control_client);
+    join_server(data_server).await;
+    join_server(control_server).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn invalid_data_plane_requests_do_not_consume_the_fault_plan() {
     let fixture = Arc::new(Mutex::new(ManagedFixture::new(Seed::new(42))));
     fixture
@@ -235,4 +438,11 @@ fn valid_create() -> CreatePaymentIntent {
     CreatePaymentIntent::new(2_500, "usd")
         .expect("the create is valid")
         .with_operation_id(OperationId::new("op_1").expect("the operation ID is valid"))
+}
+
+async fn join_server(server: tokio::task::JoinHandle<()>) {
+    timeout(Duration::from_secs(2), server)
+        .await
+        .expect("the fixture connection stops")
+        .expect("the fixture server does not panic");
 }

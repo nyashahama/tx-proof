@@ -6,6 +6,73 @@ use tiv_stripe_pi::{FaultOutcome, PaymentIntentFixture, http::serve_http1_connec
 use tokio::{net::TcpListener, sync::Mutex, time::timeout};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stripe_shaped_client_can_create_confirm_and_retrieve() {
+    let fixture = Arc::new(Mutex::new(PaymentIntentFixture::new(Seed::new(42))));
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("a loopback port is available");
+    let address = listener.local_addr().expect("the listener has an address");
+    let server_fixture = Arc::clone(&fixture);
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("a client connects");
+        serve_http1_connection(stream, server_fixture, FaultOutcome::Normal)
+            .await
+            .expect("the Stripe-shaped connection is served");
+    });
+    let client = reqwest::Client::new();
+    let collection_url = format!("http://{address}/v1/payment_intents");
+
+    let created: serde_json::Value = client
+        .post(&collection_url)
+        .header("Idempotency-Key", "checkout-order-42")
+        .form(&[("amount", "2500"), ("currency", "usd")])
+        .send()
+        .await
+        .expect("the create receives a response")
+        .error_for_status()
+        .expect("the create succeeds")
+        .json()
+        .await
+        .expect("the create response is JSON");
+    let payment_intent_id = created["id"]
+        .as_str()
+        .expect("the response contains a provider ID");
+    let instance_url = format!("{collection_url}/{payment_intent_id}");
+    let confirmed: serde_json::Value = client
+        .post(format!("{instance_url}/confirm"))
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .body("")
+        .send()
+        .await
+        .expect("the confirm receives a response")
+        .error_for_status()
+        .expect("the confirm succeeds")
+        .json()
+        .await
+        .expect("the confirm response is JSON");
+    let retrieved: serde_json::Value = client
+        .get(instance_url)
+        .send()
+        .await
+        .expect("the retrieve receives a response")
+        .error_for_status()
+        .expect("the retrieve succeeds")
+        .json()
+        .await
+        .expect("the retrieve response is JSON");
+
+    assert_eq!(confirmed["id"], payment_intent_id);
+    assert_eq!(confirmed["status"], "succeeded");
+    assert_eq!(retrieved, confirmed);
+    assert_eq!(fixture.lock().await.events().len(), 1);
+    drop(client);
+    timeout(Duration::from_secs(2), server)
+        .await
+        .expect("the connection stops")
+        .expect("the server does not panic");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn commit_then_close_is_a_real_transport_failure_with_a_cached_retry() {
     let fixture = Arc::new(Mutex::new(PaymentIntentFixture::new(Seed::new(42))));
     let listener = TcpListener::bind("127.0.0.1:0")

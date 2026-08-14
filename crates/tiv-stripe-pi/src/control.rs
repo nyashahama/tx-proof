@@ -14,7 +14,7 @@ use serde::Deserialize;
 use tiv_core::decision::Seed;
 use tokio::{net::TcpStream, sync::Mutex};
 
-use crate::{FaultOutcome, FixtureServiceError, ManagedFixture};
+use crate::{FaultOutcome, FixtureServiceError, GateId, ManagedFixture};
 
 const MAX_CONTROL_BODY_BYTES: usize = 16 * 1024;
 const CONTROL_TOKEN_HEADER: &str = "x-tiv-control-token";
@@ -141,6 +141,16 @@ async fn handle_request(
             );
             service_result(result)
         }
+        (&Method::POST, "/v1/control/release-gate") => {
+            let Some(command) = decode_json::<ReleaseGateCommand>(request).await else {
+                return Ok(text_response(StatusCode::BAD_REQUEST, "invalid command"));
+            };
+            let result = fixture
+                .lock()
+                .await
+                .release_gate(command.command_sequence, command.gate_id);
+            service_result(result)
+        }
         _ => Ok(text_response(StatusCode::NOT_FOUND, "not found")),
     }
 }
@@ -179,9 +189,13 @@ where
         Err(FixtureServiceError::EmptyFaultPlan) => {
             Ok(text_response(StatusCode::BAD_REQUEST, "empty fault plan"))
         }
+        Err(FixtureServiceError::GateNotFound) => {
+            Ok(text_response(StatusCode::NOT_FOUND, "gate not found"))
+        }
         Err(
             FixtureServiceError::CommandSequenceExhausted
             | FixtureServiceError::FaultPlanExhausted
+            | FixtureServiceError::GateSequenceExhausted
             | FixtureServiceError::Fixture(_)
             | FixtureServiceError::WebhookSignature(_),
         ) => Ok(text_response(
@@ -225,6 +239,13 @@ struct ResetCommand {
 struct ConfirmAllCommand {
     command_sequence: u64,
     timestamp: i64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReleaseGateCommand {
+    command_sequence: u64,
+    gate_id: GateId,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
