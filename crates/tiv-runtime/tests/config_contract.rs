@@ -1,5 +1,6 @@
 use std::{collections::BTreeMap, fs, path::PathBuf};
 
+use tiv_core::plan::CampaignPlanner;
 use tiv_runtime::config::{
     ConfigError, EnvironmentLookup, config_schema_json, load_resolved_config,
 };
@@ -110,6 +111,31 @@ fn generated_schema_matches_the_checked_in_v1_contract() {
     .expect("the checked-in schema exists");
 
     assert_eq!(generated, checked_in);
+}
+
+#[test]
+fn resolved_config_preserves_the_exact_serial_campaign_contract() {
+    let document = blueprint_document()
+        .replace("cases = 20", "cases = 2")
+        .replace("seed = 424242", "seed = 99")
+        .replace("duplicate_max = 3", "duplicate_max = 0")
+        .replace("delay_ms = [0, 10, 100, 1000, 5000]", "delay_ms = [17]");
+    let config = resolve_document(&document).expect("the narrowed campaign config resolves");
+
+    let campaign = CampaignPlanner::compile(config.campaign_spec())
+        .expect("the resolved campaign is feasible");
+    let encoded = serde_json::to_value(campaign).unwrap();
+
+    assert_eq!(encoded["spec"]["campaign_seed"], serde_json::json!(99));
+    assert_eq!(encoded["spec"]["case_count"], serde_json::json!(2));
+    assert_eq!(
+        encoded["spec"]["webhook_faults"]["duplicate_max"],
+        serde_json::json!(0)
+    );
+    assert_eq!(
+        encoded["spec"]["webhook_faults"]["delays_millis"],
+        serde_json::json!([17])
+    );
 }
 
 fn resolve_document(document: &str) -> Result<tiv_runtime::config::ResolvedConfig, ConfigError> {

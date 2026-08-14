@@ -12,7 +12,14 @@ use std::{
 use schemars::{JsonSchema, schema_for};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tiv_core::result::InvariantId;
+use tiv_core::{
+    decision::Seed,
+    plan::{
+        ActionBudget, CampaignSpec, CaseCount, ProcessCutPoint as CoreProcessCutPoint,
+        ProcessFaultSpec, ProviderOutcome, WebhookFaultSpec,
+    },
+    result::InvariantId,
+};
 use url::Url;
 
 const CONFIG_SCHEMA_VERSION: u16 = 1;
@@ -237,6 +244,7 @@ pub struct ResolvedConfig {
     postgres_service: String,
     stripe_service: String,
     worker_services: Vec<String>,
+    campaign_spec: CampaignSpec,
     private: ResolvedPrivate,
     redacted: RedactedConfig,
 }
@@ -245,6 +253,11 @@ impl ResolvedConfig {
     #[must_use]
     pub const fn redacted(&self) -> &RedactedConfig {
         &self.redacted
+    }
+
+    #[must_use]
+    pub const fn campaign_spec(&self) -> &CampaignSpec {
+        &self.campaign_spec
     }
 
     pub(crate) fn root(&self) -> &Path {
@@ -650,6 +663,7 @@ fn resolve_raw_config(
         bounded_duration(&raw.driver.timeout, MAX_DRIVER_TIMEOUT, "driver.timeout")?;
 
     validate_faults(&raw.faults, &raw.compose.application_service)?;
+    let campaign_spec = campaign_spec(&raw)?;
     let sql_probe = existing_repository_file(
         &canonical_root,
         &repository_root,
@@ -750,6 +764,7 @@ fn resolve_raw_config(
         postgres_service: raw.compose.postgres_service,
         stripe_service,
         worker_services: raw.compose.worker_services,
+        campaign_spec,
         private: ResolvedPrivate {
             _artifact_dir: artifact_dir,
             _case_timeout: case_timeout,
@@ -978,6 +993,71 @@ fn validate_faults(faults: &RawFaultConfig, application_service: &str) -> Result
         return Err(ConfigError::UnsupportedFaultModel);
     }
     Ok(())
+}
+
+fn campaign_spec(raw: &RawConfig) -> Result<CampaignSpec, ConfigError> {
+    let case_count = CaseCount::new(raw.run.cases).map_err(|_| ConfigError::UnsafeRunBudget)?;
+    let action_budget = ActionBudget::new(raw.run.max_actions_per_case)
+        .map_err(|_| ConfigError::UnsafeRunBudget)?;
+    let duplicate_max = u8::try_from(raw.faults.webhooks.duplicate_max)
+        .map_err(|_| ConfigError::UnsafeFaultBudget)?;
+    let webhook_faults = WebhookFaultSpec::new(
+        duplicate_max,
+        raw.faults.webhooks.delay_ms.iter().copied(),
+        raw.faults.webhooks.allow_reorder,
+        raw.faults.webhooks.allow_drop,
+    )
+    .map_err(|_| ConfigError::UnsafeFaultBudget)?;
+    let max_kills = u8::try_from(raw.faults.process.max_kills_per_case)
+        .map_err(|_| ConfigError::UnsafeFaultBudget)?;
+    let process_faults = ProcessFaultSpec::new(
+        raw.faults
+            .process
+            .cut_points
+            .iter()
+            .copied()
+            .map(|cut_point| match cut_point {
+                ProcessCutPoint::ClientRequestForwarded => {
+                    CoreProcessCutPoint::ClientRequestForwarded
+                }
+                ProcessCutPoint::ClientResponseObserved => {
+                    CoreProcessCutPoint::ClientResponseObserved
+                }
+                ProcessCutPoint::WebhookRequestForwarded => {
+                    CoreProcessCutPoint::WebhookRequestForwarded
+                }
+                ProcessCutPoint::WebhookResponseObserved => {
+                    CoreProcessCutPoint::WebhookResponseObserved
+                }
+                ProcessCutPoint::SqlProbe => CoreProcessCutPoint::SqlProbe,
+            }),
+        max_kills,
+    )
+    .map_err(|_| ConfigError::UnsafeFaultBudget)?;
+    let provider_outcomes = raw
+        .faults
+        .stripe_api
+        .outcomes
+        .iter()
+        .copied()
+        .map(|outcome| match outcome {
+            StripeApiOutcome::Normal => ProviderOutcome::Normal,
+            StripeApiOutcome::PreExecute429 => ProviderOutcome::PreExecute429,
+            StripeApiOutcome::PreExecute500 => ProviderOutcome::PreExecute500,
+            StripeApiOutcome::PostExecute500 => ProviderOutcome::PostExecute500,
+            StripeApiOutcome::CommitThenClose => ProviderOutcome::CommitThenClose,
+            StripeApiOutcome::CommitThenDelay => ProviderOutcome::CommitThenDelay,
+        });
+
+    CampaignSpec::new_payment_intent_v1(
+        Seed::new(raw.run.seed),
+        case_count,
+        action_budget,
+        provider_outcomes,
+        webhook_faults,
+        process_faults,
+    )
+    .map_err(|_| ConfigError::UnsupportedFaultModel)
 }
 
 fn bounded_duration(

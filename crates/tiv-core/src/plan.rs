@@ -10,8 +10,11 @@ use crate::{
 };
 
 pub const PLAN_SCHEMA_VERSION: u16 = 1;
+pub const CAMPAIGN_SCHEMA_VERSION: u16 = 1;
 pub const MAX_ACTIONS_PER_CASE: u32 = 40;
+pub const MAX_CASES: u32 = 500;
 pub const PAYMENT_INTENT_V1_API_VERSION: &str = "2026-02-25.clover";
+pub const CASE_SEED_DERIVATION: &str = "blake3/1.8.6/derive_key:dev.txproof.case-seed.v1/le-u64";
 pub const SCHEDULER_ALGORITHM: &str =
     "rand/0.10.2/random_range+rand_chacha/0.10.0/ChaCha20Rng-seed_from_u64";
 
@@ -871,4 +874,344 @@ fn minimum_actions_to_complete(
         .map(|distance| distance + 1);
     cache.insert(state, minimum);
     minimum
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InvalidCaseCount {
+    Zero,
+    AboveV1Maximum,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(transparent)]
+pub struct CaseCount(u32);
+
+impl CaseCount {
+    /// Creates a v1 campaign case count.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidCaseCount`] when the value is zero or exceeds the v1
+    /// maximum.
+    pub const fn new(value: u32) -> Result<Self, InvalidCaseCount> {
+        if value == 0 {
+            return Err(InvalidCaseCount::Zero);
+        }
+        if value > MAX_CASES {
+            return Err(InvalidCaseCount::AboveV1Maximum);
+        }
+        Ok(Self(value))
+    }
+
+    #[must_use]
+    pub const fn value(self) -> u32 {
+        self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for CaseCount {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Self::new(u32::deserialize(deserializer)?)
+            .map_err(|error| D::Error::custom(format_args!("invalid case count: {error:?}")))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(transparent)]
+pub struct CaseId(u32);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InvalidCaseId {
+    Zero,
+    AboveV1Maximum,
+}
+
+impl CaseId {
+    /// Creates a one-based v1 campaign case identifier.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidCaseId`] when the identifier is zero or exceeds the
+    /// maximum v1 case count.
+    pub const fn new(value: u32) -> Result<Self, InvalidCaseId> {
+        if value == 0 {
+            return Err(InvalidCaseId::Zero);
+        }
+        if value > MAX_CASES {
+            return Err(InvalidCaseId::AboveV1Maximum);
+        }
+        Ok(Self(value))
+    }
+
+    #[must_use]
+    pub const fn value(self) -> u32 {
+        self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for CaseId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Self::new(u32::deserialize(deserializer)?)
+            .map_err(|error| D::Error::custom(format_args!("invalid case ID: {error:?}")))
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CampaignSpec {
+    campaign_seed: Seed,
+    case_count: CaseCount,
+    max_actions: ActionBudget,
+    provider_adapter: ProviderAdapter,
+    provider_api_version: String,
+    provider_outcomes: BTreeSet<ProviderOutcome>,
+    webhook_faults: WebhookFaultSpec,
+    process_faults: ProcessFaultSpec,
+}
+
+impl CampaignSpec {
+    #[must_use]
+    pub fn payment_intent_v1(
+        campaign_seed: Seed,
+        case_count: CaseCount,
+        max_actions: ActionBudget,
+    ) -> Self {
+        let case = PlanSpec::payment_intent_v1(campaign_seed, max_actions);
+        Self::from_case_spec(campaign_seed, case_count, case)
+    }
+
+    #[must_use]
+    pub const fn campaign_seed(&self) -> Seed {
+        self.campaign_seed
+    }
+
+    #[must_use]
+    pub const fn case_count(&self) -> CaseCount {
+        self.case_count
+    }
+
+    #[must_use]
+    pub const fn max_actions(&self) -> ActionBudget {
+        self.max_actions
+    }
+
+    /// Creates a campaign from validated v1 fault capabilities.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PlanValidationError`] when the provider or fault contract is
+    /// outside v1.
+    pub fn new_payment_intent_v1<P>(
+        campaign_seed: Seed,
+        case_count: CaseCount,
+        max_actions: ActionBudget,
+        provider_outcomes: P,
+        webhook_faults: WebhookFaultSpec,
+        process_faults: ProcessFaultSpec,
+    ) -> Result<Self, PlanValidationError>
+    where
+        P: IntoIterator<Item = ProviderOutcome>,
+    {
+        let case = PlanSpec::new_payment_intent_v1(
+            campaign_seed,
+            max_actions,
+            provider_outcomes,
+            webhook_faults,
+            process_faults,
+        )?;
+        Ok(Self::from_case_spec(campaign_seed, case_count, case))
+    }
+
+    fn from_case_spec(campaign_seed: Seed, case_count: CaseCount, case: PlanSpec) -> Self {
+        Self {
+            campaign_seed,
+            case_count,
+            max_actions: case.max_actions,
+            provider_adapter: case.provider_adapter,
+            provider_api_version: case.provider_api_version,
+            provider_outcomes: case.provider_outcomes,
+            webhook_faults: case.webhook_faults,
+            process_faults: case.process_faults,
+        }
+    }
+
+    fn validate(&self) -> Result<(), PlanValidationError> {
+        self.case_spec(self.campaign_seed).validate()
+    }
+
+    fn case_spec(&self, seed: Seed) -> PlanSpec {
+        PlanSpec {
+            seed,
+            max_actions: self.max_actions,
+            provider_adapter: self.provider_adapter,
+            provider_api_version: self.provider_api_version.clone(),
+            provider_outcomes: self.provider_outcomes.clone(),
+            webhook_faults: self.webhook_faults.clone(),
+            process_faults: self.process_faults.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CampaignCase {
+    case_id: CaseId,
+    plan: PlannedCase,
+}
+
+impl CampaignCase {
+    #[must_use]
+    pub const fn id(&self) -> CaseId {
+        self.case_id
+    }
+
+    #[must_use]
+    pub const fn plan(&self) -> &PlannedCase {
+        &self.plan
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct CampaignPlan {
+    schema_version: u16,
+    case_seed_derivation: String,
+    spec: CampaignSpec,
+    cases: Vec<CampaignCase>,
+}
+
+impl CampaignPlan {
+    #[must_use]
+    pub const fn schema_version(&self) -> u16 {
+        self.schema_version
+    }
+
+    #[must_use]
+    pub fn case_seed_derivation(&self) -> &str {
+        &self.case_seed_derivation
+    }
+
+    #[must_use]
+    pub const fn spec(&self) -> &CampaignSpec {
+        &self.spec
+    }
+
+    #[must_use]
+    pub fn cases(&self) -> &[CampaignCase] {
+        &self.cases
+    }
+
+    /// Recompiles and compares the complete serial campaign artifact.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CampaignValidationError`] when compatibility metadata, case
+    /// identities, derived seeds, or any planned action differs.
+    pub fn validate(&self) -> Result<(), CampaignValidationError> {
+        if self.schema_version != CAMPAIGN_SCHEMA_VERSION {
+            return Err(CampaignValidationError::UnsupportedSchemaVersion);
+        }
+        if self.case_seed_derivation != CASE_SEED_DERIVATION {
+            return Err(CampaignValidationError::UnsupportedCaseSeedDerivation);
+        }
+        self.spec
+            .validate()
+            .map_err(|_| CampaignValidationError::InvalidSpec)?;
+        let expected = CampaignPlanner::compile(&self.spec)
+            .map_err(|_| CampaignValidationError::CampaignIsNotFeasible)?;
+        if self != &expected {
+            return Err(CampaignValidationError::CampaignDoesNotMatchSpec);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CampaignPlanWire {
+    schema_version: u16,
+    case_seed_derivation: String,
+    spec: CampaignSpec,
+    cases: Vec<CampaignCase>,
+}
+
+impl<'de> Deserialize<'de> for CampaignPlan {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = CampaignPlanWire::deserialize(deserializer)?;
+        let campaign = Self {
+            schema_version: wire.schema_version,
+            case_seed_derivation: wire.case_seed_derivation,
+            spec: wire.spec,
+            cases: wire.cases,
+        };
+        campaign
+            .validate()
+            .map_err(|error| D::Error::custom(format_args!("invalid campaign plan: {error:?}")))?;
+        Ok(campaign)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CampaignCompileError {
+    InvalidSpec(PlanValidationError),
+    InvalidCase {
+        case_id: CaseId,
+        source: PlanCompileError,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CampaignValidationError {
+    UnsupportedSchemaVersion,
+    UnsupportedCaseSeedDerivation,
+    InvalidSpec,
+    CampaignIsNotFeasible,
+    CampaignDoesNotMatchSpec,
+}
+
+pub struct CampaignPlanner;
+
+impl CampaignPlanner {
+    /// Compiles every case in one deterministic serial order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CampaignCompileError`] when the campaign specification or any
+    /// derived case cannot reach its final checkpoint within budget.
+    pub fn compile(spec: &CampaignSpec) -> Result<CampaignPlan, CampaignCompileError> {
+        spec.validate().map_err(CampaignCompileError::InvalidSpec)?;
+        let mut cases = Vec::with_capacity(spec.case_count.value() as usize);
+        for value in 1..=spec.case_count.value() {
+            let case_id = CaseId(value);
+            let seed = derive_case_seed(spec.campaign_seed, case_id);
+            let plan = CasePlanCompiler::compile(&spec.case_spec(seed))
+                .map_err(|source| CampaignCompileError::InvalidCase { case_id, source })?;
+            cases.push(CampaignCase { case_id, plan });
+        }
+        Ok(CampaignPlan {
+            schema_version: CAMPAIGN_SCHEMA_VERSION,
+            case_seed_derivation: CASE_SEED_DERIVATION.to_owned(),
+            spec: spec.clone(),
+            cases,
+        })
+    }
+}
+
+fn derive_case_seed(campaign_seed: Seed, case_id: CaseId) -> Seed {
+    const CONTEXT: &str = "dev.txproof.case-seed.v1";
+    let mut material = [0_u8; 12];
+    material[..8].copy_from_slice(&campaign_seed.value().to_le_bytes());
+    material[8..].copy_from_slice(&case_id.value().to_le_bytes());
+    let digest = blake3::derive_key(CONTEXT, &material);
+    let mut seed = [0_u8; 8];
+    seed.copy_from_slice(&digest[..8]);
+    Seed::new(u64::from_le_bytes(seed))
 }

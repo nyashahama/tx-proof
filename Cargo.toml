@@ -22,7 +22,7 @@ all = { level = "deny", priority = -1 }
 pedantic = { level = "warn", priority = -1 }
 
 [workspace.dependencies]
-blake3 = "1.8"
+blake3 = "=1.8.6"
 bytes = "1.12"
 clap = { version = "4.5", features = ["derive"] }
 form_urlencoded = "1.2"
