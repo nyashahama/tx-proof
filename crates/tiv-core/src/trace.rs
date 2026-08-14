@@ -285,6 +285,11 @@ impl CaseCapturedValue {
         }
     }
 
+    #[must_use]
+    pub const fn slot(&self) -> CaseOutputSlot {
+        self.kind()
+    }
+
     const fn kind(&self) -> CaseOutputSlot {
         match self {
             Self::PaymentIntentId(_) => CaseOutputSlot::PaymentIntentId,
