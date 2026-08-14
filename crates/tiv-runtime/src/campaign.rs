@@ -24,6 +24,9 @@ use crate::journal::{
 pub struct CaseEffectRequest<'a> {
     action: &'a PlannedAction,
     expected_outputs: &'a [CaseOutputRef],
+    context: &'a JournalContext,
+    journal: &'a ObservationJournal,
+    start: Instant,
 }
 
 impl CaseEffectRequest<'_> {
@@ -35,6 +38,33 @@ impl CaseEffectRequest<'_> {
     #[must_use]
     pub const fn expected_outputs(&self) -> &[CaseOutputRef] {
         self.expected_outputs
+    }
+
+    /// Durably records an observation produced while this action is active.
+    ///
+    /// The producer owns its strictly increasing sequence. Completion means
+    /// the record has been flushed and synchronized to the case journal.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed journal error when the record is out of sequence,
+    /// outside the fixed case bound, or cannot be durably written.
+    pub async fn record_observation(
+        &self,
+        producer: ObservationProducer,
+        producer_sequence: u64,
+        event: ObservationEvent,
+    ) -> Result<(), JournalError> {
+        self.journal
+            .append(Observation::new(
+                self.context.clone(),
+                producer,
+                producer_sequence,
+                elapsed_micros(self.start),
+                event,
+            ))
+            .await
+            .map(|_| ())
     }
 }
 
@@ -110,7 +140,7 @@ where
     let max_records = planned_case
         .actions()
         .len()
-        .checked_mul(2)
+        .checked_mul(4)
         .ok_or(CaseExecutionError::InvalidJournalBounds)?;
     let limits =
         JournalLimits::new(1, max_records).map_err(|_| CaseExecutionError::InvalidJournalBounds)?;
@@ -181,6 +211,9 @@ where
             .execute(CaseEffectRequest {
                 action,
                 expected_outputs: &expected_outputs,
+                context,
+                journal,
+                start,
             })
             .await
             .map_err(CaseExecutionCause::Effect)?;

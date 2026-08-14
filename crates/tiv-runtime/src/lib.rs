@@ -4,6 +4,7 @@ pub mod campaign;
 pub mod config;
 pub mod doctor;
 pub mod evidence;
+pub mod held_checkout;
 pub mod init;
 pub mod journal;
 pub mod postgres;

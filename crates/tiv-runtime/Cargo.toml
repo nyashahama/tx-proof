@@ -21,6 +21,10 @@ url.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+bytes.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
 tiv-stripe-pi = { path = "../tiv-stripe-pi" }
 
 [lints]
