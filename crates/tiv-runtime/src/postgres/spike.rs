@@ -4,6 +4,7 @@ use tokio_postgres::{Client, NoTls};
 use uuid::Uuid;
 
 use super::{
+    archive::{ArchiveError, BaselineArchive, PostgresArchiveToolchain},
     oracle::{
         OracleError, ProviderPaymentIntent, QuiescencePermit, SnapshotReport, run_reference_oracle,
     },
@@ -39,6 +40,7 @@ pub struct SpikePostgresConfig {
     admin_password: String,
     application_password: String,
     expected_cluster_name: &'static str,
+    archive_container_id: Option<String>,
 }
 
 impl SpikePostgresConfig {
@@ -56,10 +58,31 @@ impl SpikePostgresConfig {
             admin_password: admin_password.into(),
             application_password: application_password.into(),
             expected_cluster_name: TRUTH_SPIKE_CLUSTER_NAME,
+            archive_container_id: None,
         }
     }
 
     #[must_use]
+    #[cfg(test)]
+    pub fn loopback_with_archive_container(
+        port: u16,
+        admin_role: impl Into<String>,
+        admin_password: impl Into<String>,
+        application_password: impl Into<String>,
+        archive_container_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            endpoint: DatabaseEndpoint::loopback(port),
+            admin_role: admin_role.into(),
+            admin_password: admin_password.into(),
+            application_password: application_password.into(),
+            expected_cluster_name: TRUTH_SPIKE_CLUSTER_NAME,
+            archive_container_id: Some(archive_container_id.into()),
+        }
+    }
+
+    #[must_use]
+    #[cfg(test)]
     pub(crate) fn loopback_reference_app(
         port: u16,
         admin_role: impl Into<String>,
@@ -72,12 +95,32 @@ impl SpikePostgresConfig {
             admin_password: admin_password.into(),
             application_password: application_password.into(),
             expected_cluster_name: REFERENCE_APP_CLUSTER_NAME,
+            archive_container_id: None,
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn loopback_reference_app_with_archive(
+        port: u16,
+        admin_role: impl Into<String>,
+        admin_password: impl Into<String>,
+        application_password: impl Into<String>,
+        archive_container_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            endpoint: DatabaseEndpoint::loopback(port),
+            admin_role: admin_role.into(),
+            admin_password: admin_password.into(),
+            application_password: application_password.into(),
+            expected_cluster_name: REFERENCE_APP_CLUSTER_NAME,
+            archive_container_id: Some(archive_container_id.into()),
         }
     }
 }
 
 pub struct TruthSpikePostgres {
     config: SpikePostgresConfig,
+    archive_toolchain: Option<PostgresArchiveToolchain>,
 }
 
 impl TruthSpikePostgres {
@@ -95,12 +138,16 @@ impl TruthSpikePostgres {
         {
             return Err(SpikePostgresError::InvalidConfiguration);
         }
-        let postgres = Self { config };
+        let mut postgres = Self {
+            config,
+            archive_toolchain: None,
+        };
         let mut session = postgres.connect_database("postgres").await?;
         let probe = session
             .client()
             .query_one(
-                "SELECT 1::integer, current_setting('cluster_name'), current_user",
+                "SELECT 1::integer, current_setting('cluster_name'), current_user, \
+                        current_setting('server_version_num')::integer",
                 &[],
             )
             .await;
@@ -111,6 +158,19 @@ impl TruthSpikePostgres {
             || row.get::<_, &str>(2) != postgres.config.admin_role
         {
             return Err(SpikePostgresError::UnexpectedServerIdentity);
+        }
+        let server_version_num = row.get::<_, i32>(3);
+        let server_major = u16::try_from(server_version_num / 10_000)
+            .map_err(|_| SpikePostgresError::UnexpectedServerIdentity)?;
+        if let Some(container_id) = postgres.config.archive_container_id.clone() {
+            postgres.archive_toolchain = Some(
+                PostgresArchiveToolchain::attest(
+                    container_id,
+                    postgres.config.admin_role.clone(),
+                    server_major,
+                )
+                .await?,
+            );
         }
         Ok(postgres)
     }
@@ -136,6 +196,11 @@ impl TruthSpikePostgres {
         self.create_empty_database(&baseline_name).await?;
         self.initialize_reference_baseline(&baseline_name, baseline_marker, &compose_project)
             .await?;
+        let baseline_archive = if let Some(toolchain) = &self.archive_toolchain {
+            Some(toolchain.capture(&baseline_name).await?)
+        } else {
+            None
+        };
         self.seal_and_clone_baseline(
             &baseline_name,
             &case_name,
@@ -164,6 +229,7 @@ impl TruthSpikePostgres {
             baseline_target,
             case_name,
             case_target: DatabaseTarget::new(identity),
+            baseline_archive,
         })
     }
 
@@ -298,6 +364,53 @@ impl TruthSpikePostgres {
             new_marker_uuid,
         )
         .await
+    }
+
+    /// Rechecks the exact case and baseline identities, consumes a mutation
+    /// permit, and restores the trusted custom-format baseline archive into a
+    /// fresh database created from `template0`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpikePostgresError`] before mutation when the archive,
+    /// toolchain, case, or baseline does not match this isolated run, or when a
+    /// bounded drop, restore, privilege, marker, or identity step fails.
+    pub async fn reset_case_from_archive(
+        &self,
+        expected: DatabaseTarget<Unverified>,
+        expected_baseline: &BaselineTarget,
+        archive: &BaselineArchive,
+        new_marker_uuid: Uuid,
+    ) -> Result<DatabaseTarget<Unverified>, SpikePostgresError> {
+        if expected_baseline.identity.database_name().kind() != DatabaseKind::Baseline
+            || !expected_baseline.is_sealed()
+        {
+            return Err(SpikePostgresError::ExpectedBaselineName);
+        }
+        let toolchain = self
+            .archive_toolchain
+            .as_ref()
+            .ok_or(SpikePostgresError::ArchiveUnavailable)?;
+        toolchain.preflight(archive, expected_baseline.identity.database_name())?;
+        let case_name = expected.identity().database_name().clone();
+        let observed = self.observe_identity(&case_name).await?;
+        let (verified, permit) = expected
+            .verify(&observed)
+            .map_err(SpikePostgresError::Safety)?;
+        let observed_baseline = self
+            .observe_baseline_identity(expected_baseline.identity.database_name())
+            .await?;
+        if &observed_baseline != expected_baseline
+            || observed_baseline.identity.server_fingerprint()
+                != verified.identity().server_fingerprint()
+            || observed_baseline.identity.endpoint() != verified.identity().endpoint()
+            || observed_baseline.identity.marker().compose_project()
+                != verified.identity().marker().compose_project()
+        {
+            return Err(SpikePostgresError::BaselineIdentityMismatch);
+        }
+        self.reset_verified_case_from_archive(verified, permit, archive, new_marker_uuid)
+            .await
     }
 
     async fn create_empty_database(
@@ -755,6 +868,135 @@ impl TruthSpikePostgres {
         Ok(DatabaseTarget::new(observed))
     }
 
+    async fn reset_verified_case_from_archive(
+        &self,
+        verified: DatabaseTarget<Verified>,
+        _permit: MutationPermit,
+        archive: &BaselineArchive,
+        new_marker_uuid: Uuid,
+    ) -> Result<DatabaseTarget<Unverified>, SpikePostgresError> {
+        let prior = verified.identity();
+        let case_name = prior.database_name().clone();
+        let prior_fingerprint = prior.server_fingerprint().to_owned();
+        let prior_endpoint = prior.endpoint();
+        let prior_owner_oid = prior.owner_oid();
+        let compose_project = prior.marker().compose_project().clone();
+        let application_role = prior.expected_application_role().to_owned();
+        let database_oid = i64::from(prior.database_oid());
+
+        let mut maintenance = self.connect_database("postgres").await?;
+        let drop_case = format!("DROP DATABASE {}", case_name.as_str());
+        let create_case = format!(
+            "CREATE DATABASE {} WITH OWNER = {} TEMPLATE = template0",
+            case_name.as_str(),
+            self.config.admin_role,
+        );
+        let reset_result = async {
+            maintenance
+                .client()
+                .execute(
+                    "SELECT pg_terminate_backend(pid) \
+                     FROM pg_stat_activity \
+                     WHERE datid::bigint = $1 AND pid <> pg_backend_pid()",
+                    &[&database_oid],
+                )
+                .await?;
+            maintenance.client().batch_execute(&drop_case).await?;
+            maintenance.client().batch_execute(&create_case).await?;
+            maintenance
+                .client()
+                .query_one(
+                    "SELECT oid::bigint FROM pg_database WHERE datname = $1",
+                    &[&case_name.as_str()],
+                )
+                .await
+                .map(|row| row.get::<_, i64>(0))
+        }
+        .await;
+        maintenance.close().await?;
+        let created_database_oid = reset_result?;
+
+        let restore_result = self
+            .archive_toolchain
+            .as_ref()
+            .ok_or(SpikePostgresError::ArchiveUnavailable)?
+            .restore(archive, &case_name)
+            .await;
+        if let Err(error) = restore_result {
+            self.remove_failed_archive_case(&case_name, created_database_oid, prior_owner_oid)
+                .await?;
+            return Err(error.into());
+        }
+        let mut maintenance = self.connect_database("postgres").await?;
+        let configure_result = self
+            .configure_case_connect(maintenance.client(), &case_name)
+            .await;
+        maintenance.close().await?;
+        configure_result?;
+
+        self.replace_case_marker(&case_name, new_marker_uuid)
+            .await?;
+        let observed = self.observe_identity(&case_name).await?;
+        if observed.server_fingerprint() != prior_fingerprint
+            || observed.endpoint() != prior_endpoint
+            || observed.owner_oid() != prior_owner_oid
+            || observed.marker().marker_uuid() != new_marker_uuid
+            || observed.marker().kind() != MarkerKind::Case
+            || observed.marker().compose_project() != &compose_project
+            || observed.expected_application_role() != application_role
+        {
+            return Err(SpikePostgresError::PostResetIdentityMismatch);
+        }
+        Ok(DatabaseTarget::new(observed))
+    }
+
+    async fn remove_failed_archive_case(
+        &self,
+        case_name: &DatabaseName,
+        expected_database_oid: i64,
+        expected_owner_oid: u32,
+    ) -> Result<(), SpikePostgresError> {
+        let mut maintenance = self.connect_database("postgres").await?;
+        let catalog = maintenance
+            .client()
+            .query_opt(
+                "SELECT oid::bigint, datdba::bigint FROM pg_database WHERE datname = $1",
+                &[&case_name.as_str()],
+            )
+            .await?;
+        let cleanup_result = if let Some(catalog) = catalog {
+            let observed_database_oid = catalog.get::<_, i64>(0);
+            let observed_owner_oid = u32::try_from(catalog.get::<_, i64>(1))
+                .map_err(|_| SpikePostgresError::ArchiveCleanupIdentityMismatch)?;
+            if observed_database_oid != expected_database_oid
+                || observed_owner_oid != expected_owner_oid
+            {
+                Err(SpikePostgresError::ArchiveCleanupIdentityMismatch)
+            } else {
+                maintenance
+                    .client()
+                    .execute(
+                        "SELECT pg_terminate_backend(pid) \
+                         FROM pg_stat_activity \
+                         WHERE datid::bigint = $1 AND pid <> pg_backend_pid()",
+                        &[&expected_database_oid],
+                    )
+                    .await?;
+                let drop_case = format!("DROP DATABASE {}", case_name.as_str());
+                maintenance
+                    .client()
+                    .batch_execute(&drop_case)
+                    .await
+                    .map_err(SpikePostgresError::Postgres)
+            }
+        } else {
+            Ok(())
+        };
+        maintenance.close().await?;
+        cleanup_result?;
+        Ok(())
+    }
+
     async fn connect_database(
         &self,
         database_name: &str,
@@ -810,27 +1052,50 @@ pub struct ReferenceProvisioning {
     baseline_target: BaselineTarget,
     case_name: DatabaseName,
     case_target: DatabaseTarget<Unverified>,
+    baseline_archive: Option<BaselineArchive>,
 }
 
 impl ReferenceProvisioning {
     #[must_use]
+    #[cfg(test)]
     pub const fn baseline_target(&self) -> &BaselineTarget {
         &self.baseline_target
     }
 
     #[must_use]
+    #[cfg(test)]
     pub const fn case_name(&self) -> &DatabaseName {
         &self.case_name
     }
 
     #[must_use]
+    #[cfg(test)]
     pub const fn case_target(&self) -> &DatabaseTarget<Unverified> {
         &self.case_target
     }
 
     #[must_use]
+    #[cfg(test)]
     pub fn into_case_target(self) -> DatabaseTarget<Unverified> {
         self.case_target
+    }
+
+    #[must_use]
+    pub fn into_archive_parts(
+        self,
+    ) -> Option<(
+        BaselineTarget,
+        DatabaseName,
+        DatabaseTarget<Unverified>,
+        BaselineArchive,
+    )> {
+        let Self {
+            baseline_target,
+            case_name,
+            case_target,
+            baseline_archive,
+        } = self;
+        Some((baseline_target, case_name, case_target, baseline_archive?))
     }
 }
 
@@ -898,6 +1163,12 @@ pub enum SpikePostgresError {
     InvalidBugState,
     #[error("PostgreSQL server is not the isolated truth-spike cluster")]
     UnexpectedServerIdentity,
+    #[error("the matching PostgreSQL archive toolchain was not attested")]
+    ArchiveUnavailable,
+    #[error("failed archive cleanup refused a substituted database identity")]
+    ArchiveCleanupIdentityMismatch,
+    #[error(transparent)]
+    Archive(#[from] ArchiveError),
     #[error(transparent)]
     InvalidUuid(#[from] uuid::Error),
     #[error("reference invariant oracle failed: {0}")]
@@ -951,6 +1222,8 @@ fn parse_baseline_catalog_marker(
 #[cfg(test)]
 mod tests {
     use std::{
+        os::unix::fs::PermissionsExt,
+        process::Command as StdCommand,
         sync::Arc,
         time::{Duration, SystemTime, UNIX_EPOCH},
     };
@@ -1049,6 +1322,114 @@ mod tests {
             provider_uniqueness_failure(&replay_report).identity(),
             &first_identity
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires the isolated tiv-truth-spike-postgres Compose project"]
+    async fn custom_archive_fallback_restores_a_private_fresh_case() {
+        let postgres = test_postgres_with_archive().await;
+        let suffix = Uuid::new_v4().simple().to_string()[..16].to_owned();
+        let provisioned = postgres
+            .provision_reference_databases(&suffix, test_project())
+            .await
+            .expect("the baseline, archive, and first case are provisioned");
+        let (baseline_target, case_name, first_case_target, archive) = provisioned
+            .into_archive_parts()
+            .expect("the matching container toolchain captured a baseline archive");
+        let archive_path = archive.path().to_owned();
+        let archive_metadata = archive_path
+            .metadata()
+            .expect("archive metadata is readable");
+        assert_eq!(
+            archive_metadata.permissions().mode() & 0o777,
+            0o600,
+            "the host archive is never group- or world-readable"
+        );
+        assert!(archive_metadata.len() > 0, "the archive is not empty");
+        let original_oid = first_case_target.identity().database_oid();
+        let provider_objects = provider_objects();
+        let dirty_case_target = postgres
+            .insert_buggy_payment_pair(first_case_target, "op_1", &provider_objects)
+            .await
+            .expect("the synthetic bug state is inserted before fallback reset");
+
+        let reset_target = postgres
+            .reset_case_from_archive(
+                dirty_case_target,
+                &baseline_target,
+                &archive,
+                Uuid::new_v4(),
+            )
+            .await
+            .expect("the custom archive restores into a fresh template0 database");
+
+        assert_ne!(reset_target.identity().database_oid(), original_oid);
+        let clean_report = postgres
+            .check_reference_invariants(&case_name, &provider_objects, quiescence())
+            .await
+            .expect("the restored case is inspectable");
+        assert!(matches!(
+            clean_report
+                .outcome("provider-object-unique")
+                .expect("the invariant ran")
+                .verdict(),
+            InvariantVerdict::Held
+        ));
+        assert_application_role_after_reset(&postgres, reset_target.identity().database_name())
+            .await;
+        assert_invariant_role_contract(&postgres, reset_target.identity().database_name()).await;
+
+        drop(archive);
+        assert!(
+            !archive_path.exists(),
+            "drop deletes the trusted local archive"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires the isolated tiv-truth-spike-postgres Compose project"]
+    async fn failed_archive_restore_removes_the_new_empty_case() {
+        let postgres = test_postgres_with_archive().await;
+        let suffix = Uuid::new_v4().simple().to_string()[..16].to_owned();
+        let provisioned = postgres
+            .provision_reference_databases(&suffix, test_project())
+            .await
+            .expect("the baseline archive and first case are provisioned");
+        let (baseline_target, case_name, case_target, mut archive) = provisioned
+            .into_archive_parts()
+            .expect("the baseline archive exists");
+        archive
+            .truncate_after_magic_for_test()
+            .expect("the test leaves only a valid custom-archive magic prefix");
+
+        let result = postgres
+            .reset_case_from_archive(case_target, &baseline_target, &archive, Uuid::new_v4())
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(SpikePostgresError::Archive(
+                ArchiveError::ToolCommandFailed(crate::postgres::archive::PostgresTool::Restore)
+            ))
+        ));
+        let mut maintenance = postgres
+            .connect_database("postgres")
+            .await
+            .expect("the maintenance database remains reachable");
+        let case_count = maintenance
+            .client()
+            .query_one(
+                "SELECT COUNT(*)::bigint FROM pg_database WHERE datname = $1",
+                &[&case_name.as_str()],
+            )
+            .await
+            .expect("the failed case name can be checked")
+            .get::<_, i64>(0);
+        maintenance
+            .close()
+            .await
+            .expect("the maintenance session closes");
+        assert_eq!(case_count, 0, "a failed restore leaves no usable case");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1638,6 +2019,53 @@ mod tests {
         ))
         .await
         .expect("the isolated PostgreSQL fixture is healthy")
+    }
+
+    async fn test_postgres_with_archive() -> TruthSpikePostgres {
+        let port = std::env::var("TIV_POSTGRES_TEST_PORT")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(15_432);
+        let mut command = StdCommand::new("docker");
+        let output = command
+            .args([
+                "--host",
+                "unix:///var/run/docker.sock",
+                "ps",
+                "--filter",
+                "label=com.docker.compose.project=tiv-truth-spike-postgres",
+                "--filter",
+                "label=com.docker.compose.service=postgres",
+                "--format",
+                "{{.ID}}",
+            ])
+            .env_remove("DOCKER_HOST")
+            .env_remove("DOCKER_CONTEXT")
+            .env_remove("DOCKER_TLS_VERIFY")
+            .env_remove("DOCKER_CERT_PATH")
+            .output()
+            .expect("local Docker is available");
+        assert!(
+            output.status.success(),
+            "the isolated container is discoverable"
+        );
+        let container_id = String::from_utf8(output.stdout)
+            .expect("Docker emits UTF-8")
+            .trim()
+            .to_owned();
+        assert!(
+            !container_id.contains('\n'),
+            "exactly one container is running"
+        );
+        TruthSpikePostgres::connect(SpikePostgresConfig::loopback_with_archive_container(
+            port,
+            "tiv_admin",
+            "tiv-local-only-password",
+            "tiv-app-local-only-password",
+            container_id,
+        ))
+        .await
+        .expect("the isolated PostgreSQL archive toolchain is compatible")
     }
 
     async fn test_reference_postgres() -> TruthSpikePostgres {

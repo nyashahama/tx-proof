@@ -22,7 +22,7 @@ use crate::{
     postgres::{
         oracle::{InvariantVerdict, ProviderPaymentIntent, QuiescencePermit, SnapshotReport},
         safety::{ComposeProjectId, DatabaseName},
-        spike::{SpikePostgresConfig, TruthSpikePostgres},
+        spike::{SpikePostgresConfig, SpikePostgresError, TruthSpikePostgres},
     },
     replay::{
         ReferenceAppReplayConfig, ReferenceAppReplayConfigError, ReferenceAppReplayError,
@@ -472,14 +472,16 @@ pub async fn run_reference_app_evidence(
     if observed_stack != config.stack_attestation {
         return Err(ReferenceAppEvidenceConfigError::ReferenceStackMismatch.into());
     }
-    let postgres = TruthSpikePostgres::connect(SpikePostgresConfig::loopback_reference_app(
-        config.postgres_port,
-        config.postgres_admin_role.clone(),
-        config.postgres_admin_password.clone(),
-        config.postgres_application_password.clone(),
-    ))
-    .await
-    .map_err(ReferenceAppEvidenceError::postgres)?;
+    let postgres =
+        TruthSpikePostgres::connect(SpikePostgresConfig::loopback_reference_app_with_archive(
+            config.postgres_port,
+            config.postgres_admin_role.clone(),
+            config.postgres_admin_password.clone(),
+            config.postgres_application_password.clone(),
+            config.stack_attestation.postgres.clone(),
+        ))
+        .await
+        .map_err(ReferenceAppEvidenceError::postgres)?;
     let post_connect_stack = attest_reference_stack(
         config.postgres_port,
         &config.reference_app_url,
@@ -494,20 +496,18 @@ pub async fn run_reference_app_evidence(
         .provision_reference_databases(&suffix, config.compose_project.clone())
         .await
         .map_err(ReferenceAppEvidenceError::postgres)?;
-    let baseline_target = provisioned.baseline_target().clone();
-    let case_name = provisioned.case_name().clone();
-    let first_database_oid = provisioned.case_target().identity().database_oid();
+    let (baseline_target, case_name, first_case_target, baseline_archive) = provisioned
+        .into_archive_parts()
+        .ok_or(SpikePostgresError::ArchiveUnavailable)
+        .map_err(ReferenceAppEvidenceError::postgres)?;
+    let first_database_oid = first_case_target.identity().database_oid();
 
     let (first_provider_object_count, first_report) =
         run_reference_app_attempt(&postgres, plan, config, &case_name, 1, 2).await?;
     let (expected_failure, first_attempt) = provider_uniqueness_attempt(&first_report)?;
 
     let first_reset_target = postgres
-        .reset_case_from_template(
-            provisioned.into_case_target(),
-            &baseline_target,
-            Uuid::new_v4(),
-        )
+        .reset_case_from_template(first_case_target, &baseline_target, Uuid::new_v4())
         .await
         .map_err(ReferenceAppEvidenceError::postgres)?;
     let second_database_oid = first_reset_target.identity().database_oid();
@@ -517,7 +517,12 @@ pub async fn run_reference_app_evidence(
     let (_, second_attempt) = provider_uniqueness_attempt(&second_report)?;
 
     let second_reset_target = postgres
-        .reset_case_from_template(first_reset_target, &baseline_target, Uuid::new_v4())
+        .reset_case_from_archive(
+            first_reset_target,
+            &baseline_target,
+            &baseline_archive,
+            Uuid::new_v4(),
+        )
         .await
         .map_err(ReferenceAppEvidenceError::postgres)?;
     let third_database_oid = second_reset_target.identity().database_oid();
