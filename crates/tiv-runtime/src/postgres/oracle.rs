@@ -253,7 +253,7 @@ pub async fn run_reference_oracle(
     result
 }
 
-async fn load_provider_projection(
+pub(super) async fn load_provider_projection(
     client: &mut Client,
     provider_objects: &[ProviderPaymentIntent],
 ) -> Result<(), tokio_postgres::Error> {

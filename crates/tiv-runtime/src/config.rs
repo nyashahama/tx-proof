@@ -237,7 +237,7 @@ pub struct ResolvedConfig {
     postgres_service: String,
     stripe_service: String,
     worker_services: Vec<String>,
-    _private: ResolvedPrivate,
+    private: ResolvedPrivate,
     redacted: RedactedConfig,
 }
 
@@ -271,6 +271,18 @@ impl ResolvedConfig {
         &self.worker_services
     }
 
+    pub(crate) const fn statement_timeout(&self) -> Duration {
+        self.private.statement_timeout
+    }
+
+    pub(crate) const fn lock_timeout(&self) -> Duration {
+        self.private.lock_timeout
+    }
+
+    pub(crate) fn invariant_files(&self) -> &[ResolvedInvariantFile] {
+        &self.private.invariant_files
+    }
+
     pub(crate) fn into_redacted(self) -> RedactedConfig {
         self.redacted
     }
@@ -295,15 +307,30 @@ struct ResolvedPrivate {
     _quiescence_sql: PathBuf,
     _quiescence_stable_for: Duration,
     _quiescence_timeout: Duration,
-    _statement_timeout: Duration,
-    _lock_timeout: Duration,
+    statement_timeout: Duration,
+    lock_timeout: Duration,
     _stripe_base: Url,
     _webhook_url: Url,
     _driver_url: Url,
     _driver_body: PathBuf,
     _driver_timeout: Duration,
     _sql_probe: PathBuf,
-    _invariant_paths: Vec<PathBuf>,
+    invariant_files: Vec<ResolvedInvariantFile>,
+}
+
+pub(crate) struct ResolvedInvariantFile {
+    id: InvariantId,
+    path: PathBuf,
+}
+
+impl ResolvedInvariantFile {
+    pub(crate) fn id(&self) -> &str {
+        self.id.as_str()
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
 }
 
 /// Allowlisted projection safe for persistence and standard output.
@@ -637,15 +664,13 @@ fn resolve_raw_config(
     {
         return Err(ConfigError::UnsupportedInvariantSet);
     }
-    let mut invariant_paths = Vec::with_capacity(raw.invariants.len());
+    let mut invariant_files = Vec::with_capacity(raw.invariants.len());
     let mut redacted_invariants = Vec::with_capacity(raw.invariants.len());
     for invariant in &raw.invariants {
-        InvariantId::new(&invariant.id).map_err(|_| ConfigError::InvalidInvariantId)?;
-        invariant_paths.push(existing_repository_file(
-            &canonical_root,
-            &repository_root,
-            &invariant.sql_file,
-        )?);
+        let id = InvariantId::new(&invariant.id).map_err(|_| ConfigError::InvalidInvariantId)?;
+        let path =
+            existing_repository_file(&canonical_root, &repository_root, &invariant.sql_file)?;
+        invariant_files.push(ResolvedInvariantFile { id, path });
         let expect = match invariant.expect {
             InvariantExpectation::ZeroRows => "zero_rows",
         };
@@ -720,7 +745,7 @@ fn resolve_raw_config(
         postgres_service: raw.compose.postgres_service,
         stripe_service,
         worker_services: raw.compose.worker_services,
-        _private: ResolvedPrivate {
+        private: ResolvedPrivate {
             _artifact_dir: artifact_dir,
             _case_timeout: case_timeout,
             _health_url: health_url,
@@ -733,15 +758,15 @@ fn resolve_raw_config(
             _quiescence_sql: quiescence_sql,
             _quiescence_stable_for: quiescence_stable_for,
             _quiescence_timeout: quiescence_timeout,
-            _statement_timeout: statement_timeout,
-            _lock_timeout: lock_timeout,
+            statement_timeout,
+            lock_timeout,
             _stripe_base: stripe_base,
             _webhook_url: webhook_url,
             _driver_url: driver_url,
             _driver_body: driver_body,
             _driver_timeout: driver_timeout,
             _sql_probe: sql_probe,
-            _invariant_paths: invariant_paths,
+            invariant_files,
         },
         redacted,
     })

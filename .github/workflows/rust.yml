@@ -92,6 +92,16 @@ jobs:
             2>&1 \
             | tee ci-evidence/postgres-spike.log
 
+      - name: Prove the bounded five-query snapshot runner
+        env:
+          TIV_POSTGRES_TEST_PORT: "15432"
+        run: |
+          set -o pipefail
+          cargo test -p tiv-runtime postgres::snapshot::tests:: \
+            -- --ignored --test-threads=1 \
+            2>&1 \
+            | tee ci-evidence/postgres-snapshot.log
+
       - name: Capture PostgreSQL logs after a failure
         if: failure()
         continue-on-error: true
