@@ -610,6 +610,7 @@ async fn fixture_provider_projection(
     let state = response.json::<FixtureStateResponse>().await?;
     if state.command_sequence != config.confirm_sequence()
         || state.remaining_outcomes != 0
+        || !state.held_gates.is_empty()
         || state.payment_intents.len() != 2
         || state.payment_intents.iter().any(|payment_intent| {
             payment_intent.operation_id() != Some("op_1")
@@ -671,4 +672,32 @@ struct FixtureStateResponse {
     payment_intents: Vec<ReferenceProviderPaymentIntent>,
     command_sequence: u64,
     remaining_outcomes: usize,
+    held_gates: Vec<HeldGateResponse>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HeldGateResponse {
+    #[serde(rename = "gate_id")]
+    _gate_id: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::FixtureStateResponse;
+
+    #[test]
+    fn fixture_state_contract_recognizes_the_v1_held_gate_field() {
+        let state: FixtureStateResponse = serde_json::from_str(
+            r#"{
+                "payment_intents": [],
+                "command_sequence": 2,
+                "remaining_outcomes": 0,
+                "held_gates": []
+            }"#,
+        )
+        .expect("the current fixture control state is recognized");
+
+        assert!(state.held_gates.is_empty());
+    }
 }
