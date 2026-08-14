@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "scheduler_algorithm": "rand/0.10.2/random_range+rand_chacha/0.10.0/ChaCha20Rng-seed_from_u64",
   "spec": {
     "seed": 42,
@@ -37,7 +37,7 @@
       "max_kills": 1
     }
   },
-  "decision_count": 15,
+  "decision_count": 10,
   "actions": [
     {
       "id": 1,
@@ -119,7 +119,7 @@
         6
       ],
       "decision_number": 6,
-      "eligible_count": 8,
+      "eligible_count": 7,
       "kind": {
         "kind": "delay_webhook",
         "milliseconds": 5000
@@ -132,9 +132,9 @@
         7
       ],
       "decision_number": 7,
-      "eligible_count": 3,
+      "eligible_count": 2,
       "kind": {
-        "kind": "generate_provider_event"
+        "kind": "deliver_webhook"
       }
     },
     {
@@ -144,9 +144,9 @@
         8
       ],
       "decision_number": 8,
-      "eligible_count": 3,
+      "eligible_count": 2,
       "kind": {
-        "kind": "reorder_webhooks"
+        "kind": "wait_for_quiescence"
       }
     },
     {
@@ -156,66 +156,6 @@
         9
       ],
       "decision_number": 9,
-      "eligible_count": 2,
-      "kind": {
-        "kind": "deliver_webhook"
-      }
-    },
-    {
-      "id": 11,
-      "logical_sequence": 11,
-      "dependencies": [
-        10
-      ],
-      "decision_number": 10,
-      "eligible_count": 3,
-      "kind": {
-        "kind": "drop_webhook"
-      }
-    },
-    {
-      "id": 12,
-      "logical_sequence": 12,
-      "dependencies": [
-        11
-      ],
-      "decision_number": 11,
-      "eligible_count": 2,
-      "kind": {
-        "kind": "duplicate_webhook"
-      }
-    },
-    {
-      "id": 13,
-      "logical_sequence": 13,
-      "dependencies": [
-        12
-      ],
-      "decision_number": 12,
-      "eligible_count": 2,
-      "kind": {
-        "kind": "duplicate_webhook"
-      }
-    },
-    {
-      "id": 14,
-      "logical_sequence": 14,
-      "dependencies": [
-        13
-      ],
-      "decision_number": 13,
-      "eligible_count": 2,
-      "kind": {
-        "kind": "wait_for_quiescence"
-      }
-    },
-    {
-      "id": 15,
-      "logical_sequence": 15,
-      "dependencies": [
-        14
-      ],
-      "decision_number": 14,
       "eligible_count": 1,
       "kind": {
         "kind": "check_checkpoint",

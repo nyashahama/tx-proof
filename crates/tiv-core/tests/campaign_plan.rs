@@ -107,4 +107,9 @@ fn campaign_limits_and_untrusted_artifacts_fail_closed() {
     encoded["cases"][1]["case_id"] = serde_json::json!(1);
 
     assert!(serde_json::from_value::<tiv_core::plan::CampaignPlan>(encoded).is_err());
+
+    let campaign = CampaignPlanner::compile(&spec).expect("the campaign is feasible");
+    let mut obsolete = serde_json::to_value(campaign).unwrap();
+    obsolete["schema_version"] = serde_json::json!(1);
+    assert!(serde_json::from_value::<tiv_core::plan::CampaignPlan>(obsolete).is_err());
 }

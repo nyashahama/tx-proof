@@ -29,10 +29,6 @@ fn complete_captures() -> Vec<(CaseOutputRef, CaseCapturedValue)> {
             CaseOutputRef::new(ActionId::new(6), CaseOutputSlot::EventId),
             CaseCapturedValue::event_id("evt_tiv_42_1").unwrap(),
         ),
-        (
-            CaseOutputRef::new(ActionId::new(8), CaseOutputSlot::EventId),
-            CaseCapturedValue::event_id("evt_tiv_42_2").unwrap(),
-        ),
     ]
 }
 
@@ -45,7 +41,7 @@ fn a_full_planned_case_materializes_every_action_and_dynamic_binding() {
     let compiled = CaseTraceMaterializer::materialize(&plan, complete_captures())
         .expect("every reserved output was captured");
 
-    assert_eq!(compiled.schema_version(), 1);
+    assert_eq!(compiled.schema_version(), 2);
     assert_eq!(compiled.action_count(), plan.actions().len());
     assert_eq!(compiled.planned_case(), &plan);
     assert_eq!(
@@ -64,7 +60,7 @@ fn a_full_planned_case_materializes_every_action_and_dynamic_binding() {
     );
     assert_eq!(
         compiled
-            .replay_action(ActionId::new(8))
+            .replay_action(ActionId::new(6))
             .unwrap()
             .input(CaseInputSlot::PaymentIntentId),
         Some(&payment_intent)
@@ -84,13 +80,13 @@ fn a_materialized_case_round_trips_and_revalidates_the_complete_artifact() {
         .expect("the materialized case revalidates");
 
     assert_eq!(decoded, compiled);
-    assert_eq!(encoded["schema_version"], serde_json::json!(1));
+    assert_eq!(encoded["schema_version"], serde_json::json!(2));
     assert_eq!(
         decoded.resolve(CaseOutputRef::new(
-            ActionId::new(8),
+            ActionId::new(6),
             CaseOutputSlot::EventId
         )),
-        Some(&CaseCapturedValue::event_id("evt_tiv_42_2").unwrap())
+        Some(&CaseCapturedValue::event_id("evt_tiv_42_1").unwrap())
     );
 }
 
@@ -140,7 +136,7 @@ fn deserialization_rejects_tampered_actions_and_invalid_gate_ids() {
     assert!(serde_json::from_value::<CompiledCaseTrace>(invalid_gate).is_err());
 
     let mut unsupported = serde_json::to_value(&compiled).unwrap();
-    unsupported["schema_version"] = serde_json::json!(2);
+    unsupported["schema_version"] = serde_json::json!(1);
     assert!(serde_json::from_value::<CompiledCaseTrace>(unsupported).is_err());
 
     let mut encoded = serde_json::to_value(compiled).unwrap();
@@ -160,7 +156,6 @@ fn capture_requirements_are_exact_and_every_seeded_plan_materializes() {
             CaseOutputRef::new(ActionId::new(1), CaseOutputSlot::PaymentIntentId),
             CaseOutputRef::new(ActionId::new(1), CaseOutputSlot::ProviderGateId),
             CaseOutputRef::new(ActionId::new(6), CaseOutputSlot::EventId),
-            CaseOutputRef::new(ActionId::new(8), CaseOutputSlot::EventId),
         ]
     );
 

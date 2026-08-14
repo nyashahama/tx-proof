@@ -9,8 +9,8 @@ use crate::{
     trace::ActionId,
 };
 
-pub const PLAN_SCHEMA_VERSION: u16 = 1;
-pub const CAMPAIGN_SCHEMA_VERSION: u16 = 1;
+pub const PLAN_SCHEMA_VERSION: u16 = 2;
+pub const CAMPAIGN_SCHEMA_VERSION: u16 = 2;
 pub const MAX_ACTIONS_PER_CASE: u32 = 40;
 pub const MAX_CASES: u32 = 500;
 pub const PAYMENT_INTENT_V1_API_VERSION: &str = "2026-02-25.clover";
@@ -535,6 +535,7 @@ impl CasePlanCompiler {
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct ModelState {
     phase: Phase,
+    provider_objects: u8,
     application_healthy: bool,
     process_kills: u8,
 }
@@ -543,6 +544,7 @@ impl Default for ModelState {
     fn default() -> Self {
         Self {
             phase: Phase::Start,
+            provider_objects: 0,
             application_healthy: true,
             process_kills: 0,
         }
@@ -632,7 +634,7 @@ fn eligible_actions(state: ModelState, spec: &PlanSpec) -> Vec<PlanActionKind> {
             actions
         }
         Phase::Confirmed => vec![PlanActionKind::GenerateProviderEvent],
-        Phase::Events(events) => event_actions(events, spec),
+        Phase::Events(events) => event_actions(events, state.provider_objects, spec),
         Phase::Quiesced => vec![PlanActionKind::CheckCheckpoint {
             checkpoint: Checkpoint::Final,
         }],
@@ -660,11 +662,11 @@ fn retry_outcomes(spec: &PlanSpec, attempts: u8) -> impl Iterator<Item = Provide
         .filter(move |outcome| attempts < 2 || *outcome == ProviderOutcome::Normal)
 }
 
-fn event_actions(events: EventState, spec: &PlanSpec) -> Vec<PlanActionKind> {
-    let mut actions = Vec::new();
-    if events.generated < 2 && events.delivered == 0 && events.pending == events.generated {
-        actions.push(PlanActionKind::GenerateProviderEvent);
+fn event_actions(events: EventState, provider_objects: u8, spec: &PlanSpec) -> Vec<PlanActionKind> {
+    if events.generated < provider_objects {
+        return vec![PlanActionKind::GenerateProviderEvent];
     }
+    let mut actions = Vec::new();
     if events.pending > 0 {
         actions.push(PlanActionKind::DeliverWebhook);
         if !events.delay_used {
@@ -741,6 +743,14 @@ fn apply_action(mut state: ModelState, action: PlanActionKind) -> Option<ModelSt
     }
 
     if let Some(phase) = apply_provider_action(state.phase, action) {
+        if matches!(
+            action,
+            PlanActionKind::DriveCheckout { outcome }
+                | PlanActionKind::RetryBusinessRequest { outcome }
+                if outcome.commits()
+        ) {
+            state.provider_objects = state.provider_objects.checked_add(1)?;
+        }
         state.phase = phase;
         return Some(state);
     }

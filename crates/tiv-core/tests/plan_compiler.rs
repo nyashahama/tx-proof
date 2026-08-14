@@ -27,14 +27,14 @@ fn the_same_seed_and_spec_compile_to_the_same_plan() {
 }
 
 #[test]
-fn the_v1_plan_artifact_matches_its_golden_contract() {
+fn the_v2_plan_artifact_matches_its_golden_contract() {
     let spec = PlanSpec::payment_intent_v1(Seed::new(42), ActionBudget::new(40).unwrap());
     let plan = CasePlanCompiler::compile(&spec).expect("the v1 plan is feasible");
     let actual = format!("{}\n", serde_json::to_string_pretty(&plan).unwrap());
 
     assert_eq!(
         actual,
-        include_str!("golden/planned-case-v1.json"),
+        include_str!("golden/planned-case-v2.json"),
         "intentional plan wire changes require an explicit golden update"
     );
     let decoded: PlannedCase = serde_json::from_str(&actual).expect("the golden plan revalidates");
@@ -129,6 +129,54 @@ fn generated_plans_are_state_valid_bounded_and_serial() {
                 )])
             };
             assert_eq!(action.dependencies(), &expected_dependencies);
+        }
+    }
+}
+
+#[test]
+fn generated_events_match_committed_provider_objects_before_reorder() {
+    for seed in 0..512 {
+        let spec = PlanSpec::payment_intent_v1(Seed::new(seed), ActionBudget::new(40).unwrap());
+        let plan = CasePlanCompiler::compile(&spec).expect("the v1 plan is feasible");
+        let committed_provider_objects = plan
+            .actions()
+            .iter()
+            .filter(|action| {
+                matches!(
+                    action.kind(),
+                    PlanActionKind::DriveCheckout {
+                        outcome: ProviderOutcome::Normal
+                            | ProviderOutcome::PostExecute500
+                            | ProviderOutcome::CommitThenClose
+                            | ProviderOutcome::CommitThenDelay
+                    } | PlanActionKind::RetryBusinessRequest {
+                        outcome: ProviderOutcome::Normal
+                            | ProviderOutcome::PostExecute500
+                            | ProviderOutcome::CommitThenClose
+                            | ProviderOutcome::CommitThenDelay
+                    }
+                )
+            })
+            .count();
+        let generated_events = plan
+            .actions()
+            .iter()
+            .filter(|action| matches!(action.kind(), PlanActionKind::GenerateProviderEvent))
+            .count();
+
+        assert_eq!(
+            generated_events, committed_provider_objects,
+            "one succeeded event exists for each committed provider object at seed {seed}"
+        );
+        if plan
+            .actions()
+            .iter()
+            .any(|action| matches!(action.kind(), PlanActionKind::ReorderWebhooks))
+        {
+            assert!(
+                committed_provider_objects >= 2,
+                "reorder needs at least two real provider events at seed {seed}"
+            );
         }
     }
 }
@@ -283,4 +331,9 @@ fn deserialization_rejects_a_tampered_or_state_invalid_plan() {
     incompatible["spec"]["provider_api_version"] = serde_json::json!("unsupported");
 
     assert!(serde_json::from_value::<PlannedCase>(incompatible).is_err());
+
+    let plan = CasePlanCompiler::compile(&spec).expect("the v2 plan is feasible");
+    let mut obsolete = serde_json::to_value(plan).unwrap();
+    obsolete["schema_version"] = serde_json::json!(1);
+    assert!(serde_json::from_value::<PlannedCase>(obsolete).is_err());
 }

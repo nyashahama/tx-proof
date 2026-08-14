@@ -9,7 +9,7 @@ use crate::{
 };
 
 pub const TRACE_SCHEMA_VERSION: u16 = 1;
-pub const CASE_TRACE_SCHEMA_VERSION: u16 = 1;
+pub const CASE_TRACE_SCHEMA_VERSION: u16 = 2;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(transparent)]
