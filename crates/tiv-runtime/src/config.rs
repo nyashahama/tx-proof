@@ -283,6 +283,10 @@ impl ResolvedConfig {
         &self.private.invariant_files
     }
 
+    pub(crate) fn invariant_role(&self) -> &str {
+        &self.private.invariant_role
+    }
+
     pub(crate) fn into_redacted(self) -> RedactedConfig {
         self.redacted
     }
@@ -315,6 +319,7 @@ struct ResolvedPrivate {
     _driver_body: PathBuf,
     _driver_timeout: Duration,
     _sql_probe: PathBuf,
+    invariant_role: String,
     invariant_files: Vec<ResolvedInvariantFile>,
 }
 
@@ -715,7 +720,7 @@ fn resolve_raw_config(
             strategy: raw.database.strategy,
             case_database: raw.database.case_database,
             baseline_database: raw.database.baseline_database,
-            invariant_role: raw.database.invariant_role,
+            invariant_role: raw.database.invariant_role.clone(),
             quiescence_sql: display_path(&quiescence_sql),
             quiescence_stable_for_ms: duration_millis(quiescence_stable_for)?,
             quiescence_timeout_ms: duration_millis(quiescence_timeout)?,
@@ -766,6 +771,7 @@ fn resolve_raw_config(
             _driver_body: driver_body,
             _driver_timeout: driver_timeout,
             _sql_probe: sql_probe,
+            invariant_role: raw.database.invariant_role,
             invariant_files,
         },
         redacted,

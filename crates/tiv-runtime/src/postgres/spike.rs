@@ -15,6 +15,7 @@ use super::{
 };
 
 const APPLICATION_ROLE: &str = "tiv_app";
+const INVARIANT_ROLE: &str = "tiv_invariant";
 #[cfg(test)]
 const TRUTH_SPIKE_CLUSTER_NAME: &str = "tiv-truth-spike-postgres";
 const REFERENCE_APP_CLUSTER_NAME: &str = "tiv-reference-app-postgres";
@@ -131,6 +132,7 @@ impl TruthSpikePostgres {
         let case_marker = Uuid::new_v4();
 
         self.ensure_application_role().await?;
+        self.ensure_invariant_role().await?;
         self.create_empty_database(&baseline_name).await?;
         self.initialize_reference_baseline(&baseline_name, baseline_marker, &compose_project)
             .await?;
@@ -381,6 +383,62 @@ impl TruthSpikePostgres {
         Ok(())
     }
 
+    async fn ensure_invariant_role(&self) -> Result<(), SpikePostgresError> {
+        let mut session = self.connect_database("postgres").await?;
+        let result = async {
+            let role = session
+                .client()
+                .query_opt(
+                    "SELECT NOT role.rolsuper \
+                                AND NOT role.rolcreatedb \
+                                AND NOT role.rolcreaterole \
+                                AND NOT role.rolinherit \
+                                AND NOT role.rolcanlogin \
+                                AND NOT role.rolreplication \
+                                AND NOT role.rolbypassrls \
+                                AND role.rolconnlimit = -1 \
+                                AND role.rolvaliduntil IS NULL \
+                                AND role.rolconfig IS NULL, \
+                            NOT EXISTS ( \
+                                SELECT 1 \
+                                FROM pg_auth_members AS membership \
+                                WHERE membership.roleid = role.oid \
+                                   OR membership.member = role.oid \
+                            ), \
+                            NOT EXISTS ( \
+                                SELECT 1 FROM pg_database \
+                                WHERE datdba = role.oid \
+                            ) \
+                     FROM pg_roles AS role \
+                     WHERE role.rolname = $1",
+                    &[&INVARIANT_ROLE],
+                )
+                .await?;
+            match role {
+                Some(row)
+                    if row.get::<_, bool>(0) && row.get::<_, bool>(1) && row.get::<_, bool>(2) =>
+                {
+                    Ok(())
+                }
+                Some(_) => Err(SpikePostgresError::UnsafeInvariantRole),
+                None => {
+                    session
+                        .client()
+                        .batch_execute(
+                            "CREATE ROLE tiv_invariant WITH \
+                                 NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT \
+                                 NOREPLICATION NOBYPASSRLS CONNECTION LIMIT -1 PASSWORD NULL",
+                        )
+                        .await?;
+                    Ok(())
+                }
+            }
+        }
+        .await;
+        session.close().await?;
+        result
+    }
+
     async fn initialize_reference_baseline(
         &self,
         baseline_name: &DatabaseName,
@@ -419,15 +477,16 @@ impl TruthSpikePostgres {
                      INSERT INTO orders (operation_id, amount_minor, currency, status) \
                      VALUES ('op_1', 2500, 'usd', 'pending'); \
                      REVOKE ALL ON SCHEMA public FROM PUBLIC; \
-                     GRANT USAGE ON SCHEMA public TO tiv_app; \
+                     GRANT USAGE ON SCHEMA public TO tiv_app, tiv_invariant; \
                      REVOKE ALL ON TABLE tiv_verifier_marker, orders, payments \
-                         FROM PUBLIC, tiv_app; \
+                         FROM PUBLIC, tiv_app, tiv_invariant; \
                      REVOKE ALL ON SEQUENCE orders_id_seq, payments_id_seq \
-                         FROM PUBLIC, tiv_app; \
+                         FROM PUBLIC, tiv_app, tiv_invariant; \
                      GRANT INSERT ON TABLE payments TO tiv_app; \
                      GRANT SELECT (operation_id, stripe_payment_intent_id), \
                            UPDATE (status) ON TABLE payments TO tiv_app; \
-                     GRANT USAGE ON SEQUENCE payments_id_seq TO tiv_app;",
+                     GRANT USAGE ON SEQUENCE payments_id_seq TO tiv_app; \
+                     GRANT SELECT ON TABLE orders, payments TO tiv_invariant;",
                 )
                 .await?;
             session
@@ -498,7 +557,9 @@ impl TruthSpikePostgres {
             .batch_execute(&format!(
                 "REVOKE ALL ON DATABASE {} FROM PUBLIC; \
                  REVOKE ALL ON DATABASE {} FROM {APPLICATION_ROLE}; \
+                 REVOKE ALL ON DATABASE {} FROM {INVARIANT_ROLE}; \
                  GRANT CONNECT ON DATABASE {} TO {APPLICATION_ROLE}",
+                case_name.as_str(),
                 case_name.as_str(),
                 case_name.as_str(),
                 case_name.as_str(),
@@ -830,6 +891,8 @@ pub enum SpikePostgresError {
     BaselineIdentityMismatch,
     #[error("the application role has unexpected inherited memberships")]
     UnsafeApplicationRole,
+    #[error("the invariant role exceeds the isolated least-privilege contract")]
+    UnsafeInvariantRole,
     #[cfg(test)]
     #[error("the synthetic bug requires two distinct provider objects")]
     InvalidBugState,
@@ -1057,6 +1120,7 @@ mod tests {
         let baseline_target = provisioned.baseline_target().clone();
         let case_name = provisioned.case_name().clone();
         assert_application_role_contract(&postgres, &case_name).await;
+        assert_invariant_role_contract(&postgres, &case_name).await;
 
         let reset_target = postgres
             .reset_case_from_template(
@@ -1068,6 +1132,7 @@ mod tests {
             .expect("the marked case resets from the template");
         assert_application_role_after_reset(&postgres, reset_target.identity().database_name())
             .await;
+        assert_invariant_role_contract(&postgres, reset_target.identity().database_name()).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1224,6 +1289,69 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "requires the isolated tiv-truth-spike-postgres Compose project"]
+    async fn expanded_invariant_role_blocks_provisioning_without_automatic_repair() {
+        let postgres = test_postgres().await;
+        postgres
+            .ensure_invariant_role()
+            .await
+            .expect("the initial isolated invariant role is safe");
+        let mut maintenance = postgres
+            .connect_database("postgres")
+            .await
+            .expect("the isolated maintenance database is reachable");
+        maintenance
+            .client()
+            .batch_execute("ALTER ROLE tiv_invariant LOGIN")
+            .await
+            .expect("the test expands the invariant role");
+        maintenance
+            .close()
+            .await
+            .expect("the maintenance session closes");
+
+        let suffix = Uuid::new_v4().simple().to_string()[..16].to_owned();
+        let result = postgres
+            .provision_reference_databases(&suffix, test_project())
+            .await;
+
+        let mut cleanup = postgres
+            .connect_database("postgres")
+            .await
+            .expect("the isolated maintenance database remains reachable");
+        let state = cleanup
+            .client()
+            .query_one(
+                "SELECT role.rolcanlogin, \
+                        COUNT(database.oid)::bigint \
+                 FROM pg_roles AS role \
+                 LEFT JOIN pg_database AS database \
+                   ON database.datname IN ($1, $2) \
+                 WHERE role.rolname = 'tiv_invariant' \
+                 GROUP BY role.rolcanlogin",
+                &[&format!("tiv_base_{suffix}"), &format!("tiv_case_{suffix}")],
+            )
+            .await
+            .expect("the rejected provisioning state is observable");
+        cleanup
+            .client()
+            .batch_execute("ALTER ROLE tiv_invariant NOLOGIN")
+            .await
+            .expect("the test restores the invariant role");
+        cleanup.close().await.expect("the cleanup session closes");
+
+        assert!(matches!(
+            result,
+            Err(SpikePostgresError::UnsafeInvariantRole)
+        ));
+        assert!(
+            state.get::<_, bool>(0),
+            "provisioning must not repair an expanded role"
+        );
+        assert_eq!(state.get::<_, i64>(1), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires the isolated tiv-truth-spike-postgres Compose project"]
     async fn reference_app_connection_rejects_the_generic_truth_spike_cluster() {
         let port = std::env::var("TIV_POSTGRES_TEST_PORT")
             .ok()
@@ -1359,6 +1487,80 @@ mod tests {
             .await
             .expect("the reset application connection closes cleanly");
         assert_eq!(reset_insert, 1);
+    }
+
+    async fn assert_invariant_role_contract(
+        postgres: &TruthSpikePostgres,
+        case_name: &DatabaseName,
+    ) {
+        use crate::postgres::snapshot::{InvariantRoleName, attest_invariant_role};
+
+        let mut admin = postgres
+            .connect_database(case_name.as_str())
+            .await
+            .expect("the isolated case database accepts its admin role");
+        let role = InvariantRoleName::new("tiv_invariant")
+            .expect("the fixed truth-spike invariant role is valid");
+        let attestation = attest_invariant_role(admin.client(), role).await;
+        assert!(
+            attestation.is_ok(),
+            "the provisioned invariant role must satisfy fresh attestation"
+        );
+
+        let grants = admin
+            .client()
+            .query_one(
+                "SELECT has_schema_privilege('tiv_invariant', 'public', 'USAGE'), \
+                        has_schema_privilege('tiv_invariant', 'public', 'CREATE'), \
+                        has_table_privilege('tiv_invariant', 'orders', 'SELECT'), \
+                        has_table_privilege('tiv_invariant', 'payments', 'SELECT'), \
+                        has_table_privilege( \
+                            'tiv_invariant', 'tiv_verifier_marker', 'SELECT' \
+                        ), \
+                        has_table_privilege('tiv_invariant', 'payments', 'INSERT'), \
+                        has_database_privilege( \
+                            'tiv_invariant', current_database(), 'TEMP' \
+                        )",
+                &[],
+            )
+            .await
+            .expect("the invariant role grants are observable");
+        assert!(grants.get::<_, bool>(0));
+        assert!(!grants.get::<_, bool>(1));
+        assert!(grants.get::<_, bool>(2));
+        assert!(grants.get::<_, bool>(3));
+        assert!(!grants.get::<_, bool>(4));
+        assert!(!grants.get::<_, bool>(5));
+        assert!(!grants.get::<_, bool>(6));
+
+        let transaction = admin
+            .client()
+            .build_transaction()
+            .read_only(true)
+            .start()
+            .await
+            .expect("the invariant proof transaction starts read-only");
+        transaction
+            .batch_execute("SET LOCAL ROLE tiv_invariant")
+            .await
+            .expect("the isolated admin can drop to the invariant role");
+        let effective = transaction
+            .query_one(
+                "SELECT current_user::text, COUNT(*)::bigint FROM orders",
+                &[],
+            )
+            .await
+            .expect("the invariant role can read application state");
+        assert_eq!(effective.get::<_, &str>(0), "tiv_invariant");
+        assert_eq!(effective.get::<_, i64>(1), 1);
+        transaction
+            .rollback()
+            .await
+            .expect("the invariant proof transaction rolls back");
+        admin
+            .close()
+            .await
+            .expect("the invariant-role admin session closes");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

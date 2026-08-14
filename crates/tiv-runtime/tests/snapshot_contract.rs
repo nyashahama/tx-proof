@@ -2,8 +2,8 @@ use std::{collections::BTreeMap, path::PathBuf, time::Duration};
 
 use tiv_runtime::config::{EnvironmentLookup, load_resolved_config};
 use tiv_runtime::postgres::snapshot::{
-    InvariantQuery, InvariantSuite, SnapshotBudgetError, SnapshotBudgets, SnapshotContractError,
-    V1_INVARIANT_IDS, load_configured_snapshot,
+    InvariantQuery, InvariantRoleName, InvariantSuite, SnapshotBudgetError, SnapshotBudgets,
+    SnapshotContractError, V1_INVARIANT_IDS, load_configured_snapshot,
 };
 
 #[test]
@@ -82,6 +82,23 @@ fn snapshot_budgets_cannot_exceed_the_v1_safety_caps() {
 }
 
 #[test]
+fn invariant_role_name_is_a_narrow_unquoted_postgres_identifier() {
+    let role = InvariantRoleName::new("tiv_invariant").expect("the v1 role name is valid");
+    assert_eq!(role.as_str(), "tiv_invariant");
+
+    for rejected in [
+        "",
+        "TIV_INVARIANT",
+        "tiv-invariant",
+        "tiv_invariant; SET ROLE tiv_admin",
+        "1_invariant",
+        &"x".repeat(64),
+    ] {
+        assert!(InvariantRoleName::new(rejected).is_err());
+    }
+}
+
+#[test]
 fn configured_snapshot_loads_the_same_five_files_and_budgets_doctor_approved() {
     let config = load_resolved_config(&config_path(), &test_environment())
         .expect("the golden doctor config resolves");
@@ -89,6 +106,7 @@ fn configured_snapshot_loads_the_same_five_files_and_budgets_doctor_approved() {
         load_configured_snapshot(&config).expect("the five configured no-op queries load");
 
     assert_eq!(snapshot.suite().ids(), V1_INVARIANT_IDS);
+    assert_eq!(snapshot.role().as_str(), "tiv_invariant");
     assert_eq!(
         snapshot.budgets().statement_timeout(),
         Duration::from_secs(2)
