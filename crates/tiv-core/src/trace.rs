@@ -223,6 +223,30 @@ pub enum CaseInputSlot {
     ProviderGateId,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CaseInputBinding {
+    action_id: ActionId,
+    slot: CaseInputSlot,
+    source: CaseOutputRef,
+}
+
+impl CaseInputBinding {
+    #[must_use]
+    pub const fn action_id(self) -> ActionId {
+        self.action_id
+    }
+
+    #[must_use]
+    pub const fn slot(self) -> CaseInputSlot {
+        self.slot
+    }
+
+    #[must_use]
+    pub const fn source(self) -> CaseOutputRef {
+        self.source
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CaseOutputRef {
@@ -805,6 +829,30 @@ impl CaseTraceMaterializer {
         Ok(materialize_case_actions(planned_case)?
             .iter()
             .flat_map(|action| action.declared_outputs.iter().copied())
+            .collect())
+    }
+
+    /// Returns the exact earlier outputs each action consumes at execution.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CaseTraceMaterializationError`] when the planned case is not
+    /// the valid deterministic result of its embedded specification.
+    pub fn required_inputs(
+        planned_case: &PlannedCase,
+    ) -> Result<Vec<CaseInputBinding>, CaseTraceMaterializationError> {
+        planned_case
+            .validate()
+            .map_err(|_| CaseTraceMaterializationError::InvalidPlannedCase)?;
+        Ok(materialize_case_actions(planned_case)?
+            .iter()
+            .flat_map(|action| {
+                action.inputs.iter().map(|input| CaseInputBinding {
+                    action_id: action.id,
+                    slot: input.slot,
+                    source: input.source,
+                })
+            })
             .collect())
     }
 

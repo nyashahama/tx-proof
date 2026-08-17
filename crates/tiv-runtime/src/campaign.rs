@@ -11,8 +11,8 @@ use std::{
 use tiv_core::{
     plan::{PlannedAction, PlannedCase},
     trace::{
-        CaseCapturedValue, CaseOutputRef, CaseOutputSlot, CaseTraceMaterializationError,
-        CaseTraceMaterializer, CompiledCaseTrace,
+        ActionId, CaseCapturedValue, CaseInputBinding, CaseInputSlot, CaseOutputRef,
+        CaseOutputSlot, CaseTraceMaterializationError, CaseTraceMaterializer, CompiledCaseTrace,
     },
 };
 
@@ -23,6 +23,7 @@ use crate::journal::{
 
 pub struct CaseEffectRequest<'a> {
     action: &'a PlannedAction,
+    inputs: &'a [(CaseInputSlot, CaseCapturedValue)],
     expected_outputs: &'a [CaseOutputRef],
     context: &'a JournalContext,
     journal: &'a ObservationJournal,
@@ -33,6 +34,13 @@ impl CaseEffectRequest<'_> {
     #[must_use]
     pub const fn action(&self) -> &PlannedAction {
         self.action
+    }
+
+    #[must_use]
+    pub fn input(&self, slot: CaseInputSlot) -> Option<&CaseCapturedValue> {
+        self.inputs
+            .iter()
+            .find_map(|(candidate, value)| (*candidate == slot).then_some(value))
     }
 
     #[must_use]
@@ -129,6 +137,8 @@ where
 {
     let required_outputs = CaseTraceMaterializer::required_outputs(planned_case)
         .map_err(CaseExecutionError::InvalidPlan)?;
+    let required_inputs = CaseTraceMaterializer::required_inputs(planned_case)
+        .map_err(CaseExecutionError::InvalidPlan)?;
     let run_id = run_id.into();
     let case_id = case_id.into();
     let contexts = planned_case
@@ -151,6 +161,7 @@ where
     let execution = run_actions(
         planned_case,
         &contexts,
+        &required_inputs,
         &required_outputs,
         &journal,
         adapter,
@@ -179,6 +190,7 @@ where
 async fn run_actions<A>(
     planned_case: &PlannedCase,
     contexts: &[JournalContext],
+    required_inputs: &[CaseInputBinding],
     required_outputs: &[CaseOutputRef],
     journal: &ObservationJournal,
     adapter: &mut A,
@@ -190,6 +202,7 @@ where
     let mut captured = Vec::new();
 
     for (index, (action, context)) in planned_case.actions().iter().zip(contexts).enumerate() {
+        let inputs = resolve_inputs(action.id(), required_inputs, &captured)?;
         let intent_sequence = observation_sequence(index, 1)?;
         journal
             .append(Observation::new(
@@ -210,6 +223,7 @@ where
         let observed = adapter
             .execute(CaseEffectRequest {
                 action,
+                inputs: &inputs,
                 expected_outputs: &expected_outputs,
                 context,
                 journal,
@@ -236,6 +250,30 @@ where
 
     CaseTraceMaterializer::materialize(planned_case, captured)
         .map_err(CaseExecutionCause::Materialization)
+}
+
+fn resolve_inputs<E>(
+    action_id: ActionId,
+    required_inputs: &[CaseInputBinding],
+    captured: &[(CaseOutputRef, CaseCapturedValue)],
+) -> Result<Vec<(CaseInputSlot, CaseCapturedValue)>, CaseExecutionCause<E>> {
+    required_inputs
+        .iter()
+        .copied()
+        .filter(|binding| binding.action_id() == action_id)
+        .map(|binding| {
+            let value = captured
+                .iter()
+                .find_map(|(output_ref, value)| {
+                    (*output_ref == binding.source()).then_some(value.clone())
+                })
+                .ok_or(CaseExecutionCause::MissingResolvedInput {
+                    action_id,
+                    input: binding.slot(),
+                })?;
+            Ok((binding.slot(), value))
+        })
+        .collect()
 }
 
 fn validate_captures(
@@ -301,6 +339,10 @@ pub enum CaseExecutionCause<E> {
     Effect(E),
     Capture(CaseCaptureError),
     Materialization(CaseTraceMaterializationError),
+    MissingResolvedInput {
+        action_id: ActionId,
+        input: CaseInputSlot,
+    },
     SequenceOverflow,
     Finalization,
 }

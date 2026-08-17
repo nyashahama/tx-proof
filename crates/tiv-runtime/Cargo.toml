@@ -25,6 +25,7 @@ bytes.workspace = true
 http-body-util.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
+tiv-reference-app = { path = "../../tests/reference-app" }
 tiv-stripe-pi = { path = "../tiv-stripe-pi" }
 
 [lints]

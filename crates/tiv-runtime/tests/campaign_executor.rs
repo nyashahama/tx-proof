@@ -2,8 +2,8 @@ use std::path::PathBuf;
 
 use tiv_core::{
     decision::Seed,
-    plan::{ActionBudget, CasePlanCompiler, PlanSpec},
-    trace::{CaseCapturedValue, CaseOutputSlot},
+    plan::{ActionBudget, CasePlanCompiler, PlanActionKind, PlanSpec},
+    trace::{CaseCapturedValue, CaseInputSlot, CaseOutputSlot},
 };
 use tiv_runtime::campaign::{
     CaseCaptureError, CaseEffectAdapter, CaseEffectFuture, CaseEffectRequest, CaseExecutionCause,
@@ -45,6 +45,20 @@ impl CaseEffectAdapter for RecordingAdapter {
             let last: serde_json::Value = serde_json::from_str(records.last().unwrap()).unwrap();
             assert_eq!(last["observation_kind"], serde_json::json!("action_intent"));
             assert_eq!(last["action_id"], serde_json::json!(request.action().id()));
+            match request.action().kind() {
+                PlanActionKind::RetrievePaymentIntent
+                | PlanActionKind::ConfirmPaymentIntent { .. }
+                | PlanActionKind::RetryProviderRequest { .. }
+                | PlanActionKind::GenerateProviderEvent => assert!(
+                    request.input(CaseInputSlot::PaymentIntentId).is_some(),
+                    "provider actions receive the exact previously captured PaymentIntent"
+                ),
+                PlanActionKind::ReleaseProviderGate => assert!(
+                    request.input(CaseInputSlot::ProviderGateId).is_some(),
+                    "release receives the exact previously captured gate"
+                ),
+                _ => {}
+            }
 
             let call = self.calls;
             self.calls += 1;

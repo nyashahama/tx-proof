@@ -1288,6 +1288,7 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tiv-core",
+ "tiv-reference-app",
  "tiv-stripe-pi",
  "tokio",
  "tokio-postgres",

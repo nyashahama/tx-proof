@@ -325,6 +325,18 @@ PaymentIntent output in the compiled trace. The terminal script outcome drives
 the next business phase, while ambiguity and provider-object cardinality include
 every call in the script.
 
+Before an effect executes, the runtime resolves every occurrence-indexed input
+binding from prior captures and passes the exact value to the adapter. Provider
+retrieval and confirmation therefore operate on the PaymentIntent named by the
+compiled trace; they never rediscover an implicit "active" object.
+
+The loopback provider HTTP adapter checks both sides of every planned outcome:
+the driver/provider status or transport result, and the fixture state delta.
+That includes exact fault-queue consumption, object cardinality and identity,
+operation metadata, confirmation status, held-gate lifecycle, and the invariant
+that retrieval consumes no fault. A mismatch is an execution failure rather
+than an accepted approximation.
+
 ### Fixture
 
 The fixture is a single-writer actor. Its state includes:
