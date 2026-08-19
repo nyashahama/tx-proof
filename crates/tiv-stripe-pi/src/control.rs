@@ -1,4 +1,4 @@
-use std::{error::Error, fmt, sync::Arc};
+use std::{error::Error, fmt, net::IpAddr, sync::Arc, time::Duration};
 
 use bytes::Bytes;
 use http_body_util::{BodyExt as _, Full, Limited};
@@ -10,6 +10,7 @@ use hyper::{
     service::service_fn,
 };
 use hyper_util::rt::TokioIo;
+use reqwest::{Client, Url, redirect::Policy};
 use serde::Deserialize;
 use tiv_core::decision::Seed;
 use tokio::{net::TcpStream, sync::Mutex};
@@ -18,6 +19,7 @@ use crate::{FaultOutcome, FixtureServiceError, GateId, ManagedFixture};
 
 const MAX_CONTROL_BODY_BYTES: usize = 16 * 1024;
 const CONTROL_TOKEN_HEADER: &str = "x-tiv-control-token";
+const MAX_WEBHOOK_TIMEOUT: Duration = Duration::from_secs(30);
 
 type ResponseBody = Full<Bytes>;
 
@@ -70,6 +72,93 @@ impl WebhookSigningSecret {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct InvalidSecret;
 
+/// Validated application webhook target owned by the fixture data plane.
+#[derive(Clone)]
+pub struct WebhookTarget {
+    url: Url,
+    client: Client,
+}
+
+impl WebhookTarget {
+    /// Creates a redirect-free client for one bounded HTTP webhook target.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidWebhookTarget`] unless the target is an explicit HTTP
+    /// URL without credentials, query, or fragment and the timeout is bounded.
+    pub fn new(value: impl AsRef<str>, timeout: Duration) -> Result<Self, InvalidWebhookTarget> {
+        let value = value.as_ref();
+        let url = Url::parse(value).map_err(|_| InvalidWebhookTarget)?;
+        let safe_host = url.host_str().is_some_and(safe_webhook_host);
+        if value.chars().any(char::is_whitespace)
+            || url.scheme() != "http"
+            || !safe_host
+            || url.port().is_none()
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+            || matches!(url.path(), "" | "/")
+            || timeout.is_zero()
+            || timeout > MAX_WEBHOOK_TIMEOUT
+        {
+            return Err(InvalidWebhookTarget);
+        }
+        let client = Client::builder()
+            .no_proxy()
+            .redirect(Policy::none())
+            .connect_timeout(timeout)
+            .timeout(timeout)
+            .build()
+            .map_err(|_| InvalidWebhookTarget)?;
+        Ok(Self { url, client })
+    }
+
+    async fn deliver(
+        &self,
+        attempt: &crate::SignedWebhookAttempt,
+    ) -> Result<u16, WebhookDeliveryError> {
+        let raw_body =
+            hex::decode(attempt.raw_body_hex()).map_err(|_| WebhookDeliveryError::InvalidBody)?;
+        let response = self
+            .client
+            .post(self.url.clone())
+            .header(CONTENT_TYPE, "application/json")
+            .header("Stripe-Signature", attempt.signature_header())
+            .body(raw_body)
+            .send()
+            .await
+            .map_err(WebhookDeliveryError::Request)?;
+        Ok(response.status().as_u16())
+    }
+}
+
+fn safe_webhook_host(host: &str) -> bool {
+    if host == "localhost" {
+        return true;
+    }
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return ip.is_loopback();
+    }
+    host.len() <= 63
+        && !host.contains('.')
+        && host
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        && host.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_')
+        })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InvalidWebhookTarget;
+
+enum WebhookDeliveryError {
+    InvalidBody,
+    Request(reqwest::Error),
+}
+
 /// Serves one HTTP/1 connection on the fixture's isolated control listener.
 ///
 /// # Errors
@@ -81,6 +170,7 @@ pub async fn serve_http1_connection(
     fixture: Arc<Mutex<ManagedFixture>>,
     token: ControlToken,
     webhook_secret: WebhookSigningSecret,
+    webhook_target: WebhookTarget,
 ) -> Result<(), hyper::Error> {
     let service = service_fn(move |request| {
         handle_request(
@@ -88,6 +178,7 @@ pub async fn serve_http1_connection(
             Arc::clone(&fixture),
             token.clone(),
             webhook_secret.clone(),
+            webhook_target.clone(),
         )
     });
     http1::Builder::new()
@@ -100,6 +191,7 @@ async fn handle_request(
     fixture: Arc<Mutex<ManagedFixture>>,
     token: ControlToken,
     webhook_secret: WebhookSigningSecret,
+    webhook_target: WebhookTarget,
 ) -> Result<Response<ResponseBody>, ControlHttpError> {
     if request.method() == Method::GET && request.uri().path() == "/health" {
         return json_response(StatusCode::OK, &serde_json::json!({"protocol_version": 1}));
@@ -141,6 +233,19 @@ async fn handle_request(
             );
             service_result(result)
         }
+        (&Method::POST, "/v1/control/generate-event") => {
+            let Some(command) = decode_json::<GenerateEventCommand>(request).await else {
+                return Ok(text_response(StatusCode::BAD_REQUEST, "invalid command"));
+            };
+            let result = fixture
+                .lock()
+                .await
+                .generate_event(command.command_sequence, &command.payment_intent_id);
+            service_result(result)
+        }
+        (&Method::POST, "/v1/control/deliver-event") => {
+            handle_deliver_event(request, fixture, &webhook_secret, &webhook_target).await
+        }
         (&Method::POST, "/v1/control/release-gate") => {
             let Some(command) = decode_json::<ReleaseGateCommand>(request).await else {
                 return Ok(text_response(StatusCode::BAD_REQUEST, "invalid command"));
@@ -153,6 +258,52 @@ async fn handle_request(
         }
         _ => Ok(text_response(StatusCode::NOT_FOUND, "not found")),
     }
+}
+
+async fn handle_deliver_event(
+    request: Request<Incoming>,
+    fixture: Arc<Mutex<ManagedFixture>>,
+    webhook_secret: &WebhookSigningSecret,
+    webhook_target: &WebhookTarget,
+) -> Result<Response<ResponseBody>, ControlHttpError> {
+    let Some(command) = decode_json::<DeliverEventCommand>(request).await else {
+        return Ok(text_response(StatusCode::BAD_REQUEST, "invalid command"));
+    };
+    let attempt = fixture.lock().await.sign_event(
+        command.command_sequence,
+        &command.event_id,
+        command.timestamp,
+        webhook_secret,
+    );
+    let attempt = match attempt {
+        Ok(attempt) => attempt,
+        Err(error) => return service_result::<crate::SignedWebhookAttempt>(Err(error)),
+    };
+    let status = match webhook_target.deliver(&attempt).await {
+        Ok(status) => status,
+        Err(WebhookDeliveryError::InvalidBody) => {
+            return Ok(text_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "fixture webhook body error",
+            ));
+        }
+        Err(WebhookDeliveryError::Request(error)) => {
+            let _ = error;
+            return Ok(text_response(
+                StatusCode::BAD_GATEWAY,
+                "webhook delivery failed",
+            ));
+        }
+    };
+    json_response(
+        StatusCode::OK,
+        &DeliveryResult {
+            command_sequence: command.command_sequence,
+            event_id: command.event_id,
+            timestamp: command.timestamp,
+            status,
+        },
+    )
 }
 
 async fn decode_json<T>(request: Request<Incoming>) -> Option<T>
@@ -191,6 +342,9 @@ where
         }
         Err(FixtureServiceError::GateNotFound) => {
             Ok(text_response(StatusCode::NOT_FOUND, "gate not found"))
+        }
+        Err(FixtureServiceError::EventNotFound) => {
+            Ok(text_response(StatusCode::NOT_FOUND, "event not found"))
         }
         Err(
             FixtureServiceError::CommandSequenceExhausted
@@ -239,6 +393,29 @@ struct ResetCommand {
 struct ConfirmAllCommand {
     command_sequence: u64,
     timestamp: i64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GenerateEventCommand {
+    command_sequence: u64,
+    payment_intent_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeliverEventCommand {
+    command_sequence: u64,
+    event_id: String,
+    timestamp: i64,
+}
+
+#[derive(serde::Serialize)]
+struct DeliveryResult {
+    command_sequence: u64,
+    event_id: String,
+    timestamp: i64,
+    status: u16,
 }
 
 #[derive(Deserialize)]

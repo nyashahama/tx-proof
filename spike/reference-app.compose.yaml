@@ -35,6 +35,7 @@ services:
       TIV_FIXTURE_CONTROL_TOKEN: run-scoped-control-token
       TIV_FIXTURE_DATA_BIND: fixture-data:12111
       TIV_WEBHOOK_SECRET: whsec_test_secret
+      TIV_WEBHOOK_URL: http://reference-app:18080/webhooks/stripe
     healthcheck:
       test: ["CMD", "tiv-stripe-pi-fixture", "healthcheck"]
       interval: 1s
@@ -72,7 +73,7 @@ services:
       TIV_POSTGRES_PASSWORD: tiv-app-local-only-password
       TIV_POSTGRES_PORT: "5432"
       TIV_POSTGRES_ROLE: tiv_app
-      TIV_REFERENCE_APP_BIND: reference-app-host:18080
+      TIV_REFERENCE_APP_BIND: 0.0.0.0:18080
       TIV_WEBHOOK_SECRET: whsec_test_secret
     healthcheck:
       test: ["CMD", "tiv-reference-app", "healthcheck"]

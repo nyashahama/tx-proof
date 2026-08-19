@@ -10,3 +10,4 @@ pub mod postgres;
 pub mod provider_http;
 pub mod reference_app;
 pub mod replay;
+pub mod webhook_http;

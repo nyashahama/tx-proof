@@ -28,7 +28,8 @@ use tiv_runtime::{
 use tiv_stripe_pi::{
     FaultOutcome, ManagedFixture,
     control::{
-        ControlToken, WebhookSigningSecret, serve_http1_connection as serve_control_connection,
+        ControlToken, WebhookSigningSecret, WebhookTarget,
+        serve_http1_connection as serve_control_connection,
     },
     http::serve_managed_http1_connection,
 };
@@ -726,6 +727,11 @@ async fn start_control_server(fixture: Arc<Mutex<ManagedFixture>>) -> (SocketAdd
                     fixture,
                     ControlToken::new("case-control-token").unwrap(),
                     WebhookSigningSecret::new(b"whsec_case_test").unwrap(),
+                    WebhookTarget::new(
+                        "http://127.0.0.1:9/webhooks/stripe",
+                        Duration::from_secs(1),
+                    )
+                    .unwrap(),
                 )
                 .await;
             });

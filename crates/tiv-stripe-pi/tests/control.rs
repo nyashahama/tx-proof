@@ -6,7 +6,7 @@ use tiv_core::decision::Seed;
 use tiv_stripe_pi::{
     CreatePaymentIntent, FaultOutcome, FixtureServiceError, IdempotencyKey,
     ManagedDataPlaneDisposition, ManagedFixture, OperationId,
-    control::{ControlToken, WebhookSigningSecret, serve_http1_connection},
+    control::{ControlToken, WebhookSigningSecret, WebhookTarget, serve_http1_connection},
     http::serve_managed_http1_connection,
 };
 use tokio::{net::TcpListener, sync::Mutex, time::timeout};
@@ -268,7 +268,7 @@ async fn the_control_listener_requires_its_run_scoped_token() {
     let server_fixture = Arc::clone(&fixture);
     let server = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.expect("a client connects");
-        serve_http1_connection(stream, server_fixture, token, secret)
+        serve_test_control(stream, server_fixture, token, secret)
             .await
             .expect("the control connection is served");
     });
@@ -352,7 +352,7 @@ async fn a_real_data_response_waits_for_its_observed_control_gate() {
             .accept()
             .await
             .expect("a control client connects");
-        serve_http1_connection(stream, control_fixture, token, secret)
+        serve_test_control(stream, control_fixture, token, secret)
             .await
             .expect("the control connection is served");
     });
@@ -420,6 +420,19 @@ async fn a_real_data_response_waits_for_its_observed_control_gate() {
     drop(control_client);
     join_server(data_server).await;
     join_server(control_server).await;
+}
+
+fn test_webhook_target() -> WebhookTarget {
+    WebhookTarget::new("http://127.0.0.1:9/webhooks/stripe", Duration::from_secs(1)).unwrap()
+}
+
+async fn serve_test_control(
+    stream: tokio::net::TcpStream,
+    fixture: Arc<Mutex<ManagedFixture>>,
+    token: ControlToken,
+    secret: WebhookSigningSecret,
+) -> Result<(), hyper::Error> {
+    serve_http1_connection(stream, fixture, token, secret, test_webhook_target()).await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -365,6 +365,21 @@ Webhook behavior:
 - order is controlled at the event-attempt layer, not at packet level;
 - a drop means no delivery before the declared reconciliation horizon.
 
+The implemented action-level control slice uses two exact, sequenced commands:
+`generate-event` confirms the PaymentIntent resolved from the compiled trace and
+captures its immutable event ID; `deliver-event` signs that exact event with a
+fresh timestamp and makes the fixture perform the application-facing HTTP
+request. The runtime keeps a deterministic per-case queue for delay, reorder,
+drop, delivery, and duplication. It never receives an application webhook URL
+or forwards the signed body itself. Both HTTP clients ignore ambient proxies,
+reject redirects, and use bounded timeouts. A non-2xx application response
+fails the delivery action without removing the pending event.
+
+This slice is proven through real loopback fixture and application endpoints,
+but is not yet wired into the live Compose campaign runner. Durable fixture
+delivery-attempt history, webhook cut-point gates, crash injection, and final
+oracle projection remain later integration boundaries.
+
 The proposed fixture topology has separate data and control listeners. The data listener is reachable by the SUT on an internal Compose network. The control listener is published only to loopback and requires an unlogged run token plus a monotonic command sequence. Control DTOs are versioned. The truth spike must prove that this protocol is necessary and portable before it becomes part of trace compatibility.
 
 Normal health/control HTTP can use ordinary request handling. The provider data path uses Hyper's lower-level connection API because `commit_then_close` must mutate the provider model and then end the TCP connection without manufacturing an HTTP response. The truth spike must prove the exact behavior against a real client before the abstraction is generalized.

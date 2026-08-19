@@ -660,6 +660,62 @@ impl ManagedFixture {
         })
     }
 
+    /// Confirms one exact provider object and exposes its immutable event.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an out-of-order command, an unknown provider
+    /// object, or an unexpected fixture failure.
+    pub fn generate_event(
+        &mut self,
+        command_sequence: u64,
+        payment_intent_id: &str,
+    ) -> Result<GeneratedEvent, FixtureServiceError> {
+        self.require_next_sequence(command_sequence)?;
+        self.fixture
+            .confirm(payment_intent_id)
+            .map_err(FixtureServiceError::Fixture)?;
+        let event = self
+            .fixture
+            .events()
+            .iter()
+            .find(|event| event.payment_intent_id() == payment_intent_id)
+            .ok_or(FixtureServiceError::EventNotFound)?;
+        self.command_sequence = command_sequence;
+        Ok(GeneratedEvent {
+            command_sequence,
+            event_id: event.id().to_owned(),
+            payment_intent_id: payment_intent_id.to_owned(),
+        })
+    }
+
+    /// Signs one exact immutable provider event for a fresh delivery attempt.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an out-of-order command, an unknown event, or a
+    /// signing failure.
+    pub fn sign_event(
+        &mut self,
+        command_sequence: u64,
+        event_id: &str,
+        timestamp: i64,
+        secret: &control::WebhookSigningSecret,
+    ) -> Result<SignedWebhookAttempt, FixtureServiceError> {
+        self.require_next_sequence(command_sequence)?;
+        let attempt = self
+            .fixture
+            .events()
+            .iter()
+            .find(|event| event.id() == event_id)
+            .ok_or(FixtureServiceError::EventNotFound)?
+            .webhook_attempt(timestamp, secret.as_bytes())
+            .map(SignedWebhookAttempt::from)
+            .map_err(FixtureServiceError::WebhookSignature)?;
+        self.command_sequence = command_sequence;
+        Ok(attempt)
+    }
+
     #[must_use]
     pub fn snapshot(&self) -> FixtureSnapshot {
         FixtureSnapshot {
@@ -792,6 +848,30 @@ pub struct ConfirmationResult {
     attempts: Vec<SignedWebhookAttempt>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct GeneratedEvent {
+    command_sequence: u64,
+    event_id: String,
+    payment_intent_id: String,
+}
+
+impl GeneratedEvent {
+    #[must_use]
+    pub const fn command_sequence(&self) -> u64 {
+        self.command_sequence
+    }
+
+    #[must_use]
+    pub fn event_id(&self) -> &str {
+        &self.event_id
+    }
+
+    #[must_use]
+    pub fn payment_intent_id(&self) -> &str {
+        &self.payment_intent_id
+    }
+}
+
 impl ConfirmationResult {
     #[must_use]
     pub const fn command_sequence(&self) -> u64 {
@@ -849,6 +929,7 @@ impl From<WebhookAttempt> for SignedWebhookAttempt {
 pub enum FixtureServiceError {
     CommandSequenceExhausted,
     EmptyFaultPlan,
+    EventNotFound,
     FaultPlanExhausted,
     GateNotFound,
     GateSequenceExhausted,
