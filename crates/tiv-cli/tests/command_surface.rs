@@ -142,6 +142,8 @@ fn the_cli_exposes_an_attested_planned_reference_case_run() {
         "planned-case.json",
         "--journal",
         "artifacts/case.jsonl",
+        "--config",
+        "safe/tiv.toml",
         "--postgres-port",
         "15432",
         "--reference-app-url",
@@ -157,6 +159,7 @@ fn the_cli_exposes_an_attested_planned_reference_case_run() {
             command: ReplayCommand::ReferenceAppCase(ReferenceAppCaseArgs {
                 plan: "planned-case.json".into(),
                 journal: "artifacts/case.jsonl".into(),
+                config: Some("safe/tiv.toml".into()),
                 postgres_port: 15_432,
                 postgres_admin_role: "tiv_admin".to_owned(),
                 reference_app_url: "http://127.0.0.1:18080".to_owned(),

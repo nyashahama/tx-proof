@@ -42,7 +42,10 @@ fn configured_sql_probe_loads_the_repository_file_and_runtime_boundary() {
     let probe = load_configured_sql_probe(&config)
         .expect("the configured repository predicate satisfies the probe contract");
 
-    assert_eq!(probe.query().sql(), "SELECT FALSE AS release_kill");
+    assert_eq!(
+        probe.query().sql(),
+        "SELECT current_user = 'tiv_invariant'\n   AND EXISTS (\n       SELECT 1\n       FROM payments\n       WHERE amount_minor = 2500\n         AND currency = 'usd'\n   ) AS release_kill"
+    );
     assert_eq!(probe.role().as_str(), "tiv_invariant");
     assert_eq!(probe.budgets().statement_timeout().as_millis(), 2_000);
     assert_eq!(probe.budgets().lock_timeout().as_millis(), 500);

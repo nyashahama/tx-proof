@@ -1,12 +1,48 @@
 use std::{process::Command, time::SystemTime};
 
+use clap::Parser;
+use tiv_cli::{Cli, CliError, execute_async};
 use tiv_core::{
     decision::Seed,
     plan::{
-        ActionBudget, CasePlanCompiler, PlanActionKind, PlanSpec, ProcessCutPoint,
+        ActionBudget, CasePlanCompiler, PlanActionKind, PlanSpec, PlannedCase, ProcessCutPoint,
         ProcessFaultSpec, ProviderOutcome, WebhookFaultSpec,
     },
 };
+
+#[tokio::test]
+async fn sql_probe_case_requires_project_config_before_credentials_or_stack_access() {
+    let plan = sql_probe_plan();
+    let nonce = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let plan_path = std::env::temp_dir().join(format!(
+        "tiv-missing-sql-probe-config-{}-{nonce}.json",
+        std::process::id()
+    ));
+    std::fs::write(&plan_path, serde_json::to_vec_pretty(&plan).unwrap()).unwrap();
+    let cli = Cli::try_parse_from([
+        "tiv",
+        "replay",
+        "reference-app-case",
+        "--plan",
+        plan_path.to_str().unwrap(),
+        "--journal",
+        "unused.jsonl",
+        "--reference-app-url",
+        "http://127.0.0.1:18080",
+        "--fixture-control-url",
+        "http://127.0.0.1:12112",
+    ])
+    .unwrap();
+
+    let error = execute_async(cli)
+        .await
+        .expect_err("SQL probe execution without project config must fail closed");
+    assert!(matches!(error, CliError::MissingSqlProbeConfig));
+    std::fs::remove_file(plan_path).unwrap();
+}
 
 #[test]
 #[ignore = "requires a fresh isolated reference-app Compose project"]
@@ -358,31 +394,7 @@ fn webhook_response_observed_kill_restarts_and_finishes_the_live_case() {
 #[test]
 #[ignore = "requires a fresh isolated reference-app Compose project"]
 fn sql_probe_kill_restarts_and_finishes_the_live_case() {
-    let plan = (0..4_096)
-        .find_map(|seed| {
-            let spec = PlanSpec::new_payment_intent_v1(
-                Seed::new(seed),
-                ActionBudget::new(40).unwrap(),
-                [ProviderOutcome::Normal],
-                WebhookFaultSpec::new(0, [], false, false).unwrap(),
-                ProcessFaultSpec::new([ProcessCutPoint::SqlProbe], 1).unwrap(),
-            )
-            .unwrap();
-            let plan = CasePlanCompiler::compile(&spec).unwrap();
-            plan.actions()
-                .windows(2)
-                .any(|actions| {
-                    matches!(actions[0].kind(), PlanActionKind::DriveCheckout { .. })
-                        && matches!(
-                            actions[1].kind(),
-                            PlanActionKind::KillApplication {
-                                cut_point: ProcessCutPoint::SqlProbe
-                            }
-                        )
-                })
-                .then_some(plan)
-        })
-        .expect("the seed corpus contains a checkout-owned SQL probe cut point");
+    let plan = sql_probe_plan();
     let nonce = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap()
@@ -395,6 +407,10 @@ fn sql_probe_kill_restarts_and_finishes_the_live_case() {
         "tiv-reference-sql-probe-case-{}-{nonce}.jsonl",
         std::process::id()
     ));
+    let config_path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/golden/doctor-project/tiv.toml"
+    );
     std::fs::write(&plan_path, serde_json::to_vec_pretty(&plan).unwrap()).unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_tiv"))
         .args([
@@ -404,6 +420,8 @@ fn sql_probe_kill_restarts_and_finishes_the_live_case() {
             plan_path.to_str().unwrap(),
             "--journal",
             journal_path.to_str().unwrap(),
+            "--config",
+            config_path,
             "--postgres-port",
             "15432",
             "--reference-app-url",
@@ -417,6 +435,15 @@ fn sql_probe_kill_restarts_and_finishes_the_live_case() {
             "TIV_POSTGRES_APPLICATION_PASSWORD",
             "tiv-app-local-only-password",
         )
+        .env(
+            "TIV_POSTGRES_ADMIN_URL",
+            "postgresql://tiv_admin:tiv-local-only-password@127.0.0.1:15432/postgres",
+        )
+        .env(
+            "DATABASE_URL",
+            "postgresql://tiv_app:tiv-app-local-only-password@127.0.0.1:15432/tiv_case_checkout",
+        )
+        .env("TIV_STRIPE_WEBHOOK_SECRET", "whsec_reference-canary")
         .env("DOCKER_HOST", "tcp://127.0.0.1:9")
         .env("DOCKER_CONTEXT", "intentionally-remote")
         .env("HTTP_PROXY", "http://127.0.0.1:9")
@@ -457,4 +484,32 @@ fn sql_probe_kill_restarts_and_finishes_the_live_case() {
     std::fs::remove_file(journal_path).unwrap();
     std::fs::remove_file(plan_path).unwrap();
     assert!(!String::from_utf8_lossy(&output.stdout).contains("password"));
+}
+
+fn sql_probe_plan() -> PlannedCase {
+    (0..4_096)
+        .find_map(|seed| {
+            let spec = PlanSpec::new_payment_intent_v1(
+                Seed::new(seed),
+                ActionBudget::new(40).unwrap(),
+                [ProviderOutcome::Normal],
+                WebhookFaultSpec::new(0, [], false, false).unwrap(),
+                ProcessFaultSpec::new([ProcessCutPoint::SqlProbe], 1).unwrap(),
+            )
+            .unwrap();
+            let plan = CasePlanCompiler::compile(&spec).unwrap();
+            plan.actions()
+                .windows(2)
+                .any(|actions| {
+                    matches!(actions[0].kind(), PlanActionKind::DriveCheckout { .. })
+                        && matches!(
+                            actions[1].kind(),
+                            PlanActionKind::KillApplication {
+                                cut_point: ProcessCutPoint::SqlProbe
+                            }
+                        )
+                })
+                .then_some(plan)
+        })
+        .expect("the seed corpus contains a checkout-owned SQL probe cut point")
 }

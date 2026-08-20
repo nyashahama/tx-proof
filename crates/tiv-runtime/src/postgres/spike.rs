@@ -10,6 +10,7 @@ use super::{
     oracle::{
         OracleError, ProviderPaymentIntent, QuiescencePermit, SnapshotReport, run_reference_oracle,
     },
+    probe::{ConfiguredSqlProbe, SqlProbe, SqlProbeError},
     safety::{
         ComposeProjectId, DatabaseEndpoint, DatabaseIdentity, DatabaseKind, DatabaseMarker,
         DatabaseName, DatabaseTarget, InvalidDatabaseIdentity, InvalidDatabaseName, MarkerKind,
@@ -330,20 +331,18 @@ impl TruthSpikePostgres {
         result
     }
 
-    /// Opens the fixed read-only payment predicate used by the synthetic
-    /// reference application's SQL process cut point.
-    pub(crate) async fn reference_payment_probe(
+    /// Opens the configured repository-owned predicate against one freshly
+    /// attested reference case database.
+    pub(crate) async fn configured_sql_probe(
         &self,
         expected: &DatabaseTarget<Unverified>,
-        operation_id: &str,
+        configured: ConfiguredSqlProbe,
         timeout: Duration,
         poll_interval: Duration,
-    ) -> Result<ReferencePaymentSqlProbe, SpikePostgresError> {
+    ) -> Result<ReferenceSqlProbe, SpikePostgresError> {
         let case_name = expected.identity().database_name();
-        let expected_operation =
-            format!("op_{}", case_name.as_str().trim_start_matches("tiv_case_"));
         if case_name.kind() != DatabaseKind::Case
-            || operation_id != expected_operation
+            || configured.role().as_str() != INVARIANT_ROLE
             || timeout.is_zero()
             || poll_interval.is_zero()
             || poll_interval >= timeout
@@ -368,13 +367,11 @@ impl TruthSpikePostgres {
         {
             return Err(SpikePostgresError::UnexpectedServerIdentity);
         }
-        Ok(ReferencePaymentSqlProbe {
+        Ok(ReferenceSqlProbe {
             session,
-            operation_id: operation_id.to_owned(),
+            probe: configured.into_probe(),
             timeout,
             poll_interval,
-            armed: false,
-            observed: false,
         })
     }
 
@@ -1168,75 +1165,34 @@ struct PostgresSession {
     connection: Option<JoinHandle<Result<(), tokio_postgres::Error>>>,
 }
 
-/// One bounded `PostgreSQL` observer for the reference payment-row transition.
-pub(crate) struct ReferencePaymentSqlProbe {
+/// One bounded configured `PostgreSQL` observer for a reference case.
+pub(crate) struct ReferenceSqlProbe {
     session: PostgresSession,
-    operation_id: String,
+    probe: SqlProbe,
     timeout: Duration,
     poll_interval: Duration,
-    armed: bool,
-    observed: bool,
 }
 
-impl ReferencePaymentSqlProbe {
-    /// Proves the payment predicate is false immediately before the owning
-    /// checkout action begins.
+impl ReferenceSqlProbe {
+    /// Proves the repository predicate is false immediately before the owning
+    /// application action begins.
     pub(crate) async fn require_false(&mut self) -> Result<(), SpikePostgresError> {
-        if self.armed || self.observed || self.payment_exists().await? {
-            return Err(SpikePostgresError::SqlProbeDidNotBeginFalse);
-        }
-        self.armed = true;
-        Ok(())
+        self.probe
+            .require_false(self.session.client())
+            .await
+            .map_err(SpikePostgresError::SqlProbe)
     }
 
-    /// Observes the armed predicate's first true value through the non-login
-    /// invariant role.
+    /// Observes the repository predicate's first committed true value.
     pub(crate) async fn observe_true(&mut self) -> Result<(), SpikePostgresError> {
-        if !self.armed || self.observed {
-            return Err(SpikePostgresError::SqlProbeNotArmed);
-        }
-        tokio::time::timeout(self.timeout, async {
-            loop {
-                if self.payment_exists().await? {
-                    self.observed = true;
-                    return Ok(());
-                }
-                tokio::time::sleep(self.poll_interval).await;
-            }
-        })
-        .await
-        .map_err(|_| SpikePostgresError::SqlProbeTimeout)?
+        self.probe
+            .observe_true(self.session.client(), self.timeout, self.poll_interval)
+            .await
+            .map_err(SpikePostgresError::SqlProbe)
     }
 
     pub(crate) const fn observed(&self) -> bool {
-        self.observed
-    }
-
-    async fn payment_exists(&mut self) -> Result<bool, SpikePostgresError> {
-        let transaction = self.session.client().transaction().await?;
-        transaction
-            .batch_execute(
-                "SET TRANSACTION READ ONLY; \
-                 SET LOCAL statement_timeout = '2s'; \
-                 SET LOCAL lock_timeout = '100ms'; \
-                 SET LOCAL ROLE tiv_invariant",
-            )
-            .await?;
-        let row = transaction
-            .query_one(
-                "SELECT current_user, EXISTS ( \
-                     SELECT 1 FROM payments WHERE operation_id = $1 \
-                 )",
-                &[&self.operation_id],
-            )
-            .await?;
-        let role = row.get::<_, &str>(0);
-        let exists = row.get::<_, bool>(1);
-        transaction.rollback().await?;
-        if role != INVARIANT_ROLE {
-            return Err(SpikePostgresError::UnexpectedSqlProbeRole);
-        }
-        Ok(exists)
+        self.probe.observed()
     }
 }
 
@@ -1296,14 +1252,8 @@ pub enum SpikePostgresError {
     UnsafeInvariantRole,
     #[error("invalid reference SQL probe configuration")]
     InvalidSqlProbeConfiguration,
-    #[error("the reference SQL probe predicate did not begin false")]
-    SqlProbeDidNotBeginFalse,
-    #[error("the reference SQL probe was not armed exactly once")]
-    SqlProbeNotArmed,
-    #[error("the reference SQL probe did not become true before its deadline")]
-    SqlProbeTimeout,
-    #[error("the reference SQL probe did not execute as the invariant role")]
-    UnexpectedSqlProbeRole,
+    #[error("the configured reference SQL probe failed: {0}")]
+    SqlProbe(#[source] SqlProbeError),
     #[cfg(test)]
     #[error("the synthetic bug requires two distinct provider objects")]
     InvalidBugState,

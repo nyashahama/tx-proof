@@ -9,12 +9,18 @@ use std::{
 use clap::{Args, Parser, Subcommand};
 use serde::Serialize;
 use thiserror::Error;
-use tiv_core::{plan::PlannedCase, trace::CompiledTrace};
+use tiv_core::{
+    plan::{PlanActionKind, PlannedCase, ProcessCutPoint},
+    trace::CompiledTrace,
+};
 use tiv_runtime::{
-    config::ProcessEnvironment,
+    config::{ConfigError, ProcessEnvironment, load_resolved_config},
     doctor::{DoctorError, run_doctor},
     init::{InitError, initialize_project},
-    postgres::safety::DatabaseName,
+    postgres::{
+        probe::{ConfiguredSqlProbeError, load_configured_sql_probe},
+        safety::DatabaseName,
+    },
     reference_app::{
         ReferenceAppEvidenceConfig, ReferenceAppEvidenceConfigError, ReferenceAppEvidenceError,
         run_reference_app_evidence, run_reference_app_planned_case,
@@ -134,6 +140,9 @@ pub struct ReferenceAppCaseArgs {
     /// New JSON-lines observation journal path for this case.
     #[arg(long)]
     pub journal: PathBuf,
+    /// Typed project configuration required by configured SQL-probe cut points.
+    #[arg(long)]
+    pub config: Option<PathBuf>,
     /// Loopback host port for the isolated `PostgreSQL` service.
     #[arg(long, default_value_t = 15_432)]
     pub postgres_port: u16,
@@ -248,6 +257,7 @@ pub async fn execute_async(cli: Cli) -> Result<String, CliError> {
             let document = read_trace_document(&args.plan)?;
             let plan: PlannedCase =
                 serde_json::from_str(&document).map_err(CliError::InvalidPlannedCase)?;
+            let configured_sql_probe = configured_sql_probe(&plan, args.config.as_ref())?;
             let admin_password = required_env("TIV_POSTGRES_ADMIN_PASSWORD")?;
             let application_password = required_env("TIV_POSTGRES_APPLICATION_PASSWORD")?;
             let fixture_control_token = required_env("TIV_FIXTURE_CONTROL_TOKEN")?;
@@ -261,7 +271,9 @@ pub async fn execute_async(cli: Cli) -> Result<String, CliError> {
                 fixture_control_token,
             )
             .await?;
-            let evidence = run_reference_app_planned_case(&plan, &config, args.journal).await?;
+            let evidence =
+                run_reference_app_planned_case(&plan, &config, args.journal, configured_sql_probe)
+                    .await?;
             evidence.to_pretty_json().map_err(CliError::Encode)
         }
         read_only => execute(Cli { command: read_only }),
@@ -299,6 +311,28 @@ fn required_env(name: &'static str) -> Result<String, CliError> {
     std::env::var(name).map_err(|_| CliError::MissingEnvironmentVariable(name))
 }
 
+fn configured_sql_probe(
+    plan: &PlannedCase,
+    config_path: Option<&PathBuf>,
+) -> Result<Option<tiv_runtime::postgres::probe::ConfiguredSqlProbe>, CliError> {
+    let required = plan.actions().iter().any(|action| {
+        matches!(
+            action.kind(),
+            PlanActionKind::KillApplication {
+                cut_point: ProcessCutPoint::SqlProbe
+            }
+        )
+    });
+    if !required {
+        return Ok(None);
+    }
+    let path = config_path.ok_or(CliError::MissingSqlProbeConfig)?;
+    let config = load_resolved_config(path, &ProcessEnvironment)?;
+    load_configured_sql_probe(&config)
+        .map(Some)
+        .map_err(CliError::ConfiguredSqlProbe)
+}
+
 fn current_unix_timestamp() -> Result<i64, CliError> {
     let seconds = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -332,6 +366,12 @@ pub enum CliError {
     InvalidCaseDatabase,
     #[error("required environment variable {0} is missing or invalid")]
     MissingEnvironmentVariable(&'static str),
+    #[error("a SQL-probe planned case requires --config")]
+    MissingSqlProbeConfig,
+    #[error("project configuration is invalid: {0}")]
+    Config(#[from] ConfigError),
+    #[error("configured SQL probe is invalid: {0}")]
+    ConfiguredSqlProbe(#[source] ConfiguredSqlProbeError),
     #[error("the system clock could not produce a valid webhook timestamp")]
     InvalidSystemTime,
     #[error("reference app replay configuration is invalid: {0}")]

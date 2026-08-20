@@ -25,10 +25,9 @@ use crate::{
     evidence::{EvidenceError, TruthSpikeEvidence},
     postgres::{
         oracle::{InvariantVerdict, ProviderPaymentIntent, QuiescencePermit, SnapshotReport},
+        probe::ConfiguredSqlProbe,
         safety::{ComposeProjectId, DatabaseName, DatabaseTarget, Unverified},
-        spike::{
-            ReferencePaymentSqlProbe, SpikePostgresConfig, SpikePostgresError, TruthSpikePostgres,
-        },
+        spike::{ReferenceSqlProbe, SpikePostgresConfig, SpikePostgresError, TruthSpikePostgres},
     },
     reference_case::{
         ReferenceCaseRunConfig, ReferenceCaseRunConfigError, ReferenceCaseRunError,
@@ -630,8 +629,9 @@ pub async fn run_reference_app_planned_case(
     planned_case: &PlannedCase,
     config: &ReferenceAppEvidenceConfig,
     journal_path: impl AsRef<Path>,
+    configured_sql_probe: Option<ConfiguredSqlProbe>,
 ) -> Result<ReferencePlannedCaseEvidence, ReferenceAppEvidenceError> {
-    preflight_reference_planned_case(planned_case, true, true)?;
+    preflight_reference_planned_case(planned_case, true, configured_sql_probe.is_some())?;
     let observed_stack = attest_reference_stack(
         config.postgres_port,
         &config.reference_app_url,
@@ -676,7 +676,8 @@ pub async fn run_reference_app_planned_case(
         .map_err(ReferenceAppEvidenceError::postgres)?;
     let database_oid = case_target.identity().database_oid();
     let operation_id = reference_operation_id(&case_name);
-    let mut sql_probe = reference_case_sql_probe(&postgres, &case_target, &operation_id).await?;
+    let mut sql_probe =
+        reference_case_sql_probe(&postgres, &case_target, configured_sql_probe).await?;
     let timestamp = current_unix_timestamp()?;
     let run_config = ReferenceCaseRunConfig::new(
         &case_name,
@@ -699,7 +700,7 @@ pub async fn run_reference_app_planned_case(
         journal_path,
         run_config,
         &mut process,
-        &mut sql_probe,
+        sql_probe.as_mut(),
     )
     .await?;
     let executed_action_count = receipt.executed().trace().action_count();
@@ -733,17 +734,21 @@ pub async fn run_reference_app_planned_case(
 async fn reference_case_sql_probe(
     postgres: &TruthSpikePostgres,
     case_target: &DatabaseTarget<Unverified>,
-    operation_id: &str,
-) -> Result<ReferencePaymentSqlProbe, ReferenceAppEvidenceError> {
-    postgres
-        .reference_payment_probe(
-            case_target,
-            operation_id,
-            Duration::from_secs(10),
-            Duration::from_millis(10),
-        )
-        .await
-        .map_err(ReferenceAppEvidenceError::postgres)
+    configured: Option<ConfiguredSqlProbe>,
+) -> Result<Option<ReferenceSqlProbe>, ReferenceAppEvidenceError> {
+    match configured {
+        Some(configured) => postgres
+            .configured_sql_probe(
+                case_target,
+                configured,
+                Duration::from_secs(10),
+                Duration::from_millis(10),
+            )
+            .await
+            .map(Some)
+            .map_err(ReferenceAppEvidenceError::postgres),
+        None => Ok(None),
+    }
 }
 
 async fn fixture_control_sequence(

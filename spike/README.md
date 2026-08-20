@@ -143,12 +143,15 @@ TIV_POSTGRES_APPLICATION_PASSWORD=tiv-app-local-only-password \
 ```
 
 The runner implements `client_request_forwarded`, supported application
-`client_response_observed`, fixture `webhook_response_observed`, and the fixed
-reference payment-row `sql_probe` placement. It SIGKILLs the exact attested
+`client_response_observed`, fixture `webhook_response_observed`, and a
+repository-owned `sql_probe` loaded from the typed project configuration.
+Plans containing that cut point must pass `--config <path>` and provide the
+configuration's referenced environment variables. The probe must begin false,
+then become true in a committed read-only snapshot before the runner SIGKILLs the exact attested
 application container, proves it stopped, starts the same container, waits for
 HTTP health and full stack re-attestation, and then continues the durable
-journal. Webhook-request, configured customer SQL, and abstract process-cut
-placements fail before stack or database mutation.
+journal. Webhook-request and abstract process-cut placements fail before stack
+or database mutation.
 
 The command provisions a generated case database, installs a sequenced
 `commit_then_close`/`normal` fault plan, drives the application checkout, signs

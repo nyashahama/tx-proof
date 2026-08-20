@@ -444,8 +444,10 @@ and then releases or closes the held operation according to the trace. The
 current reference runner implements `client_request_forwarded`, the
 application-checkout form of `client_response_observed`, and the
 fixture-delivery form of `webhook_response_observed`. It also implements the
-reference checkout's fixed payment-row `sql_probe`; this does not yet execute
-the general configured `sql_probe_file`. The runner uses
+repository-owned `sql_probe_file` resolved from the typed project
+configuration. The predicate must be parameter-free, begin false immediately
+before its owning action, and first become true through a committed read-only
+snapshot under the freshly attested invariant role. The runner uses
 the already-attested local Docker container ID rather than ambient Docker
 context. Restart starts that exact stopped container, then repeats full Docker
 attestation and application-health checks before execution continues.

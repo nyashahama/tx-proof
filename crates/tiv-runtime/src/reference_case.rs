@@ -18,7 +18,7 @@ use crate::{
     postgres::{
         oracle::{ProviderPaymentIntent, QuiescencePermit},
         safety::{DatabaseKind, DatabaseName},
-        spike::ReferencePaymentSqlProbe,
+        spike::ReferenceSqlProbe,
     },
     provider_http::{
         ProviderHttpAdapter, ProviderHttpConfig, ProviderHttpConfigError, ProviderHttpError,
@@ -189,7 +189,7 @@ pub(crate) async fn run_reference_planned_case_with_process(
     journal_path: impl AsRef<Path>,
     config: ReferenceCaseRunConfig,
     process: &mut dyn ReferenceProcessControl,
-    sql_probe: &mut ReferencePaymentSqlProbe,
+    sql_probe: Option<&mut ReferenceSqlProbe>,
 ) -> Result<ReferenceCaseRunReceipt, ReferenceCaseRunError> {
     run_reference_planned_case_inner(
         run_id,
@@ -198,7 +198,7 @@ pub(crate) async fn run_reference_planned_case_with_process(
         journal_path,
         config,
         Some(process),
-        Some(sql_probe),
+        sql_probe,
     )
     .await
 }
@@ -210,7 +210,7 @@ async fn run_reference_planned_case_inner<'a>(
     journal_path: impl AsRef<Path>,
     config: ReferenceCaseRunConfig,
     process: Option<&'a mut dyn ReferenceProcessControl>,
-    sql_probe: Option<&'a mut ReferencePaymentSqlProbe>,
+    sql_probe: Option<&'a mut ReferenceSqlProbe>,
 ) -> Result<ReferenceCaseRunReceipt, ReferenceCaseRunError> {
     preflight_reference_planned_case(planned_case, process.is_some(), sql_probe.is_some())?;
     let client_response_cut_points = client_response_cut_point_actions(planned_case)?;
@@ -475,7 +475,7 @@ struct ResetResponse {
 pub struct ReferenceCaseAdapter<'a> {
     http: CaseHttpAdapter,
     process: Option<&'a mut dyn ReferenceProcessControl>,
-    sql_probe: Option<&'a mut ReferencePaymentSqlProbe>,
+    sql_probe: Option<&'a mut ReferenceSqlProbe>,
     sql_probe_action_ids: std::collections::BTreeSet<tiv_core::trace::ActionId>,
     postgres_producer_sequence: u64,
     sql_probe_observed: bool,
@@ -489,7 +489,7 @@ impl<'a> ReferenceCaseAdapter<'a> {
     pub(crate) const fn new(
         http: CaseHttpAdapter,
         process: Option<&'a mut dyn ReferenceProcessControl>,
-        sql_probe: Option<&'a mut ReferencePaymentSqlProbe>,
+        sql_probe: Option<&'a mut ReferenceSqlProbe>,
         sql_probe_action_ids: std::collections::BTreeSet<tiv_core::trace::ActionId>,
     ) -> Self {
         Self {
@@ -581,7 +581,7 @@ impl<'a> ReferenceCaseAdapter<'a> {
                 || !self
                     .sql_probe
                     .as_deref()
-                    .is_some_and(ReferencePaymentSqlProbe::observed)
+                    .is_some_and(ReferenceSqlProbe::observed)
             {
                 return Err(ReferenceCaseError::InvalidLifecycleOrder);
             }
