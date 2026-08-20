@@ -602,6 +602,9 @@ async fn handle_app_request(
     request: Request<Incoming>,
     app: Arc<ReferenceApp>,
 ) -> Result<Response<AppResponseBody>, AppHttpError> {
+    if provider_proxy_payment_intent_id(request.method(), request.uri().path()).is_some() {
+        return handle_provider_proxy(request, &app).await;
+    }
     match (request.method(), request.uri().path()) {
         (&Method::GET, "/health") => {
             json_response(StatusCode::OK, &serde_json::json!({"status": "ok"}))
@@ -614,6 +617,91 @@ async fn handle_app_request(
         (&Method::POST, "/webhooks/stripe") => handle_webhook(request, &app).await,
         _ => Ok(text_response(StatusCode::NOT_FOUND, "not found")),
     }
+}
+
+async fn handle_provider_proxy(
+    request: Request<Incoming>,
+    app: &ReferenceApp,
+) -> Result<Response<AppResponseBody>, AppHttpError> {
+    let method = request.method().clone();
+    let path = request.uri().path().to_owned();
+    if request.uri().query().is_some() {
+        return Ok(text_response(
+            StatusCode::BAD_REQUEST,
+            "invalid provider request",
+        ));
+    }
+    if method == Method::POST
+        && request
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            != Some("application/x-www-form-urlencoded")
+    {
+        return Ok(text_response(
+            StatusCode::BAD_REQUEST,
+            "invalid provider request",
+        ));
+    }
+    let body = Limited::new(request.into_body(), MAX_APP_REQUEST_BODY_BYTES)
+        .collect()
+        .await
+        .map_err(|_| AppHttpError::ProviderResponse)?
+        .to_bytes();
+    if !body.is_empty() {
+        return Ok(text_response(
+            StatusCode::BAD_REQUEST,
+            "invalid provider request",
+        ));
+    }
+    let endpoint = format!(
+        "{}{path}",
+        app.config.fixture_base_url.trim_end_matches('/')
+    );
+    let upstream = app
+        .http_client
+        .request(method, endpoint)
+        .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(body)
+        .send()
+        .await
+        .map_err(|_| AppHttpError::ProviderTransport)?;
+    let status = upstream.status();
+    let content_type = upstream.headers().get(CONTENT_TYPE).cloned();
+    let body = upstream
+        .bytes()
+        .await
+        .map_err(|_| AppHttpError::ProviderResponse)?;
+    if body.len() > MAX_APP_REQUEST_BODY_BYTES {
+        return Err(AppHttpError::ProviderResponse);
+    }
+    let mut response = Response::new(Full::new(body));
+    *response.status_mut() = status;
+    if let Some(content_type) = content_type {
+        response.headers_mut().insert(CONTENT_TYPE, content_type);
+    }
+    Ok(response)
+}
+
+fn valid_payment_intent_id(value: &str) -> bool {
+    let Some(suffix) = value.strip_prefix("pi_tiv_") else {
+        return false;
+    };
+    !suffix.is_empty()
+        && suffix.len() <= 255
+        && suffix
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+}
+
+fn provider_proxy_payment_intent_id<'a>(method: &Method, path: &'a str) -> Option<&'a str> {
+    let path = path.strip_prefix("/v1/payment_intents/")?;
+    let payment_intent_id = match *method {
+        Method::GET if !path.contains('/') => path,
+        Method::POST => path.strip_suffix("/confirm")?,
+        _ => return None,
+    };
+    valid_payment_intent_id(payment_intent_id).then_some(payment_intent_id)
 }
 
 async fn handle_checkout(
@@ -776,11 +864,17 @@ struct CheckoutResponse<'a> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AppHttpError {
     Serialization,
+    ProviderTransport,
+    ProviderResponse,
 }
 
 impl fmt::Display for AppHttpError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("reference app response serialization failed")
+        formatter.write_str(match self {
+            Self::Serialization => "reference app response serialization failed",
+            Self::ProviderTransport => "reference app provider transport failed",
+            Self::ProviderResponse => "reference app provider response failed",
+        })
     }
 }
 

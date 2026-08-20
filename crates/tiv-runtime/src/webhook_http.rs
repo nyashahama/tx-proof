@@ -134,6 +134,21 @@ impl WebhookHttpAdapter {
         })
     }
 
+    pub(crate) const fn control_sequence(&self) -> u64 {
+        self.config.control_sequence
+    }
+
+    pub(crate) fn synchronize_control_sequence(
+        &mut self,
+        observed: u64,
+    ) -> Result<(), WebhookHttpError> {
+        if observed < self.config.control_sequence || observed == u64::MAX {
+            return Err(WebhookHttpError::UnexpectedControlResponse);
+        }
+        self.config.control_sequence = observed;
+        Ok(())
+    }
+
     async fn generate_event(
         &mut self,
         request: &CaseEffectRequest<'_>,

@@ -1,6 +1,7 @@
 //! Effectful runtime adapters for `TxProof`.
 
 pub mod campaign;
+pub mod case_http;
 pub mod config;
 pub mod doctor;
 pub mod evidence;

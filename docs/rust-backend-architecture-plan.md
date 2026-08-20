@@ -375,6 +375,16 @@ or forwards the signed body itself. Both HTTP clients ignore ambient proxies,
 reject redirects, and use bounded timeouts. A non-2xx application response
 fails the delivery action without removing the pending event.
 
+The serial case HTTP adapter owns the provider and webhook adapters together.
+After each successful effect it transfers the exact validated fixture command
+sequence to the other adapter, preventing a later webhook command from
+replaying a sequence already consumed by a provider-gate release. The
+reference application also exposes only the supported PaymentIntent confirm
+and retrieve routes as a bounded proxy to its internal fixture address. The
+proxy preserves provider status/body and propagates a real upstream transport
+close by ending the driver connection; the host does not receive a fixture
+data-plane port.
+
 This slice is proven through real loopback fixture and application endpoints,
 but is not yet wired into the live Compose campaign runner. Durable fixture
 delivery-attempt history, webhook cut-point gates, crash injection, and final

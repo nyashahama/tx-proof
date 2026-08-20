@@ -191,6 +191,21 @@ impl ProviderHttpAdapter {
         })
     }
 
+    pub(crate) const fn control_sequence(&self) -> u64 {
+        self.config.control_sequence
+    }
+
+    pub(crate) fn synchronize_control_sequence(
+        &mut self,
+        observed: u64,
+    ) -> Result<(), ProviderHttpError> {
+        if observed < self.config.control_sequence || observed == u64::MAX {
+            return Err(ProviderHttpError::UnexpectedFixtureState);
+        }
+        self.config.control_sequence = observed;
+        Ok(())
+    }
+
     async fn drive_checkout(
         &mut self,
         request: &CaseEffectRequest<'_>,
