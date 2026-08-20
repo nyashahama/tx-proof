@@ -212,6 +212,20 @@ impl ProviderHttpAdapter {
         self.pending.is_none()
     }
 
+    pub(crate) fn mark_application_killed(&mut self) -> Result<(), ProviderHttpError> {
+        let pending = self
+            .pending
+            .as_mut()
+            .ok_or(ProviderHttpError::NoPendingRequest)?;
+        if !matches!(pending.kind, PendingRequestKind::Checkout { .. })
+            || pending.expect_application_disconnect
+        {
+            return Err(ProviderHttpError::InvalidProcessCutPointState);
+        }
+        pending.expect_application_disconnect = true;
+        Ok(())
+    }
+
     pub(crate) async fn quiescent_provider_projection(
         &self,
     ) -> Result<Vec<ProviderPaymentIntent>, ProviderHttpError> {
@@ -594,6 +608,7 @@ impl ProviderHttpAdapter {
             task,
             gate_id,
             kind: PendingRequestKind::Confirm { payment_intent_id },
+            expect_application_disconnect: false,
         });
         provider_gate_capture(request.expected_outputs(), gate_id)
     }
@@ -699,6 +714,7 @@ impl ProviderHttpAdapter {
             kind: PendingRequestKind::Checkout {
                 payment_intent_ids: held.payment_intent_ids,
             },
+            expect_application_disconnect: false,
         });
         Ok(captured)
     }
@@ -774,10 +790,15 @@ impl ProviderHttpAdapter {
         }
         self.fixture_producer_sequence = next_fixture_sequence;
 
-        let response = pending
-            .task
-            .await
-            .map_err(ProviderHttpError::RequestJoin)??;
+        let response = pending.task.await.map_err(ProviderHttpError::RequestJoin);
+        if pending.expect_application_disconnect {
+            return match response {
+                Ok(Err(ProviderHttpError::HttpRequest(_))) => Ok(Vec::new()),
+                Ok(Ok(_)) => Err(ProviderHttpError::ExpectedApplicationDisconnect),
+                Ok(Err(error)) | Err(error) => Err(error),
+            };
+        }
+        let response = response??;
         match (pending.kind, response) {
             (
                 PendingRequestKind::Checkout { payment_intent_ids },
@@ -1198,6 +1219,7 @@ struct PendingProviderRequest {
     task: JoinHandle<Result<PendingResponse, ProviderHttpError>>,
     gate_id: u64,
     kind: PendingRequestKind,
+    expect_application_disconnect: bool,
 }
 
 impl PendingProviderRequest {
@@ -1340,6 +1362,10 @@ pub enum ProviderHttpError {
     ResponseMismatch,
     #[error("provider returned a response where the plan required a transport close")]
     ExpectedTransportClose,
+    #[error("application process state did not match the planned client cut point")]
+    InvalidProcessCutPointState,
+    #[error("application returned a response after its process was killed")]
+    ExpectedApplicationDisconnect,
     #[error("provider HTTP sequence exhausted")]
     SequenceExhausted,
     #[error("provider HTTP request task failed: {0}")]

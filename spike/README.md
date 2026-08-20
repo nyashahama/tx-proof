@@ -103,6 +103,7 @@ TIV_POSTGRES_APPLICATION_PASSWORD=tiv-app-local-only-password \
     --postgres-port 15432 \
     --reference-app-url http://127.0.0.1:18080 \
     --fixture-control-url http://127.0.0.1:12112
+```
 
 Run the compiled serial provider/webhook case with a new durable journal path:
 
@@ -124,12 +125,33 @@ application container, waits for both HTTP and Docker health, re-attests the
 same container identity, and then allocates the fixture's next authenticated
 control sequence. This makes consecutive evidence and planned-case commands
 safe on one isolated stack without weakening the monotonic sequence contract.
+
+Run the compiled `client_request_forwarded` SIGKILL/restart case with another
+new journal path:
+
+```sh
+TIV_FIXTURE_CONTROL_TOKEN=run-scoped-control-token \
+TIV_POSTGRES_ADMIN_PASSWORD=tiv-local-only-password \
+TIV_POSTGRES_APPLICATION_PASSWORD=tiv-app-local-only-password \
+  cargo run --quiet -p tiv-cli --bin tiv -- \
+    replay reference-app-case \
+    --plan crates/tiv-core/tests/golden/planned-case-v3.json \
+    --journal /tmp/tiv-reference-process-case.jsonl \
+    --postgres-port 15432 \
+    --reference-app-url http://127.0.0.1:18080 \
+    --fixture-control-url http://127.0.0.1:12112
 ```
+
+Only the `client_request_forwarded` process cut point is implemented. The
+runner SIGKILLs the exact attested application container, proves it stopped,
+starts the same container, waits for HTTP health and full stack re-attestation,
+and then continues the durable journal. All response-observed, webhook, and
+SQL-probe cut points fail before stack or database mutation.
 
 The command provisions a generated case database, installs a sequenced
 `commit_then_close`/`normal` fault plan, drives the application checkout, signs
 and delivers the fixture's exact raw webhook bytes, observes two provider and
-local objects for `op_1`, and runs the five-query snapshot. It repeats that
+local objects for the generated case-derived operation, and runs the five-query snapshot. It repeats that
 exact trace three times, cloning the sealed baseline before attempts two and
 three, then classifies the expected invariant/checkpoint identity as `stable`
 (3/3), `reproducible` (2/3), or `inconclusive` (0/3 or 1/3). Standard output is
@@ -147,9 +169,9 @@ containers, including each image, command, purpose label, and exact loopback
 port binding. Every Docker inspection has bounded output, a ten-second command
 deadline, and explicit kill/reap cleanup on timeout.
 
-The reference stack must be fresh for each evidence command because fixture
-control commands are strictly sequenced. Reset it with the scoped `down` command
-below before starting another run.
+Public commands read the authenticated fixture state and allocate the next
+strictly monotonic control sequence, so they can run serially on one attested
+stack. Each journal path must be new.
 
 Remove only this exact disposable project when finished:
 

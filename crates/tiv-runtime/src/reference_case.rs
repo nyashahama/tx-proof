@@ -1,11 +1,13 @@
 //! Reference-application planned-case execution and checkpoint evaluation.
 
-use std::{path::Path, time::Duration};
+use std::{future::Future, path::Path, pin::Pin, time::Duration};
 
 use reqwest::{Client, StatusCode, Url, redirect::Policy};
 use serde::Deserialize;
 use thiserror::Error;
-use tiv_core::plan::{PlanActionKind, PlanValidationError, PlannedCase, ProviderOutcome};
+use tiv_core::plan::{
+    PlanActionKind, PlanValidationError, PlannedCase, ProcessCutPoint, ProviderOutcome,
+};
 
 use crate::{
     campaign::{
@@ -26,6 +28,24 @@ use crate::{
 };
 
 const MAX_RESET_RESPONSE_BYTES: usize = 16 * 1024;
+
+pub(crate) type ReferenceProcessControlFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<(), ReferenceProcessControlError>> + Send + 'a>>;
+
+pub(crate) trait ReferenceProcessControl: Send {
+    fn kill_application(&mut self) -> ReferenceProcessControlFuture<'_>;
+    fn restart_and_await_health(&mut self) -> ReferenceProcessControlFuture<'_>;
+}
+
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+pub enum ReferenceProcessControlError {
+    #[error("the attested reference application could not be killed")]
+    Kill,
+    #[error("the attested reference application could not be restarted")]
+    Restart,
+    #[error("the restarted reference application did not become healthy and fully attested")]
+    HealthOrAttestation,
+}
 
 /// Validated, secret-bearing inputs for one reference planned-case run.
 ///
@@ -149,26 +169,47 @@ pub async fn run_reference_planned_case(
     journal_path: impl AsRef<Path>,
     config: ReferenceCaseRunConfig,
 ) -> Result<ReferenceCaseRunReceipt, ReferenceCaseRunError> {
-    planned_case
-        .validate()
-        .map_err(ReferenceCaseRunError::InvalidPlan)?;
-    if planned_case.actions().iter().any(|action| {
-        matches!(
-            action.kind(),
-            PlanActionKind::KillApplication { .. } | PlanActionKind::RestartAndAwaitHealth
-        )
-    }) {
-        return Err(ReferenceCaseRunError::UnsupportedProcessFault);
-    }
+    run_reference_planned_case_inner(run_id, case_id, planned_case, journal_path, config, None)
+        .await
+}
+
+pub(crate) async fn run_reference_planned_case_with_process(
+    run_id: impl Into<String>,
+    case_id: impl Into<String>,
+    planned_case: &PlannedCase,
+    journal_path: impl AsRef<Path>,
+    config: ReferenceCaseRunConfig,
+    process: &mut dyn ReferenceProcessControl,
+) -> Result<ReferenceCaseRunReceipt, ReferenceCaseRunError> {
+    run_reference_planned_case_inner(
+        run_id,
+        case_id,
+        planned_case,
+        journal_path,
+        config,
+        Some(process),
+    )
+    .await
+}
+
+async fn run_reference_planned_case_inner(
+    run_id: impl Into<String>,
+    case_id: impl Into<String>,
+    planned_case: &PlannedCase,
+    journal_path: impl AsRef<Path>,
+    config: ReferenceCaseRunConfig,
+    process: Option<&mut dyn ReferenceProcessControl>,
+) -> Result<ReferenceCaseRunReceipt, ReferenceCaseRunError> {
+    preflight_reference_planned_case(planned_case, process.is_some())?;
     let outcomes = provider_outcomes(planned_case);
-    if outcomes.is_empty() {
-        return Err(ReferenceCaseRunError::MissingProviderOutcomes);
-    }
     reset_fixture(&config, planned_case, &outcomes).await?;
-    let mut adapter = ReferenceCaseAdapter::new(CaseHttpAdapter::new(
-        ProviderHttpAdapter::new(config.provider)?,
-        WebhookHttpAdapter::new(config.webhook)?,
-    ));
+    let mut adapter = ReferenceCaseAdapter::new(
+        CaseHttpAdapter::new(
+            ProviderHttpAdapter::new(config.provider)?,
+            WebhookHttpAdapter::new(config.webhook)?,
+        ),
+        process,
+    );
     let executed =
         execute_planned_case(run_id, case_id, planned_case, journal_path, &mut adapter).await?;
     let checkpoint = adapter.finish()?;
@@ -176,6 +217,34 @@ pub async fn run_reference_planned_case(
         executed,
         checkpoint,
     })
+}
+
+pub(crate) fn preflight_reference_planned_case(
+    planned_case: &PlannedCase,
+    process_control_available: bool,
+) -> Result<(), ReferenceCaseRunError> {
+    planned_case
+        .validate()
+        .map_err(ReferenceCaseRunError::InvalidPlan)?;
+    let contains_process_fault = planned_case
+        .actions()
+        .iter()
+        .any(|action| matches!(action.kind(), PlanActionKind::KillApplication { .. }));
+    if planned_case.actions().iter().any(|action| {
+        matches!(
+            action.kind(),
+            PlanActionKind::KillApplication { cut_point }
+                if *cut_point != ProcessCutPoint::ClientRequestForwarded
+        )
+    }) || (contains_process_fault && !process_control_available)
+    {
+        return Err(ReferenceCaseRunError::UnsupportedProcessFault);
+    }
+    let outcomes = provider_outcomes(planned_case);
+    if outcomes.is_empty() {
+        return Err(ReferenceCaseRunError::MissingProviderOutcomes);
+    }
+    Ok(())
 }
 
 fn provider_outcomes(planned_case: &PlannedCase) -> Vec<ProviderOutcome> {
@@ -247,17 +316,24 @@ struct ResetResponse {
 
 /// Executes HTTP effects plus the synthetic reference application's final
 /// quiescence and checkpoint boundaries.
-pub struct ReferenceCaseAdapter {
+pub struct ReferenceCaseAdapter<'a> {
     http: CaseHttpAdapter,
+    process: Option<&'a mut dyn ReferenceProcessControl>,
+    application_healthy: bool,
     quiescence: Option<ReferenceCaseHttpCompletion>,
     checkpoint: Option<ReferenceCaseCheckpoint>,
 }
 
-impl ReferenceCaseAdapter {
+impl<'a> ReferenceCaseAdapter<'a> {
     #[must_use]
-    pub const fn new(http: CaseHttpAdapter) -> Self {
+    pub(crate) const fn new(
+        http: CaseHttpAdapter,
+        process: Option<&'a mut dyn ReferenceProcessControl>,
+    ) -> Self {
         Self {
             http,
+            process,
+            application_healthy: true,
             quiescence: None,
             checkpoint: None,
         }
@@ -317,9 +393,45 @@ impl ReferenceCaseAdapter {
         });
         Ok(Vec::new())
     }
+
+    async fn kill_application(
+        &mut self,
+        request: &CaseEffectRequest<'_>,
+        cut_point: ProcessCutPoint,
+    ) -> Result<crate::campaign::CaseEffectOutput, ReferenceCaseError> {
+        require_no_outputs(request)?;
+        if cut_point != ProcessCutPoint::ClientRequestForwarded || !self.application_healthy {
+            return Err(ReferenceCaseError::InvalidLifecycleOrder);
+        }
+        self.http.mark_application_killed()?;
+        self.process
+            .as_deref_mut()
+            .ok_or(ReferenceCaseError::MissingProcessControl)?
+            .kill_application()
+            .await?;
+        self.application_healthy = false;
+        Ok(Vec::new())
+    }
+
+    async fn restart_application(
+        &mut self,
+        request: &CaseEffectRequest<'_>,
+    ) -> Result<crate::campaign::CaseEffectOutput, ReferenceCaseError> {
+        require_no_outputs(request)?;
+        if self.application_healthy {
+            return Err(ReferenceCaseError::InvalidLifecycleOrder);
+        }
+        self.process
+            .as_deref_mut()
+            .ok_or(ReferenceCaseError::MissingProcessControl)?
+            .restart_and_await_health()
+            .await?;
+        self.application_healthy = true;
+        Ok(Vec::new())
+    }
 }
 
-impl CaseEffectAdapter for ReferenceCaseAdapter {
+impl CaseEffectAdapter for ReferenceCaseAdapter<'_> {
     type Error = ReferenceCaseError;
 
     fn execute<'a>(
@@ -328,6 +440,10 @@ impl CaseEffectAdapter for ReferenceCaseAdapter {
     ) -> CaseEffectFuture<'a, Self::Error> {
         Box::pin(async move {
             match request.action().kind() {
+                PlanActionKind::KillApplication { cut_point } => {
+                    self.kill_application(&request, *cut_point).await
+                }
+                PlanActionKind::RestartAndAwaitHealth => self.restart_application(&request).await,
                 PlanActionKind::WaitForQuiescence => self.wait_for_quiescence(&request).await,
                 PlanActionKind::CheckCheckpoint { .. } => self.check_checkpoint(&request),
                 _ if self.quiescence.is_some() || self.checkpoint.is_some() => {
@@ -382,6 +498,10 @@ pub enum ReferenceCaseError {
     UnexpectedOutputContract,
     #[error("reference case did not reach its final checkpoint")]
     MissingCheckpoint,
+    #[error("reference case process control is unavailable")]
+    MissingProcessControl,
+    #[error("reference case process action failed: {0}")]
+    ProcessControl(#[from] ReferenceProcessControlError),
 }
 
 #[derive(Debug, Error)]
@@ -402,7 +522,7 @@ pub enum ReferenceCaseRunConfigError {
 pub enum ReferenceCaseRunError {
     #[error("reference planned case failed pure validation")]
     InvalidPlan(PlanValidationError),
-    #[error("reference planned-case process faults are not implemented")]
+    #[error("reference planned-case process cut point is not supported")]
     UnsupportedProcessFault,
     #[error("reference planned case did not contain a provider fault script")]
     MissingProviderOutcomes,
@@ -425,5 +545,40 @@ pub enum ReferenceCaseRunError {
 impl From<CaseExecutionError<ReferenceCaseError>> for ReferenceCaseRunError {
     fn from(error: CaseExecutionError<ReferenceCaseError>) -> Self {
         Self::Execution(error)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tiv_core::{
+        decision::Seed,
+        plan::{ActionBudget, CasePlanCompiler, PlanSpec, ProcessFaultSpec, WebhookFaultSpec},
+    };
+
+    #[test]
+    fn unsupported_cut_points_fail_preflight_even_when_process_control_exists() {
+        let plan = (0..512)
+            .find_map(|seed| {
+                let spec = PlanSpec::new_payment_intent_v1(
+                    Seed::new(seed),
+                    ActionBudget::new(40).unwrap(),
+                    [ProviderOutcome::Normal, ProviderOutcome::CommitThenDelay],
+                    WebhookFaultSpec::new(0, [], false, false).unwrap(),
+                    ProcessFaultSpec::new([ProcessCutPoint::SqlProbe], 1).unwrap(),
+                )
+                .unwrap();
+                let plan = CasePlanCompiler::compile(&spec).unwrap();
+                plan.actions()
+                    .iter()
+                    .any(|action| matches!(action.kind(), PlanActionKind::KillApplication { .. }))
+                    .then_some(plan)
+            })
+            .expect("the bounded seed corpus contains a SQL-probe kill");
+
+        assert!(matches!(
+            preflight_reference_planned_case(&plan, true),
+            Err(ReferenceCaseRunError::UnsupportedProcessFault)
+        ));
     }
 }

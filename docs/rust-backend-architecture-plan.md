@@ -386,20 +386,30 @@ close by ending the driver connection; the host does not receive a fixture
 data-plane port.
 
 The reference planned-case runner validates the compiled plan before mutation,
-rejects process-fault cases before fixture reset, installs the exact flattened
-provider fault scripts, and executes the full serial HTTP plan into a durable
-journal. Its reference-only quiescence gate requires no held provider request,
-no queued webhook, no held fixture gate, no unused provider outcome, and a
-validated provider projection. The final checkpoint yields the unforgeable
-permit consumed by the existing five-query PostgreSQL oracle. Self-contained
-public runs restart and re-attest only the known reference-app container and
-allocate the next authenticated fixture sequence so multiple commands can run
-serially on the same isolated stack.
+installs the exact flattened provider fault scripts, and executes the full
+serial plan into a durable journal. It supports one honest process cut point:
+`client_request_forwarded` after the fixture has committed and held its
+response. The runner sends SIGKILL to the exact locally attested application
+container, proves that container stopped, starts the same container, and waits
+for both application health and full three-service re-attestation. Releasing
+the provider gate must then end the killed in-flight driver request without a
+manufactured response. Case-derived operation identity and a narrow durable
+order read let a restarted application recover webhook routing from PostgreSQL
+instead of process RAM.
 
-This slice is proven through real loopback fixture and application endpoints,
-but is not yet wired into the live Compose campaign runner. Durable fixture
-delivery-attempt history, webhook cut-point gates, crash injection, and final
-oracle projection remain later integration boundaries.
+Response-observed, webhook, and SQL-probe cut points remain unsupported and are
+rejected before stack inspection or database provisioning. The reference-only
+quiescence gate requires no held provider request, no queued webhook, no held
+fixture gate, no unused provider outcome, and a validated provider projection.
+The final checkpoint yields the unforgeable permit consumed by the existing
+five-query PostgreSQL oracle. Self-contained public runs allocate the next
+authenticated fixture sequence so multiple commands can run serially on the
+same isolated stack.
+
+This slice is proven through real loopback fixture and application endpoints
+and the live Compose reference runner. Durable fixture delivery-attempt
+history and real blocking gates for response-observed, webhook, and SQL-probe
+cut points remain later integration boundaries.
 
 The proposed fixture topology has separate data and control listeners. The data listener is reachable by the SUT on an internal Compose network. The control listener is published only to loopback and requires an unlogged run token plus a monotonic command sequence. Control DTOs are versioned. The truth spike must prove that this protocol is necessary and portable before it becomes part of trace compatibility.
 
@@ -417,13 +427,17 @@ Supported cut points are external and honest:
 - webhook response observed but designated unacknowledged by the logical sender;
 - customer SQL probe first becomes true.
 
-At a cut point, the responsible driver/fixture task records the observation and blocks on a gate. The orchestrator persists it, invokes:
+At an implemented cut point, the responsible driver/fixture task records the observation and blocks on a gate. The orchestrator persists it, invokes:
 
 ```text
 docker compose --project-name <exact> ... kill --signal SIGKILL <configured-service>
 ```
 
-and then releases or closes the held operation according to the trace. Restart uses an explicit Compose command followed by both Compose-state and application-health checks.
+and then releases or closes the held operation according to the trace. The
+current reference runner implements only `client_request_forwarded` and uses
+the already-attested local Docker container ID rather than ambient Docker
+context. Restart starts that exact stopped container, then repeats full Docker
+attestation and application-health checks before execution continues.
 
 The report calls these “observable external cut points.” It makes no source-line or instruction-level crash claim.
 

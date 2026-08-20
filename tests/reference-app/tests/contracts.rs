@@ -45,6 +45,30 @@ fn only_generated_case_database_names_are_accepted() {
 }
 
 #[test]
+fn generated_case_names_have_one_reversible_operation_identity() {
+    let database = ReferenceDatabaseName::parse("tiv_case_0123456789abcdef")
+        .expect("the generated case name is valid");
+
+    assert_eq!(database.operation_id(), "op_0123456789abcdef");
+    assert_eq!(
+        ReferenceDatabaseName::from_operation_id(&database.operation_id()),
+        Ok(database)
+    );
+
+    for unrelated in [
+        "op_1",
+        "op_nothexadecimal",
+        "other_0123456789abcdef",
+        "op_0123456789abcdef0123456789abcdef0",
+    ] {
+        assert!(
+            ReferenceDatabaseName::from_operation_id(unrelated).is_err(),
+            "{unrelated:?} must not select a reference database"
+        );
+    }
+}
+
+#[test]
 fn webhook_verification_covers_the_exact_raw_bytes_and_rejects_stale_signatures() {
     let secret = b"whsec_test_secret";
     let timestamp = current_unix_timestamp();

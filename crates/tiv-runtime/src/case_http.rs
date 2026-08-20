@@ -38,6 +38,12 @@ impl CaseHttpAdapter {
         })
     }
 
+    pub(crate) fn mark_application_killed(&mut self) -> Result<(), CaseHttpError> {
+        self.provider
+            .mark_application_killed()
+            .map_err(CaseHttpError::Provider)
+    }
+
     async fn execute_provider(
         &mut self,
         request: CaseEffectRequest<'_>,

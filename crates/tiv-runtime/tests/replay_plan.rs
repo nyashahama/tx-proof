@@ -81,6 +81,7 @@ fn reference_app_replay_config_accepts_only_loopback_prepared_case_execution() {
     .expect("the bounded loopback reference replay config is valid");
 
     assert_eq!(config.case_database(), &case_database);
+    assert_eq!(config.operation_id(), "op_7dc6fb6e");
     assert_eq!(config.reference_app_url(), "http://127.0.0.1:18080");
     assert_eq!(config.fixture_control_url(), "http://127.0.0.1:12112");
     assert_eq!(config.fixture_control_token(), "run-scoped-control-token");

@@ -194,8 +194,14 @@ impl TruthSpikePostgres {
         self.ensure_application_role().await?;
         self.ensure_invariant_role().await?;
         self.create_empty_database(&baseline_name).await?;
-        self.initialize_reference_baseline(&baseline_name, baseline_marker, &compose_project)
-            .await?;
+        let operation_id = format!("op_{suffix}");
+        self.initialize_reference_baseline(
+            &baseline_name,
+            baseline_marker,
+            &compose_project,
+            &operation_id,
+        )
+        .await?;
         let baseline_archive = if let Some(toolchain) = &self.archive_toolchain {
             Some(toolchain.capture(&baseline_name).await?)
         } else {
@@ -557,6 +563,7 @@ impl TruthSpikePostgres {
         baseline_name: &DatabaseName,
         marker_uuid: Uuid,
         compose_project: &ComposeProjectId,
+        operation_id: &str,
     ) -> Result<(), SpikePostgresError> {
         let mut session = self.connect_database(baseline_name.as_str()).await?;
         let result = async {
@@ -587,19 +594,26 @@ impl TruthSpikePostgres {
                      ); \
                      CREATE INDEX payments_operation_id_idx ON payments (operation_id); \
                     CREATE INDEX payments_provider_id_idx ON payments (stripe_payment_intent_id); \
-                     INSERT INTO orders (operation_id, amount_minor, currency, status) \
-                     VALUES ('op_1', 2500, 'usd', 'pending'); \
                      REVOKE ALL ON SCHEMA public FROM PUBLIC; \
                      GRANT USAGE ON SCHEMA public TO tiv_app, tiv_invariant; \
                      REVOKE ALL ON TABLE tiv_verifier_marker, orders, payments \
                          FROM PUBLIC, tiv_app, tiv_invariant; \
                      REVOKE ALL ON SEQUENCE orders_id_seq, payments_id_seq \
                          FROM PUBLIC, tiv_app, tiv_invariant; \
+                     GRANT SELECT (operation_id, amount_minor, currency) ON TABLE orders TO tiv_app; \
                      GRANT INSERT ON TABLE payments TO tiv_app; \
                      GRANT SELECT (operation_id, stripe_payment_intent_id), \
                            UPDATE (status) ON TABLE payments TO tiv_app; \
                      GRANT USAGE ON SEQUENCE payments_id_seq TO tiv_app; \
                      GRANT SELECT ON TABLE orders, payments TO tiv_invariant;",
+                )
+                .await?;
+            session
+                .client()
+                .execute(
+                    "INSERT INTO orders (operation_id, amount_minor, currency, status) \
+                     VALUES ($1, 2500, 'usd', 'pending')",
+                    &[&operation_id],
                 )
                 .await?;
             session
@@ -1246,6 +1260,30 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "requires the isolated tiv-truth-spike-postgres Compose project"]
+    async fn provisioned_reference_case_owns_its_case_derived_operation() {
+        let postgres = test_postgres().await;
+        let suffix = Uuid::new_v4().simple().to_string()[..16].to_owned();
+        let provisioned = postgres
+            .provision_reference_databases(&suffix, test_project())
+            .await
+            .expect("the baseline and case are provisioned");
+        let mut session = postgres
+            .connect_database(provisioned.case_name().as_str())
+            .await
+            .expect("the generated case is reachable");
+        let operation_id: String = session
+            .client()
+            .query_one("SELECT operation_id FROM orders", &[])
+            .await
+            .expect("the seed order is readable")
+            .get(0);
+        session.close().await.expect("the session closes cleanly");
+
+        assert_eq!(operation_id, format!("op_{suffix}"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires the isolated tiv-truth-spike-postgres Compose project"]
     async fn template_reset_and_five_query_oracle_reproduce_the_same_failure() {
         let postgres = test_postgres().await;
         let suffix = Uuid::new_v4().simple().to_string()[..16].to_owned();
@@ -1257,10 +1295,15 @@ mod tests {
         let case_name = provisioned.case_name().clone();
         let original_oid = provisioned.case_target().identity().database_oid();
         let provider_objects = provider_objects();
+        let operation_id = format!("op_{suffix}");
 
         let stale_case_target = DatabaseTarget::new(provisioned.case_target().identity().clone());
         let dirty_case_target = postgres
-            .insert_buggy_payment_pair(provisioned.into_case_target(), "op_1", &provider_objects)
+            .insert_buggy_payment_pair(
+                provisioned.into_case_target(),
+                &operation_id,
+                &provider_objects,
+            )
             .await
             .expect("the synthetic bug state is inserted");
         let first_report = postgres
@@ -1290,7 +1333,7 @@ mod tests {
         ));
 
         let stale_write = postgres
-            .insert_buggy_payment_pair(stale_case_target, "op_1", &provider_objects)
+            .insert_buggy_payment_pair(stale_case_target, &operation_id, &provider_objects)
             .await;
         assert!(matches!(
             stale_write,
@@ -1311,7 +1354,7 @@ mod tests {
         ));
 
         let _replayed_case_target = postgres
-            .insert_buggy_payment_pair(reset_target, "op_1", &provider_objects)
+            .insert_buggy_payment_pair(reset_target, &operation_id, &provider_objects)
             .await
             .expect("the same compiled fault is replayed");
         let replay_report = postgres
@@ -1348,8 +1391,9 @@ mod tests {
         assert!(archive_metadata.len() > 0, "the archive is not empty");
         let original_oid = first_case_target.identity().database_oid();
         let provider_objects = provider_objects();
+        let operation_id = format!("op_{suffix}");
         let dirty_case_target = postgres
-            .insert_buggy_payment_pair(first_case_target, "op_1", &provider_objects)
+            .insert_buggy_payment_pair(first_case_target, &operation_id, &provider_objects)
             .await
             .expect("the synthetic bug state is inserted before fallback reset");
 
@@ -1756,6 +1800,7 @@ mod tests {
         postgres: &TruthSpikePostgres,
         case_name: &DatabaseName,
     ) {
+        let operation_id = reference_operation_id(case_name);
         let mut app = postgres
             .connect_application_database(case_name)
             .await
@@ -1772,11 +1817,12 @@ mod tests {
             .execute(
                 "INSERT INTO payments \
                      (operation_id, stripe_payment_intent_id, amount_minor, currency, status) \
-                 VALUES ('op_1', 'pi_tiv_role_test', 2500, 'usd', 'succeeded')",
-                &[],
+                 VALUES ($1, 'pi_tiv_role_test', 2500, 'usd', 'succeeded')",
+                &[&operation_id],
             )
             .await
             .expect("the app can persist its one required relation");
+        assert_durable_operation_read(app.client(), &operation_id).await;
         let marker_read = app
             .client()
             .query("SELECT marker_uuid FROM tiv_verifier_marker", &[])
@@ -1785,9 +1831,9 @@ mod tests {
             .client()
             .execute(
                 "UPDATE payments SET status = 'succeeded' \
-                 WHERE operation_id = 'op_1' \
+                 WHERE operation_id = $1 \
                    AND stripe_payment_intent_id = 'pi_tiv_role_test'",
-                &[],
+                &[&operation_id],
             )
             .await
             .expect("the app can reconcile the exact provider relation it wrote");
@@ -1815,6 +1861,7 @@ mod tests {
             )
             .await;
         let ungranted_payment_read = app.client().query("SELECT status FROM payments", &[]).await;
+        let ungranted_order_read = app.client().query("SELECT status FROM orders", &[]).await;
         app.close()
             .await
             .expect("the application connection closes cleanly");
@@ -1843,12 +1890,30 @@ mod tests {
             ungranted_payment_read.is_err(),
             "the app cannot read columns outside its reconciliation predicate"
         );
+        assert!(
+            ungranted_order_read.is_err(),
+            "the app cannot read mutable order state while recovering routing"
+        );
+    }
+
+    async fn assert_durable_operation_read(client: &Client, operation_id: &str) {
+        let order = client
+            .query_one(
+                "SELECT operation_id, amount_minor, currency FROM orders WHERE operation_id = $1",
+                &[&operation_id],
+            )
+            .await
+            .expect("the app can recover its durable operation relation");
+        assert_eq!(order.get::<_, String>(0), operation_id);
+        assert_eq!(order.get::<_, i64>(1), 2_500);
+        assert_eq!(order.get::<_, String>(2), "usd");
     }
 
     async fn assert_application_role_after_reset(
         postgres: &TruthSpikePostgres,
         case_name: &DatabaseName,
     ) {
+        let operation_id = reference_operation_id(case_name);
         let mut reset_app = postgres
             .connect_application_database(case_name)
             .await
@@ -1858,8 +1923,8 @@ mod tests {
             .execute(
                 "INSERT INTO payments \
                      (operation_id, stripe_payment_intent_id, amount_minor, currency, status) \
-                 VALUES ('op_1', 'pi_tiv_role_test_after_reset', 2500, 'usd', 'succeeded')",
-                &[],
+                 VALUES ($1, 'pi_tiv_role_test_after_reset', 2500, 'usd', 'succeeded')",
+                &[&operation_id],
             )
             .await
             .expect("the narrow grant survives a template reset");
@@ -1868,6 +1933,16 @@ mod tests {
             .await
             .expect("the reset application connection closes cleanly");
         assert_eq!(reset_insert, 1);
+    }
+
+    fn reference_operation_id(case_name: &DatabaseName) -> String {
+        format!(
+            "op_{}",
+            case_name
+                .as_str()
+                .strip_prefix("tiv_case_")
+                .expect("generated case keeps its validated prefix")
+        )
     }
 
     async fn assert_invariant_role_contract(
@@ -2148,6 +2223,13 @@ mod tests {
         case_target: DatabaseTarget<Unverified>,
     ) -> (SnapshotReport, DatabaseTarget<Unverified>) {
         let case_name = case_target.identity().database_name().clone();
+        let operation_id = format!(
+            "op_{}",
+            case_name
+                .as_str()
+                .strip_prefix("tiv_case_")
+                .expect("generated case keeps its validated prefix")
+        );
         let fixture = Arc::new(Mutex::new(PaymentIntentFixture::new(Seed::new(42))));
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -2208,7 +2290,7 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         let case_target = postgres
-            .insert_buggy_payment_pair(case_target, "op_1", &provider_objects)
+            .insert_buggy_payment_pair(case_target, &operation_id, &provider_objects)
             .await
             .expect("reconciliation persists both provider objects for one operation");
         let report = postgres

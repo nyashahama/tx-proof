@@ -30,7 +30,8 @@ use crate::{
     },
     reference_case::{
         ReferenceCaseRunConfig, ReferenceCaseRunConfigError, ReferenceCaseRunError,
-        run_reference_planned_case,
+        ReferenceProcessControl, ReferenceProcessControlError, ReferenceProcessControlFuture,
+        preflight_reference_planned_case, run_reference_planned_case_with_process,
     },
     replay::{
         ReferenceAppReplayConfig, ReferenceAppReplayConfigError, ReferenceAppReplayError,
@@ -39,7 +40,6 @@ use crate::{
 };
 
 const PROVIDER_UNIQUENESS_ID: &str = "provider-object-unique";
-const OPERATION_ID: &str = "op_1";
 const REFERENCE_APP_COMPOSE_PROJECT: &str = "tiv-reference-app-spike";
 const REFERENCE_POSTGRES_PURPOSE: &str = "disposable-reference-app-postgres";
 const REFERENCE_POSTGRES_IMAGE: &str = "postgres:18.4-bookworm";
@@ -522,7 +522,7 @@ pub async fn run_reference_app_evidence(
         0,
     )
     .await?;
-    let (expected_failure, first_attempt) = provider_uniqueness_attempt(&first_report)?;
+    let (expected_failure, first_attempt) = uniqueness_attempt(&first_report, &case_name)?;
 
     let first_reset_target = postgres
         .reset_case_from_template(first_case_target, &baseline_target, Uuid::new_v4())
@@ -539,7 +539,7 @@ pub async fn run_reference_app_evidence(
         2,
     )
     .await?;
-    let (_, second_attempt) = provider_uniqueness_attempt(&second_report)?;
+    let (_, second_attempt) = uniqueness_attempt(&second_report, &case_name)?;
 
     let second_reset_target = postgres
         .reset_case_from_archive(
@@ -561,7 +561,7 @@ pub async fn run_reference_app_evidence(
         4,
     )
     .await?;
-    let (_, third_attempt) = provider_uniqueness_attempt(&third_report)?;
+    let (_, third_attempt) = uniqueness_attempt(&third_report, &case_name)?;
 
     let attempts = [first_attempt, second_attempt, third_attempt];
 
@@ -614,9 +614,10 @@ struct ReferenceInvariantEvidence {
 /// Provisions one isolated case database, runs a compiled serial case through
 /// the real reference stack, and evaluates its final `PostgreSQL` checkpoint.
 ///
-/// The current slice rejects process-kill plans before fixture reset. All
-/// provider, gate, webhook, quiescence, journal, and oracle boundaries are
-/// live.
+/// The current slice executes a `client_request_forwarded` application kill
+/// against the exact attested container. Other process cut points are rejected
+/// before stack or database mutation. Provider, gate, webhook, quiescence,
+/// journal, and oracle boundaries are live.
 ///
 /// # Errors
 ///
@@ -627,6 +628,7 @@ pub async fn run_reference_app_planned_case(
     config: &ReferenceAppEvidenceConfig,
     journal_path: impl AsRef<Path>,
 ) -> Result<ReferencePlannedCaseEvidence, ReferenceAppEvidenceError> {
+    preflight_reference_planned_case(planned_case, true)?;
     let observed_stack = attest_reference_stack(
         config.postgres_port,
         &config.reference_app_url,
@@ -670,6 +672,7 @@ pub async fn run_reference_app_planned_case(
         .ok_or(SpikePostgresError::ArchiveUnavailable)
         .map_err(ReferenceAppEvidenceError::postgres)?;
     let database_oid = case_target.identity().database_oid();
+    let operation_id = reference_operation_id(&case_name);
     let timestamp = current_unix_timestamp()?;
     let run_config = ReferenceCaseRunConfig::new(
         &case_name,
@@ -678,18 +681,20 @@ pub async fn run_reference_app_planned_case(
         config.fixture_control_token.clone(),
         reset_sequence,
         timestamp,
-        OPERATION_ID,
+        operation_id,
         2_500,
         "usd",
         Duration::from_secs(10),
         Duration::from_millis(10),
     )?;
-    let receipt = run_reference_planned_case(
+    let mut process = AttestedReferenceProcessControl { config };
+    let receipt = run_reference_planned_case_with_process(
         format!("run_{suffix}"),
         format!("case_{suffix}"),
         planned_case,
         journal_path,
         run_config,
+        &mut process,
     )
     .await?;
     let executed_action_count = receipt.executed().trace().action_count();
@@ -767,6 +772,53 @@ async fn restart_reference_application(
     if restarted.trim() != container_id {
         return Err(ReferenceAppEvidenceError::ReferenceApplicationRestart);
     }
+    await_reference_application_health(config).await
+}
+
+struct AttestedReferenceProcessControl<'a> {
+    config: &'a ReferenceAppEvidenceConfig,
+}
+
+impl ReferenceProcessControl for AttestedReferenceProcessControl<'_> {
+    fn kill_application(&mut self) -> ReferenceProcessControlFuture<'_> {
+        Box::pin(async move {
+            let container_id = self.config.stack_attestation.reference_app.as_str();
+            let killed = docker_output(&["kill", "--signal", "KILL", container_id])
+                .await
+                .map_err(|_| ReferenceProcessControlError::Kill)?;
+            if killed.trim() != container_id {
+                return Err(ReferenceProcessControlError::Kill);
+            }
+            let running =
+                docker_output(&["inspect", "--format", "{{.State.Running}}", container_id])
+                    .await
+                    .map_err(|_| ReferenceProcessControlError::Kill)?;
+            if running.trim() != "false" {
+                return Err(ReferenceProcessControlError::Kill);
+            }
+            Ok(())
+        })
+    }
+
+    fn restart_and_await_health(&mut self) -> ReferenceProcessControlFuture<'_> {
+        Box::pin(async move {
+            let container_id = self.config.stack_attestation.reference_app.as_str();
+            let started = docker_output(&["start", container_id])
+                .await
+                .map_err(|_| ReferenceProcessControlError::Restart)?;
+            if started.trim() != container_id {
+                return Err(ReferenceProcessControlError::Restart);
+            }
+            await_reference_application_health(self.config)
+                .await
+                .map_err(|_| ReferenceProcessControlError::HealthOrAttestation)
+        })
+    }
+}
+
+async fn await_reference_application_health(
+    config: &ReferenceAppEvidenceConfig,
+) -> Result<(), ReferenceAppEvidenceError> {
     let client = reqwest::Client::builder()
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
@@ -921,9 +973,11 @@ async fn evaluate_completed_replay(
         .map_err(ReferenceAppEvidenceError::postgres)
 }
 
-fn provider_uniqueness_attempt(
+fn uniqueness_attempt(
     report: &SnapshotReport,
+    case_name: &DatabaseName,
 ) -> Result<(FailureIdentity, AttemptResult), ReferenceAppEvidenceError> {
+    let expected_operation_id = reference_operation_id(case_name);
     let outcome = report
         .outcome(PROVIDER_UNIQUENESS_ID)
         .ok_or(ReferenceAppEvidenceError::MissingProviderUniquenessOutcome)?;
@@ -932,7 +986,7 @@ fn provider_uniqueness_attempt(
         InvariantVerdict::Held => Ok((identity, AttemptResult::Held)),
         InvariantVerdict::Violated(witnesses) => {
             if witnesses.len() != 1
-                || witnesses[0].operation_id() != OPERATION_ID
+                || witnesses[0].operation_id() != expected_operation_id
                 || witnesses[0].provider_object_count() != 2
             {
                 return Err(ReferenceAppEvidenceError::UnexpectedProviderUniquenessWitness);
@@ -940,6 +994,10 @@ fn provider_uniqueness_attempt(
             Ok((identity.clone(), AttemptResult::Violation(identity)))
         }
     }
+}
+
+fn reference_operation_id(case_name: &DatabaseName) -> String {
+    format!("op_{}", case_name.as_str().trim_start_matches("tiv_case_"))
 }
 
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]

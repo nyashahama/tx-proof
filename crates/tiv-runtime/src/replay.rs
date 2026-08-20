@@ -238,6 +238,15 @@ impl ReferenceAppReplayConfig {
         &self.case_database
     }
 
+    /// Returns the operation identity reserved for this generated case.
+    #[must_use]
+    pub fn operation_id(&self) -> String {
+        format!(
+            "op_{}",
+            self.case_database.as_str().trim_start_matches("tiv_case_")
+        )
+    }
+
     #[must_use]
     pub fn reference_app_url(&self) -> &str {
         &self.reference_app_url
@@ -511,11 +520,12 @@ async fn drive_reference_checkout(
     config: &ReferenceAppReplayConfig,
     script: &ReferenceReplayScript,
 ) -> Result<String, ReferenceAppReplayError> {
+    let operation_id = config.operation_id();
     let response = client
         .post(format!("{}/checkout", config.reference_app_url()))
         .json(&serde_json::json!({
             "database": config.case_database().as_str(),
-            "operation_id": "op_1",
+            "operation_id": operation_id,
             "amount_minor": 2500,
             "currency": "usd"
         }))
@@ -526,7 +536,7 @@ async fn drive_reference_checkout(
     if checkout.payment_intent_id != script.expected_payment_intent_id() {
         return Err(ReferenceAppReplayError::CheckoutPaymentIntentMismatch);
     }
-    if checkout.operation_id != "op_1" {
+    if checkout.operation_id != config.operation_id() {
         return Err(ReferenceAppReplayError::CheckoutOperationMismatch);
     }
     Ok(checkout.payment_intent_id)
@@ -606,6 +616,7 @@ async fn fixture_provider_projection(
     client: &reqwest::Client,
     config: &ReferenceAppReplayConfig,
 ) -> Result<Vec<ReferenceProviderPaymentIntent>, ReferenceAppReplayError> {
+    let operation_id = config.operation_id();
     let response = client
         .get(format!("{}/v1/control/state", config.fixture_control_url()))
         .header("X-Tiv-Control-Token", config.fixture_control_token())
@@ -618,7 +629,7 @@ async fn fixture_provider_projection(
         || !state.held_gates.is_empty()
         || state.payment_intents.len() != 2
         || state.payment_intents.iter().any(|payment_intent| {
-            payment_intent.operation_id() != Some("op_1")
+            payment_intent.operation_id() != Some(operation_id.as_str())
                 || payment_intent.amount_minor() != 2_500
                 || payment_intent.currency() != "usd"
         })

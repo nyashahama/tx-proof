@@ -51,6 +51,25 @@ impl ReferenceDatabaseName {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// Returns the operation identity reserved for this generated case.
+    #[must_use]
+    pub fn operation_id(&self) -> String {
+        format!("op_{}", self.0.trim_start_matches("tiv_case_"))
+    }
+
+    /// Recovers the only generated case that may own an operation identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReferenceAppError::InvalidDatabaseName`] unless the operation
+    /// uses the exact case-derived identity grammar.
+    pub fn from_operation_id(value: &str) -> Result<Self, ReferenceAppError> {
+        let suffix = value
+            .strip_prefix("op_")
+            .ok_or(ReferenceAppError::InvalidDatabaseName)?;
+        Self::parse(format!("tiv_case_{suffix}"))
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -469,14 +488,51 @@ impl ReferenceApp {
             .lock()
             .await
             .get(observed.operation_id())
-            .cloned()
-            .ok_or(ReferenceAppError::UnknownOperation)?;
+            .cloned();
+        let registered = match registered {
+            Some(registered) => registered,
+            None => self.recover_registered_operation(observed).await?,
+        };
         if registered.operation.amount_minor() != observed.amount_minor()
             || registered.operation.currency() != observed.currency()
         {
             return Err(ReferenceAppError::OperationConflict);
         }
         Ok(registered)
+    }
+
+    async fn recover_registered_operation(
+        &self,
+        observed: &ObservedPaymentIntent,
+    ) -> Result<RegisteredOperation, ReferenceAppError> {
+        let database = ReferenceDatabaseName::from_operation_id(observed.operation_id())
+            .map_err(|_| ReferenceAppError::UnknownOperation)?;
+        let (client, connection) = self.connect_database(&database).await?;
+        let row = client
+            .query_opt(
+                "SELECT amount_minor, currency FROM orders WHERE operation_id = $1",
+                &[&observed.operation_id()],
+            )
+            .await;
+        drop(client);
+        let connection_result = connection.await;
+        let row = row.map_err(|_| ReferenceAppError::Database)?;
+        connection_result
+            .map_err(|_| ReferenceAppError::Database)?
+            .map_err(|_| ReferenceAppError::Database)?;
+        let row = row.ok_or(ReferenceAppError::UnknownOperation)?;
+        let amount_minor = row.get::<_, i64>(0);
+        let currency = row.get::<_, String>(1);
+        if amount_minor != observed.amount_minor() || currency != observed.currency() {
+            return Err(ReferenceAppError::OperationConflict);
+        }
+        let operation = CheckoutOperation::new(observed.operation_id(), amount_minor, currency)?;
+        self.register_operation(database.clone(), operation.clone())
+            .await?;
+        Ok(RegisteredOperation {
+            database,
+            operation,
+        })
     }
 
     async fn persist_checkout(
@@ -719,6 +775,9 @@ async fn handle_checkout(
     else {
         return Ok(text_response(StatusCode::BAD_REQUEST, "invalid checkout"));
     };
+    if operation.operation_id() != database.operation_id() {
+        return Ok(text_response(StatusCode::BAD_REQUEST, "invalid checkout"));
+    }
     if app
         .register_operation(database.clone(), operation.clone())
         .await
@@ -913,3 +972,37 @@ impl fmt::Display for ReferenceAppError {
 }
 
 impl Error for ReferenceAppError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_fresh_process_routes_a_case_derived_webhook_to_durable_state() {
+        let app = ReferenceApp::new(
+            ReferenceAppConfig::new(
+                "http://127.0.0.1:1",
+                "127.0.0.1",
+                1,
+                "tiv_app",
+                "synthetic-app-password",
+                "whsec_test_secret",
+                "127.0.0.1:1",
+            )
+            .expect("the synthetic config is valid"),
+        );
+        let observed = ObservedPaymentIntent {
+            id: "pi_tiv_restart".to_owned(),
+            operation_id: "op_0123456789abcdef".to_owned(),
+            amount_minor: 2_500,
+            currency: "usd".to_owned(),
+            status: "succeeded".to_owned(),
+        };
+
+        assert_eq!(
+            app.registered_operation(&observed).await,
+            Err(ReferenceAppError::Database),
+            "a valid durable identity must reach PostgreSQL instead of being rejected as unknown RAM"
+        );
+    }
+}

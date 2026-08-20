@@ -67,6 +67,28 @@ async fn unsafe_checkout_target_and_unsigned_webhook_fail_before_side_effects() 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn checkout_rejects_an_operation_owned_by_another_generated_case() {
+    let app = Arc::new(test_app("127.0.0.1:1"));
+    let (address, server) = serve_connections(app, 1).await;
+
+    let checkout = reqwest::Client::new()
+        .post(format!("http://{address}/checkout"))
+        .header("Connection", "close")
+        .json(&json!({
+            "database": "tiv_case_0123456789abcdef",
+            "operation_id": "op_fedcba9876543210",
+            "amount_minor": 2500,
+            "currency": "usd"
+        }))
+        .send()
+        .await
+        .expect("the validation failure is an HTTP response");
+
+    assert_eq!(checkout.status(), StatusCode::BAD_REQUEST);
+    await_server(server).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn provider_confirmation_proxy_preserves_the_internal_fixture_response() {
     let fixture = Arc::new(Mutex::new(ManagedFixture::new(Seed::new(19))));
     fixture
