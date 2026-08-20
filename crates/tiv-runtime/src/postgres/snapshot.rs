@@ -712,7 +712,7 @@ fn supported_type(found: &Type) -> bool {
     .contains(found)
 }
 
-fn normalize_query(sql: &str) -> Option<&str> {
+pub(super) fn normalize_query(sql: &str) -> Option<&str> {
     if sql.contains('\0') {
         return None;
     }

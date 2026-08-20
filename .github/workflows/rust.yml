@@ -102,6 +102,16 @@ jobs:
             2>&1 \
             | tee ci-evidence/postgres-snapshot.log
 
+      - name: Prove the configured SQL probe transition
+        env:
+          TIV_POSTGRES_TEST_PORT: "15432"
+        run: |
+          set -o pipefail
+          cargo test -p tiv-runtime --test sql_probe_contract \
+            -- --ignored --nocapture --test-threads=1 \
+            2>&1 \
+            | tee ci-evidence/postgres-sql-probe.log
+
       - name: Capture PostgreSQL logs after a failure
         if: failure()
         continue-on-error: true

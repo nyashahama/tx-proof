@@ -300,6 +300,10 @@ impl ResolvedConfig {
         &self.private.invariant_role
     }
 
+    pub(crate) fn sql_probe_file(&self) -> &Path {
+        &self.private.sql_probe
+    }
+
     pub(crate) fn into_redacted(self) -> RedactedConfig {
         self.redacted
     }
@@ -331,7 +335,7 @@ struct ResolvedPrivate {
     _driver_url: Url,
     _driver_body: PathBuf,
     _driver_timeout: Duration,
-    _sql_probe: PathBuf,
+    sql_probe: PathBuf,
     invariant_role: String,
     invariant_files: Vec<ResolvedInvariantFile>,
 }
@@ -785,7 +789,7 @@ fn resolve_raw_config(
             _driver_url: driver_url,
             _driver_body: driver_body,
             _driver_timeout: driver_timeout,
-            _sql_probe: sql_probe,
+            sql_probe,
             invariant_role: raw.database.invariant_role,
             invariant_files,
         },
