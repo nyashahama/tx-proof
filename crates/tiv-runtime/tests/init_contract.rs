@@ -28,6 +28,7 @@ fn init_writes_the_exact_fail_closed_v1_scaffold_without_secrets() {
         "invariants/05_balanced_ledger.sql",
         "kill_probe.sql",
         "quiescence.sql",
+        "tiv-safety-marker.sql",
         "tiv.toml",
     ];
     assert_eq!(report.files(), expected);
@@ -51,6 +52,11 @@ fn init_writes_the_exact_fail_closed_v1_scaffold_without_secrets() {
             "{path} must fail closed until authored"
         );
     }
+    let marker = read(repository.path(), "tiv-safety-marker.sql");
+    assert!(marker.contains("CREATE TABLE tiv_verifier_marker"));
+    assert!(marker.contains("gen_random_uuid()"));
+    assert!(marker.contains("TODO-compose-project"));
+    assert!(marker.contains("TODO-application-role"));
 
     fs::write(repository.path().join("compose.yaml"), "services: {}\n")
         .expect("the customer-owned Compose placeholder writes");
@@ -72,6 +78,7 @@ fn init_refuses_every_collision_before_writing_and_never_overwrites_user_work() 
         "invariants/05_balanced_ledger.sql",
         "kill_probe.sql",
         "quiescence.sql",
+        "tiv-safety-marker.sql",
         "tiv.toml",
         "invariants",
     ] {
@@ -102,6 +109,7 @@ fn init_refuses_every_collision_before_writing_and_never_overwrites_user_work() 
             "checkout.json",
             "kill_probe.sql",
             "quiescence.sql",
+            "tiv-safety-marker.sql",
             "tiv.toml",
         ] {
             if generated != collision {

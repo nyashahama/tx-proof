@@ -307,6 +307,99 @@ pub struct MutationPermit {
     _private: (),
 }
 
+/// Exact, secret-free phrase the operator must repeat before one destructive
+/// reset can be considered. The phrase binds consent to every identity field
+/// that is rechecked immediately before mutation.
+#[derive(Debug)]
+pub struct ResetChallenge {
+    expected: DatabaseIdentity,
+    phrase: String,
+}
+
+impl ResetChallenge {
+    /// Creates a human-visible challenge for one already observed case target.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ResetAcknowledgementError::ExpectedCaseMarker`] unless both
+    /// the configured name and the in-database marker identify a case.
+    pub fn new(expected: DatabaseIdentity) -> Result<Self, ResetAcknowledgementError> {
+        if expected.database_name.kind != DatabaseKind::Case
+            || expected.marker.kind != MarkerKind::Case
+        {
+            return Err(ResetAcknowledgementError::ExpectedCaseMarker);
+        }
+        let phrase = format!(
+            "RESET {} fingerprint={} endpoint=127.0.0.1:{} oid={} owner={} marker={} project={} app-role={}",
+            expected.database_name.as_str(),
+            expected.server_fingerprint,
+            expected.endpoint.port(),
+            expected.database_oid,
+            expected.owner_oid,
+            expected.marker.marker_uuid(),
+            expected.marker.compose_project().as_str(),
+            expected.expected_application_role,
+        );
+        Ok(Self { expected, phrase })
+    }
+
+    #[must_use]
+    pub fn phrase(&self) -> &str {
+        &self.phrase
+    }
+
+    /// Consumes the challenge only when the operator repeats it byte-for-byte.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ResetAcknowledgementError::PhraseMismatch`] for abbreviated,
+    /// stale, or otherwise non-exact consent.
+    pub fn acknowledge(
+        self,
+        phrase: &str,
+    ) -> Result<ResetAuthorization, ResetAcknowledgementError> {
+        if phrase != self.phrase {
+            return Err(ResetAcknowledgementError::PhraseMismatch);
+        }
+        Ok(ResetAuthorization {
+            target: DatabaseTarget::new(self.expected),
+        })
+    }
+}
+
+/// Single-use reset consent awaiting a fresh database identity observation.
+#[derive(Debug)]
+pub struct ResetAuthorization {
+    target: DatabaseTarget<Unverified>,
+}
+
+impl ResetAuthorization {
+    /// Rechecks the complete target identity and issues one mutation permit.
+    ///
+    /// Consuming `self` prevents this acknowledgement from authorizing a
+    /// second reset. A later reset must create and repeat a fresh challenge.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ResetAcknowledgementError::Safety`] when any identity field
+    /// changed after the challenge was issued.
+    pub fn authorize(
+        self,
+        observed: &DatabaseIdentity,
+    ) -> Result<(DatabaseTarget<Verified>, MutationPermit), ResetAcknowledgementError> {
+        self.target
+            .verify(observed)
+            .map_err(ResetAcknowledgementError::Safety)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResetAcknowledgementError {
+    ExpectedCaseMarker,
+    PhraseMismatch,
+    Safety(SafetyError),
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum IdentityField {
     ServerFingerprint,

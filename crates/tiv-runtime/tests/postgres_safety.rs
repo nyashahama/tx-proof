@@ -1,6 +1,7 @@
 use tiv_runtime::postgres::safety::{
     ComposeProjectId, DatabaseEndpoint, DatabaseIdentity, DatabaseMarker, DatabaseName,
-    DatabaseTarget, IdentityField, MarkerKind, SafetyError, Unverified,
+    DatabaseTarget, IdentityField, MarkerKind, ResetAcknowledgementError, ResetChallenge,
+    SafetyError, Unverified,
 };
 use uuid::Uuid;
 
@@ -79,6 +80,69 @@ fn a_baseline_marker_can_never_authorize_case_mutation() {
         .expect_err("the sealed template is never a mutable case target");
 
     assert_eq!(error, SafetyError::ExpectedCaseMarker);
+}
+
+#[test]
+fn reset_acknowledgement_is_bound_to_the_complete_case_identity() {
+    let identity = case_identity(91, "11111111-1111-4111-8111-111111111111");
+    let challenge = ResetChallenge::new(identity.clone())
+        .expect("a marked case identity can issue a reset challenge");
+
+    assert!(challenge.phrase().contains("tiv_case_0123456789abcdef"));
+    assert!(challenge.phrase().contains("pg-system-740592390"));
+    assert!(challenge.phrase().contains("oid=91"));
+    assert!(
+        challenge
+            .phrase()
+            .contains("marker=11111111-1111-4111-8111-111111111111")
+    );
+    assert!(challenge.phrase().contains("project=tiv-truth-spike-test"));
+
+    let phrase = challenge.phrase().to_owned();
+    let authorization = challenge
+        .acknowledge(&phrase)
+        .expect("the exact generated phrase acknowledges this identity once");
+    let (verified, _permit) = authorization
+        .authorize(&identity)
+        .expect("freshly observing the same complete identity authorizes mutation");
+
+    assert_eq!(verified.identity(), &identity);
+}
+
+#[test]
+fn reset_acknowledgement_rejects_approximate_or_stale_consent() {
+    let identity = case_identity(91, "11111111-1111-4111-8111-111111111111");
+    let challenge = ResetChallenge::new(identity.clone()).unwrap();
+    assert!(matches!(
+        challenge.acknowledge("RESET tiv_case_0123456789abcdef"),
+        Err(ResetAcknowledgementError::PhraseMismatch)
+    ));
+
+    let challenge = ResetChallenge::new(identity.clone()).unwrap();
+    let phrase = challenge.phrase().to_owned();
+    let authorization = challenge.acknowledge(&phrase).unwrap();
+    let substituted = case_identity(92, "11111111-1111-4111-8111-111111111111");
+    assert_eq!(
+        authorization.authorize(&substituted).unwrap_err(),
+        ResetAcknowledgementError::Safety(SafetyError::IdentityMismatch(
+            IdentityField::DatabaseOid
+        ))
+    );
+}
+
+#[test]
+fn a_baseline_identity_cannot_issue_a_reset_challenge() {
+    let mut identity = case_identity(91, "11111111-1111-4111-8111-111111111111");
+    identity = identity.with_marker(DatabaseMarker::new(
+        Uuid::parse_str("11111111-1111-4111-8111-111111111111").unwrap(),
+        MarkerKind::Baseline,
+        ComposeProjectId::new("tiv-test").unwrap(),
+    ));
+
+    assert!(matches!(
+        ResetChallenge::new(identity),
+        Err(ResetAcknowledgementError::ExpectedCaseMarker)
+    ));
 }
 
 fn case_identity(database_oid: u32, marker_uuid: &str) -> DatabaseIdentity {

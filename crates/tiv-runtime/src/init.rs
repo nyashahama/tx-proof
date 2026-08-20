@@ -17,7 +17,7 @@ struct TemplateFile {
     contents: &'static str,
 }
 
-const TEMPLATE_FILES: [TemplateFile; 9] = [
+const TEMPLATE_FILES: [TemplateFile; 10] = [
     TemplateFile {
         relative_path: "checkout.json",
         contents: include_str!("../templates/checkout.json"),
@@ -49,6 +49,10 @@ const TEMPLATE_FILES: [TemplateFile; 9] = [
     TemplateFile {
         relative_path: "quiescence.sql",
         contents: include_str!("../templates/quiescence.sql"),
+    },
+    TemplateFile {
+        relative_path: "tiv-safety-marker.sql",
+        contents: include_str!("../templates/tiv-safety-marker.sql"),
     },
     TemplateFile {
         relative_path: "tiv.toml",
