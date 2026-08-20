@@ -18,6 +18,7 @@ use crate::{
     postgres::{
         oracle::{ProviderPaymentIntent, QuiescencePermit},
         safety::{DatabaseKind, DatabaseName},
+        spike::ReferencePaymentSqlProbe,
     },
     provider_http::{
         ProviderHttpAdapter, ProviderHttpConfig, ProviderHttpConfigError, ProviderHttpError,
@@ -169,8 +170,16 @@ pub async fn run_reference_planned_case(
     journal_path: impl AsRef<Path>,
     config: ReferenceCaseRunConfig,
 ) -> Result<ReferenceCaseRunReceipt, ReferenceCaseRunError> {
-    run_reference_planned_case_inner(run_id, case_id, planned_case, journal_path, config, None)
-        .await
+    run_reference_planned_case_inner(
+        run_id,
+        case_id,
+        planned_case,
+        journal_path,
+        config,
+        None,
+        None,
+    )
+    .await
 }
 
 pub(crate) async fn run_reference_planned_case_with_process(
@@ -180,6 +189,7 @@ pub(crate) async fn run_reference_planned_case_with_process(
     journal_path: impl AsRef<Path>,
     config: ReferenceCaseRunConfig,
     process: &mut dyn ReferenceProcessControl,
+    sql_probe: &mut ReferencePaymentSqlProbe,
 ) -> Result<ReferenceCaseRunReceipt, ReferenceCaseRunError> {
     run_reference_planned_case_inner(
         run_id,
@@ -188,21 +198,24 @@ pub(crate) async fn run_reference_planned_case_with_process(
         journal_path,
         config,
         Some(process),
+        Some(sql_probe),
     )
     .await
 }
 
-async fn run_reference_planned_case_inner(
+async fn run_reference_planned_case_inner<'a>(
     run_id: impl Into<String>,
     case_id: impl Into<String>,
     planned_case: &PlannedCase,
     journal_path: impl AsRef<Path>,
     config: ReferenceCaseRunConfig,
-    process: Option<&mut dyn ReferenceProcessControl>,
+    process: Option<&'a mut dyn ReferenceProcessControl>,
+    sql_probe: Option<&'a mut ReferencePaymentSqlProbe>,
 ) -> Result<ReferenceCaseRunReceipt, ReferenceCaseRunError> {
-    preflight_reference_planned_case(planned_case, process.is_some())?;
+    preflight_reference_planned_case(planned_case, process.is_some(), sql_probe.is_some())?;
     let client_response_cut_points = client_response_cut_point_actions(planned_case)?;
     let webhook_response_cut_points = webhook_response_cut_point_actions(planned_case)?;
+    let sql_probe_cut_points = sql_probe_cut_point_actions(planned_case)?;
     let outcomes = provider_outcomes(planned_case);
     reset_fixture(&config, planned_case, &outcomes).await?;
     let mut adapter = ReferenceCaseAdapter::new(
@@ -213,6 +226,8 @@ async fn run_reference_planned_case_inner(
                 .with_webhook_response_cut_points(webhook_response_cut_points),
         ),
         process,
+        sql_probe,
+        sql_probe_cut_points,
     );
     let executed =
         execute_planned_case(run_id, case_id, planned_case, journal_path, &mut adapter).await?;
@@ -226,6 +241,7 @@ async fn run_reference_planned_case_inner(
 pub(crate) fn preflight_reference_planned_case(
     planned_case: &PlannedCase,
     process_control_available: bool,
+    sql_probe_available: bool,
 ) -> Result<(), ReferenceCaseRunError> {
     planned_case
         .validate()
@@ -236,6 +252,7 @@ pub(crate) fn preflight_reference_planned_case(
         .any(|action| matches!(action.kind(), PlanActionKind::KillApplication { .. }));
     if client_response_cut_point_actions(planned_case).is_err()
         || webhook_response_cut_point_actions(planned_case).is_err()
+        || sql_probe_cut_point_actions(planned_case).is_err()
         || planned_case.actions().iter().any(|action| {
             matches!(
                 action.kind(),
@@ -245,10 +262,19 @@ pub(crate) fn preflight_reference_planned_case(
                         ProcessCutPoint::ClientRequestForwarded
                             | ProcessCutPoint::ClientResponseObserved
                             | ProcessCutPoint::WebhookResponseObserved
+                            | ProcessCutPoint::SqlProbe
                     )
             )
         })
         || (contains_process_fault && !process_control_available)
+        || (planned_case.actions().iter().any(|action| {
+            matches!(
+                action.kind(),
+                PlanActionKind::KillApplication {
+                    cut_point: ProcessCutPoint::SqlProbe
+                }
+            )
+        }) && !sql_probe_available)
     {
         return Err(ReferenceCaseRunError::UnsupportedProcessFault);
     }
@@ -340,6 +366,43 @@ fn webhook_response_cut_point_actions(
     Ok(action_ids)
 }
 
+fn sql_probe_cut_point_actions(
+    planned_case: &PlannedCase,
+) -> Result<std::collections::BTreeSet<tiv_core::trace::ActionId>, ReferenceCaseRunError> {
+    let mut action_ids = std::collections::BTreeSet::new();
+    for actions in planned_case.actions().windows(2) {
+        if !matches!(
+            actions[1].kind(),
+            PlanActionKind::KillApplication {
+                cut_point: ProcessCutPoint::SqlProbe
+            }
+        ) {
+            continue;
+        }
+        if matches!(actions[0].kind(), PlanActionKind::DriveCheckout { .. }) {
+            action_ids.insert(actions[0].id());
+        } else {
+            return Err(ReferenceCaseRunError::UnsupportedProcessFault);
+        }
+    }
+    let expected = planned_case
+        .actions()
+        .iter()
+        .filter(|action| {
+            matches!(
+                action.kind(),
+                PlanActionKind::KillApplication {
+                    cut_point: ProcessCutPoint::SqlProbe
+                }
+            )
+        })
+        .count();
+    if action_ids.len() != expected {
+        return Err(ReferenceCaseRunError::UnsupportedProcessFault);
+    }
+    Ok(action_ids)
+}
+
 fn provider_outcomes(planned_case: &PlannedCase) -> Vec<ProviderOutcome> {
     planned_case
         .actions()
@@ -412,6 +475,10 @@ struct ResetResponse {
 pub struct ReferenceCaseAdapter<'a> {
     http: CaseHttpAdapter,
     process: Option<&'a mut dyn ReferenceProcessControl>,
+    sql_probe: Option<&'a mut ReferencePaymentSqlProbe>,
+    sql_probe_action_ids: std::collections::BTreeSet<tiv_core::trace::ActionId>,
+    postgres_producer_sequence: u64,
+    sql_probe_observed: bool,
     application_healthy: bool,
     quiescence: Option<ReferenceCaseHttpCompletion>,
     checkpoint: Option<ReferenceCaseCheckpoint>,
@@ -422,10 +489,16 @@ impl<'a> ReferenceCaseAdapter<'a> {
     pub(crate) const fn new(
         http: CaseHttpAdapter,
         process: Option<&'a mut dyn ReferenceProcessControl>,
+        sql_probe: Option<&'a mut ReferencePaymentSqlProbe>,
+        sql_probe_action_ids: std::collections::BTreeSet<tiv_core::trace::ActionId>,
     ) -> Self {
         Self {
             http,
             process,
+            sql_probe,
+            sql_probe_action_ids,
+            postgres_producer_sequence: 0,
+            sql_probe_observed: false,
             application_healthy: true,
             quiescence: None,
             checkpoint: None,
@@ -498,11 +571,23 @@ impl<'a> ReferenceCaseAdapter<'a> {
             ProcessCutPoint::ClientRequestForwarded
                 | ProcessCutPoint::ClientResponseObserved
                 | ProcessCutPoint::WebhookResponseObserved
+                | ProcessCutPoint::SqlProbe
         ) || !self.application_healthy
         {
             return Err(ReferenceCaseError::InvalidLifecycleOrder);
         }
-        self.http.mark_application_killed(cut_point)?;
+        if cut_point == ProcessCutPoint::SqlProbe {
+            if !self.sql_probe_observed
+                || !self
+                    .sql_probe
+                    .as_deref()
+                    .is_some_and(ReferencePaymentSqlProbe::observed)
+            {
+                return Err(ReferenceCaseError::InvalidLifecycleOrder);
+            }
+        } else {
+            self.http.mark_application_killed(cut_point)?;
+        }
         self.process
             .as_deref_mut()
             .ok_or(ReferenceCaseError::MissingProcessControl)?
@@ -513,6 +598,47 @@ impl<'a> ReferenceCaseAdapter<'a> {
             .await?;
         self.application_healthy = false;
         Ok(Vec::new())
+    }
+
+    async fn execute_http(
+        &mut self,
+        request: CaseEffectRequest<'_>,
+    ) -> Result<crate::campaign::CaseEffectOutput, ReferenceCaseError> {
+        if !self.sql_probe_action_ids.contains(&request.action().id()) {
+            return self
+                .http
+                .execute(request)
+                .await
+                .map_err(ReferenceCaseError::Http);
+        }
+        let observation_request = request;
+        let probe = self
+            .sql_probe
+            .as_deref_mut()
+            .ok_or(ReferenceCaseError::MissingSqlProbe)?;
+        probe
+            .require_false()
+            .await
+            .map_err(|_| ReferenceCaseError::SqlProbe)?;
+        let (http_result, probe_result) =
+            tokio::join!(self.http.execute(request), probe.observe_true(),);
+        let output = http_result.map_err(ReferenceCaseError::Http)?;
+        probe_result.map_err(|_| ReferenceCaseError::SqlProbe)?;
+        let next_sequence = self
+            .postgres_producer_sequence
+            .checked_add(1)
+            .ok_or(ReferenceCaseError::PostgresObservationSequenceExhausted)?;
+        observation_request
+            .record_observation(
+                crate::journal::ObservationProducer::Postgres,
+                next_sequence,
+                crate::journal::ObservationEvent::SqlProbeTrue,
+            )
+            .await
+            .map_err(ReferenceCaseError::SqlProbeJournal)?;
+        self.postgres_producer_sequence = next_sequence;
+        self.sql_probe_observed = true;
+        Ok(output)
     }
 
     async fn restart_application(
@@ -551,11 +677,7 @@ impl CaseEffectAdapter for ReferenceCaseAdapter<'_> {
                 _ if self.quiescence.is_some() || self.checkpoint.is_some() => {
                     Err(ReferenceCaseError::InvalidLifecycleOrder)
                 }
-                _ => self
-                    .http
-                    .execute(request)
-                    .await
-                    .map_err(ReferenceCaseError::Http),
+                _ => self.execute_http(request).await,
             }
         })
     }
@@ -602,6 +724,14 @@ pub enum ReferenceCaseError {
     MissingCheckpoint,
     #[error("reference case process control is unavailable")]
     MissingProcessControl,
+    #[error("reference case SQL probe is unavailable")]
+    MissingSqlProbe,
+    #[error("reference case SQL probe failed")]
+    SqlProbe,
+    #[error("reference case SQL-probe journal append failed: {0}")]
+    SqlProbeJournal(#[source] crate::journal::JournalError),
+    #[error("reference case PostgreSQL observation sequence exhausted")]
+    PostgresObservationSequenceExhausted,
     #[error("reference case process action failed: {0}")]
     ProcessControl(#[from] ReferenceProcessControlError),
 }
@@ -679,7 +809,7 @@ mod tests {
             .expect("the bounded seed corpus contains a SQL-probe kill");
 
         assert!(matches!(
-            preflight_reference_planned_case(&plan, true),
+            preflight_reference_planned_case(&plan, true, true),
             Err(ReferenceCaseRunError::UnsupportedProcessFault)
         ));
     }
@@ -704,7 +834,7 @@ mod tests {
             })
             .expect("the bounded seed corpus contains a client-response kill");
 
-        preflight_reference_planned_case(&plan, true)
+        preflight_reference_planned_case(&plan, true, false)
             .expect("client-response process control is supported");
     }
 
@@ -740,7 +870,7 @@ mod tests {
             .expect("the seed corpus reaches an abstract non-application response cut point");
 
         assert!(matches!(
-            preflight_reference_planned_case(&plan, true),
+            preflight_reference_planned_case(&plan, true, false),
             Err(ReferenceCaseRunError::UnsupportedProcessFault)
         ));
     }
@@ -775,7 +905,43 @@ mod tests {
             })
             .expect("the seed corpus contains a webhook-response delivery cut point");
 
-        preflight_reference_planned_case(&plan, true)
+        preflight_reference_planned_case(&plan, true, false)
             .expect("a real fixture webhook response can own the process cut point");
+    }
+
+    #[test]
+    fn sql_probe_passes_preflight_only_after_the_initial_checkout() {
+        let plan = (0..4_096)
+            .find_map(|seed| {
+                let spec = PlanSpec::new_payment_intent_v1(
+                    Seed::new(seed),
+                    ActionBudget::new(40).unwrap(),
+                    [ProviderOutcome::Normal],
+                    WebhookFaultSpec::new(0, [], false, false).unwrap(),
+                    ProcessFaultSpec::new([ProcessCutPoint::SqlProbe], 1).unwrap(),
+                )
+                .unwrap();
+                let plan = CasePlanCompiler::compile(&spec).unwrap();
+                plan.actions()
+                    .windows(2)
+                    .any(|actions| {
+                        matches!(actions[0].kind(), PlanActionKind::DriveCheckout { .. })
+                            && matches!(
+                                actions[1].kind(),
+                                PlanActionKind::KillApplication {
+                                    cut_point: ProcessCutPoint::SqlProbe
+                                }
+                            )
+                    })
+                    .then_some(plan)
+            })
+            .expect("the seed corpus contains a checkout-owned SQL probe cut point");
+
+        assert!(matches!(
+            preflight_reference_planned_case(&plan, true, false),
+            Err(ReferenceCaseRunError::UnsupportedProcessFault)
+        ));
+        preflight_reference_planned_case(&plan, true, true)
+            .expect("a real read-only payment probe can own this cut point");
     }
 }

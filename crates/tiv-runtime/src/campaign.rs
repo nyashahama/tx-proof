@@ -21,6 +21,7 @@ use crate::journal::{
     ObservationEvent, ObservationJournal, ObservationProducer,
 };
 
+#[derive(Clone, Copy)]
 pub struct CaseEffectRequest<'a> {
     action: &'a PlannedAction,
     inputs: &'a [(CaseInputSlot, CaseCapturedValue)],

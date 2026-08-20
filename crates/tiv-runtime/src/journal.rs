@@ -109,6 +109,7 @@ pub enum ObservationEvent {
     ProviderResponseReleased { gate_id: u64 },
     WebhookResponseObserved { gate_id: u64 },
     WebhookResponseDiscarded { gate_id: u64 },
+    SqlProbeTrue,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -149,6 +150,7 @@ enum ObservationKind {
     ProviderResponseReleased,
     WebhookResponseObserved,
     WebhookResponseDiscarded,
+    SqlProbeTrue,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -183,6 +185,7 @@ impl ObservationEvent {
                 ObservationKind::WebhookResponseDiscarded,
                 ObservationPayload::Gate { gate_id },
             ),
+            Self::SqlProbeTrue => (ObservationKind::SqlProbeTrue, ObservationPayload::None),
         }
     }
 }

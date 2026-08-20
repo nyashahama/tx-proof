@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use thiserror::Error;
 use tokio::task::{JoinError, JoinHandle};
 use tokio_postgres::{Client, NoTls};
@@ -326,6 +328,54 @@ impl TruthSpikePostgres {
             .map_err(SpikePostgresError::Oracle);
         session.close().await?;
         result
+    }
+
+    /// Opens the fixed read-only payment predicate used by the synthetic
+    /// reference application's SQL process cut point.
+    pub(crate) async fn reference_payment_probe(
+        &self,
+        expected: &DatabaseTarget<Unverified>,
+        operation_id: &str,
+        timeout: Duration,
+        poll_interval: Duration,
+    ) -> Result<ReferencePaymentSqlProbe, SpikePostgresError> {
+        let case_name = expected.identity().database_name();
+        let expected_operation =
+            format!("op_{}", case_name.as_str().trim_start_matches("tiv_case_"));
+        if case_name.kind() != DatabaseKind::Case
+            || operation_id != expected_operation
+            || timeout.is_zero()
+            || poll_interval.is_zero()
+            || poll_interval >= timeout
+        {
+            return Err(SpikePostgresError::InvalidSqlProbeConfiguration);
+        }
+        let observed = self.observe_identity(case_name).await?;
+        if &observed != expected.identity() {
+            return Err(SpikePostgresError::PostResetIdentityMismatch);
+        }
+        let mut session = self.connect_database(case_name.as_str()).await?;
+        let identity = session
+            .client()
+            .query_one(
+                "SELECT current_database(), current_setting('cluster_name'), current_user",
+                &[],
+            )
+            .await?;
+        if identity.get::<_, &str>(0) != case_name.as_str()
+            || identity.get::<_, &str>(1) != REFERENCE_APP_CLUSTER_NAME
+            || identity.get::<_, &str>(2) != self.config.admin_role
+        {
+            return Err(SpikePostgresError::UnexpectedServerIdentity);
+        }
+        Ok(ReferencePaymentSqlProbe {
+            session,
+            operation_id: operation_id.to_owned(),
+            timeout,
+            poll_interval,
+            armed: false,
+            observed: false,
+        })
     }
 
     /// Rechecks the exact case identity, consumes a mutation permit, drops only
@@ -1118,6 +1168,78 @@ struct PostgresSession {
     connection: Option<JoinHandle<Result<(), tokio_postgres::Error>>>,
 }
 
+/// One bounded `PostgreSQL` observer for the reference payment-row transition.
+pub(crate) struct ReferencePaymentSqlProbe {
+    session: PostgresSession,
+    operation_id: String,
+    timeout: Duration,
+    poll_interval: Duration,
+    armed: bool,
+    observed: bool,
+}
+
+impl ReferencePaymentSqlProbe {
+    /// Proves the payment predicate is false immediately before the owning
+    /// checkout action begins.
+    pub(crate) async fn require_false(&mut self) -> Result<(), SpikePostgresError> {
+        if self.armed || self.observed || self.payment_exists().await? {
+            return Err(SpikePostgresError::SqlProbeDidNotBeginFalse);
+        }
+        self.armed = true;
+        Ok(())
+    }
+
+    /// Observes the armed predicate's first true value through the non-login
+    /// invariant role.
+    pub(crate) async fn observe_true(&mut self) -> Result<(), SpikePostgresError> {
+        if !self.armed || self.observed {
+            return Err(SpikePostgresError::SqlProbeNotArmed);
+        }
+        tokio::time::timeout(self.timeout, async {
+            loop {
+                if self.payment_exists().await? {
+                    self.observed = true;
+                    return Ok(());
+                }
+                tokio::time::sleep(self.poll_interval).await;
+            }
+        })
+        .await
+        .map_err(|_| SpikePostgresError::SqlProbeTimeout)?
+    }
+
+    pub(crate) const fn observed(&self) -> bool {
+        self.observed
+    }
+
+    async fn payment_exists(&mut self) -> Result<bool, SpikePostgresError> {
+        let transaction = self.session.client().transaction().await?;
+        transaction
+            .batch_execute(
+                "SET TRANSACTION READ ONLY; \
+                 SET LOCAL statement_timeout = '2s'; \
+                 SET LOCAL lock_timeout = '100ms'; \
+                 SET LOCAL ROLE tiv_invariant",
+            )
+            .await?;
+        let row = transaction
+            .query_one(
+                "SELECT current_user, EXISTS ( \
+                     SELECT 1 FROM payments WHERE operation_id = $1 \
+                 )",
+                &[&self.operation_id],
+            )
+            .await?;
+        let role = row.get::<_, &str>(0);
+        let exists = row.get::<_, bool>(1);
+        transaction.rollback().await?;
+        if role != INVARIANT_ROLE {
+            return Err(SpikePostgresError::UnexpectedSqlProbeRole);
+        }
+        Ok(exists)
+    }
+}
+
 impl PostgresSession {
     fn client(&mut self) -> &mut Client {
         self.client.as_mut().expect("an open session has a client")
@@ -1172,6 +1294,16 @@ pub enum SpikePostgresError {
     UnsafeApplicationRole,
     #[error("the invariant role exceeds the isolated least-privilege contract")]
     UnsafeInvariantRole,
+    #[error("invalid reference SQL probe configuration")]
+    InvalidSqlProbeConfiguration,
+    #[error("the reference SQL probe predicate did not begin false")]
+    SqlProbeDidNotBeginFalse,
+    #[error("the reference SQL probe was not armed exactly once")]
+    SqlProbeNotArmed,
+    #[error("the reference SQL probe did not become true before its deadline")]
+    SqlProbeTimeout,
+    #[error("the reference SQL probe did not execute as the invariant role")]
+    UnexpectedSqlProbeRole,
     #[cfg(test)]
     #[error("the synthetic bug requires two distinct provider objects")]
     InvalidBugState,

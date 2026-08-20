@@ -25,8 +25,10 @@ use crate::{
     evidence::{EvidenceError, TruthSpikeEvidence},
     postgres::{
         oracle::{InvariantVerdict, ProviderPaymentIntent, QuiescencePermit, SnapshotReport},
-        safety::{ComposeProjectId, DatabaseName},
-        spike::{SpikePostgresConfig, SpikePostgresError, TruthSpikePostgres},
+        safety::{ComposeProjectId, DatabaseName, DatabaseTarget, Unverified},
+        spike::{
+            ReferencePaymentSqlProbe, SpikePostgresConfig, SpikePostgresError, TruthSpikePostgres,
+        },
     },
     reference_case::{
         ReferenceCaseRunConfig, ReferenceCaseRunConfigError, ReferenceCaseRunError,
@@ -614,11 +616,11 @@ struct ReferenceInvariantEvidence {
 /// Provisions one isolated case database, runs a compiled serial case through
 /// the real reference stack, and evaluates its final `PostgreSQL` checkpoint.
 ///
-/// The current slice executes `client_request_forwarded` and supported
-/// `client_response_observed` application kills against the exact attested
-/// container. Other process cut points are rejected
-/// before stack or database mutation. Provider, gate, webhook, quiescence,
-/// journal, and oracle boundaries are live.
+/// The current slice executes the supported client, webhook-response, and
+/// checkout-owned SQL-probe application kills against the exact attested
+/// container. Other process-cut placements are rejected before stack or
+/// database mutation. Provider, gate, webhook, SQL, quiescence, journal, and
+/// oracle boundaries are live.
 ///
 /// # Errors
 ///
@@ -629,7 +631,7 @@ pub async fn run_reference_app_planned_case(
     config: &ReferenceAppEvidenceConfig,
     journal_path: impl AsRef<Path>,
 ) -> Result<ReferencePlannedCaseEvidence, ReferenceAppEvidenceError> {
-    preflight_reference_planned_case(planned_case, true)?;
+    preflight_reference_planned_case(planned_case, true, true)?;
     let observed_stack = attest_reference_stack(
         config.postgres_port,
         &config.reference_app_url,
@@ -674,6 +676,7 @@ pub async fn run_reference_app_planned_case(
         .map_err(ReferenceAppEvidenceError::postgres)?;
     let database_oid = case_target.identity().database_oid();
     let operation_id = reference_operation_id(&case_name);
+    let mut sql_probe = reference_case_sql_probe(&postgres, &case_target, &operation_id).await?;
     let timestamp = current_unix_timestamp()?;
     let run_config = ReferenceCaseRunConfig::new(
         &case_name,
@@ -696,6 +699,7 @@ pub async fn run_reference_app_planned_case(
         journal_path,
         run_config,
         &mut process,
+        &mut sql_probe,
     )
     .await?;
     let executed_action_count = receipt.executed().trace().action_count();
@@ -724,6 +728,22 @@ pub async fn run_reference_app_planned_case(
         provider_object_count,
         invariant_outcomes,
     })
+}
+
+async fn reference_case_sql_probe(
+    postgres: &TruthSpikePostgres,
+    case_target: &DatabaseTarget<Unverified>,
+    operation_id: &str,
+) -> Result<ReferencePaymentSqlProbe, ReferenceAppEvidenceError> {
+    postgres
+        .reference_payment_probe(
+            case_target,
+            operation_id,
+            Duration::from_secs(10),
+            Duration::from_millis(10),
+        )
+        .await
+        .map_err(ReferenceAppEvidenceError::postgres)
 }
 
 async fn fixture_control_sequence(

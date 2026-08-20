@@ -142,11 +142,13 @@ TIV_POSTGRES_APPLICATION_PASSWORD=tiv-app-local-only-password \
     --fixture-control-url http://127.0.0.1:12112
 ```
 
-Only the `client_request_forwarded` process cut point is implemented. The
-runner SIGKILLs the exact attested application container, proves it stopped,
-starts the same container, waits for HTTP health and full stack re-attestation,
-and then continues the durable journal. All response-observed, webhook, and
-SQL-probe cut points fail before stack or database mutation.
+The runner implements `client_request_forwarded`, supported application
+`client_response_observed`, fixture `webhook_response_observed`, and the fixed
+reference payment-row `sql_probe` placement. It SIGKILLs the exact attested
+application container, proves it stopped, starts the same container, waits for
+HTTP health and full stack re-attestation, and then continues the durable
+journal. Webhook-request, configured customer SQL, and abstract process-cut
+placements fail before stack or database mutation.
 
 The command provisions a generated case database, installs a sequenced
 `commit_then_close`/`normal` fault plan, drives the application checkout, signs
