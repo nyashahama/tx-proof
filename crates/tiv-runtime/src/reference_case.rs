@@ -201,11 +201,13 @@ async fn run_reference_planned_case_inner(
     process: Option<&mut dyn ReferenceProcessControl>,
 ) -> Result<ReferenceCaseRunReceipt, ReferenceCaseRunError> {
     preflight_reference_planned_case(planned_case, process.is_some())?;
+    let client_response_cut_points = client_response_cut_point_actions(planned_case)?;
     let outcomes = provider_outcomes(planned_case);
     reset_fixture(&config, planned_case, &outcomes).await?;
     let mut adapter = ReferenceCaseAdapter::new(
         CaseHttpAdapter::new(
-            ProviderHttpAdapter::new(config.provider)?,
+            ProviderHttpAdapter::new(config.provider)?
+                .with_client_response_cut_points(client_response_cut_points),
             WebhookHttpAdapter::new(config.webhook)?,
         ),
         process,
@@ -230,13 +232,19 @@ pub(crate) fn preflight_reference_planned_case(
         .actions()
         .iter()
         .any(|action| matches!(action.kind(), PlanActionKind::KillApplication { .. }));
-    if planned_case.actions().iter().any(|action| {
-        matches!(
-            action.kind(),
-            PlanActionKind::KillApplication { cut_point }
-                if *cut_point != ProcessCutPoint::ClientRequestForwarded
-        )
-    }) || (contains_process_fault && !process_control_available)
+    if client_response_cut_point_actions(planned_case).is_err()
+        || planned_case.actions().iter().any(|action| {
+            matches!(
+                action.kind(),
+                PlanActionKind::KillApplication { cut_point }
+                    if !matches!(
+                        cut_point,
+                        ProcessCutPoint::ClientRequestForwarded
+                            | ProcessCutPoint::ClientResponseObserved
+                    )
+            )
+        })
+        || (contains_process_fault && !process_control_available)
     {
         return Err(ReferenceCaseRunError::UnsupportedProcessFault);
     }
@@ -245,6 +253,47 @@ pub(crate) fn preflight_reference_planned_case(
         return Err(ReferenceCaseRunError::MissingProviderOutcomes);
     }
     Ok(())
+}
+
+fn client_response_cut_point_actions(
+    planned_case: &PlannedCase,
+) -> Result<std::collections::BTreeSet<tiv_core::trace::ActionId>, ReferenceCaseRunError> {
+    let mut action_ids = std::collections::BTreeSet::new();
+    for actions in planned_case.actions().windows(2) {
+        if !matches!(
+            actions[1].kind(),
+            PlanActionKind::KillApplication {
+                cut_point: ProcessCutPoint::ClientResponseObserved
+            }
+        ) {
+            continue;
+        }
+        match actions[0].kind() {
+            PlanActionKind::DriveCheckout { provider_script }
+            | PlanActionKind::RetryBusinessRequest { provider_script }
+                if provider_script.terminal_outcome() != ProviderOutcome::CommitThenDelay =>
+            {
+                action_ids.insert(actions[0].id());
+            }
+            _ => return Err(ReferenceCaseRunError::UnsupportedProcessFault),
+        }
+    }
+    let expected = planned_case
+        .actions()
+        .iter()
+        .filter(|action| {
+            matches!(
+                action.kind(),
+                PlanActionKind::KillApplication {
+                    cut_point: ProcessCutPoint::ClientResponseObserved
+                }
+            )
+        })
+        .count();
+    if action_ids.len() != expected {
+        return Err(ReferenceCaseRunError::UnsupportedProcessFault);
+    }
+    Ok(action_ids)
 }
 
 fn provider_outcomes(planned_case: &PlannedCase) -> Vec<ProviderOutcome> {
@@ -400,10 +449,14 @@ impl<'a> ReferenceCaseAdapter<'a> {
         cut_point: ProcessCutPoint,
     ) -> Result<crate::campaign::CaseEffectOutput, ReferenceCaseError> {
         require_no_outputs(request)?;
-        if cut_point != ProcessCutPoint::ClientRequestForwarded || !self.application_healthy {
+        if !matches!(
+            cut_point,
+            ProcessCutPoint::ClientRequestForwarded | ProcessCutPoint::ClientResponseObserved
+        ) || !self.application_healthy
+        {
             return Err(ReferenceCaseError::InvalidLifecycleOrder);
         }
-        self.http.mark_application_killed()?;
+        self.http.mark_application_killed(cut_point)?;
         self.process
             .as_deref_mut()
             .ok_or(ReferenceCaseError::MissingProcessControl)?
@@ -575,6 +628,67 @@ mod tests {
                     .then_some(plan)
             })
             .expect("the bounded seed corpus contains a SQL-probe kill");
+
+        assert!(matches!(
+            preflight_reference_planned_case(&plan, true),
+            Err(ReferenceCaseRunError::UnsupportedProcessFault)
+        ));
+    }
+
+    #[test]
+    fn client_response_observed_passes_preflight_with_process_control() {
+        let plan = (0..512)
+            .find_map(|seed| {
+                let spec = PlanSpec::new_payment_intent_v1(
+                    Seed::new(seed),
+                    ActionBudget::new(40).unwrap(),
+                    [ProviderOutcome::Normal],
+                    WebhookFaultSpec::new(0, [], false, false).unwrap(),
+                    ProcessFaultSpec::new([ProcessCutPoint::ClientResponseObserved], 1).unwrap(),
+                )
+                .unwrap();
+                let plan = CasePlanCompiler::compile(&spec).unwrap();
+                plan.actions()
+                    .iter()
+                    .any(|action| matches!(action.kind(), PlanActionKind::KillApplication { .. }))
+                    .then_some(plan)
+            })
+            .expect("the bounded seed corpus contains a client-response kill");
+
+        preflight_reference_planned_case(&plan, true)
+            .expect("client-response process control is supported");
+    }
+
+    #[test]
+    fn client_response_observed_rejects_a_non_application_predecessor() {
+        let plan = (0..4_096)
+            .find_map(|seed| {
+                let spec = PlanSpec::new_payment_intent_v1(
+                    Seed::new(seed),
+                    ActionBudget::new(40).unwrap(),
+                    [ProviderOutcome::Normal],
+                    WebhookFaultSpec::new(0, [], false, false).unwrap(),
+                    ProcessFaultSpec::new([ProcessCutPoint::ClientResponseObserved], 1).unwrap(),
+                )
+                .unwrap();
+                let plan = CasePlanCompiler::compile(&spec).unwrap();
+                plan.actions()
+                    .windows(2)
+                    .any(|actions| {
+                        matches!(
+                            actions[1].kind(),
+                            PlanActionKind::KillApplication {
+                                cut_point: ProcessCutPoint::ClientResponseObserved
+                            }
+                        ) && !matches!(
+                            actions[0].kind(),
+                            PlanActionKind::DriveCheckout { .. }
+                                | PlanActionKind::RetryBusinessRequest { .. }
+                        )
+                    })
+                    .then_some(plan)
+            })
+            .expect("the seed corpus reaches an abstract non-application response cut point");
 
         assert!(matches!(
             preflight_reference_planned_case(&plan, true),

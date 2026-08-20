@@ -8,9 +8,9 @@ use serde::Deserialize;
 use thiserror::Error;
 use tiv_core::{
     plan::{PlanActionKind, ProviderOutcome, ProviderOutcomeScript},
-    trace::{CaseCapturedValue, CaseOutputRef, CaseOutputSlot},
+    trace::{ActionId, CaseCapturedValue, CaseOutputRef, CaseOutputSlot},
 };
-use tokio::{task::JoinHandle, time::timeout};
+use tokio::{sync::oneshot, task::JoinHandle, time::timeout};
 
 use crate::{
     campaign::{CaseEffectAdapter, CaseEffectFuture, CaseEffectOutput, CaseEffectRequest},
@@ -165,7 +165,10 @@ pub struct ProviderHttpAdapter {
     config: ProviderHttpConfig,
     client: Client,
     pending: Option<PendingProviderRequest>,
+    pending_client_response: Option<PendingClientResponse>,
+    client_response_cut_points: BTreeSet<ActionId>,
     known_payment_intents: BTreeSet<String>,
+    driver_producer_sequence: u64,
     fixture_producer_sequence: u64,
 }
 
@@ -188,9 +191,23 @@ impl ProviderHttpAdapter {
             config,
             client,
             pending: None,
+            pending_client_response: None,
+            client_response_cut_points: BTreeSet::new(),
             known_payment_intents: BTreeSet::new(),
+            driver_producer_sequence: 0,
             fixture_producer_sequence: 0,
         })
+    }
+
+    /// Marks the exact business-request actions whose validated application
+    /// response must be held for a `client_response_observed` process fault.
+    #[must_use]
+    pub fn with_client_response_cut_points<I>(mut self, action_ids: I) -> Self
+    where
+        I: IntoIterator<Item = ActionId>,
+    {
+        self.client_response_cut_points = action_ids.into_iter().collect();
+        self
     }
 
     pub(crate) const fn control_sequence(&self) -> u64 {
@@ -209,20 +226,39 @@ impl ProviderHttpAdapter {
     }
 
     pub(crate) const fn is_idle(&self) -> bool {
-        self.pending.is_none()
+        self.pending.is_none() && self.pending_client_response.is_none()
     }
 
-    pub(crate) fn mark_application_killed(&mut self) -> Result<(), ProviderHttpError> {
-        let pending = self
-            .pending
-            .as_mut()
-            .ok_or(ProviderHttpError::NoPendingRequest)?;
-        if !matches!(pending.kind, PendingRequestKind::Checkout { .. })
-            || pending.expect_application_disconnect
-        {
-            return Err(ProviderHttpError::InvalidProcessCutPointState);
+    pub(crate) fn mark_application_killed(
+        &mut self,
+        cut_point: tiv_core::plan::ProcessCutPoint,
+    ) -> Result<(), ProviderHttpError> {
+        match cut_point {
+            tiv_core::plan::ProcessCutPoint::ClientRequestForwarded => {
+                let pending = self
+                    .pending
+                    .as_mut()
+                    .ok_or(ProviderHttpError::NoPendingRequest)?;
+                if !matches!(pending.kind, PendingRequestKind::Checkout { .. })
+                    || pending.expect_application_disconnect
+                    || self.pending_client_response.is_some()
+                {
+                    return Err(ProviderHttpError::InvalidProcessCutPointState);
+                }
+                pending.expect_application_disconnect = true;
+            }
+            tiv_core::plan::ProcessCutPoint::ClientResponseObserved => {
+                let pending = self
+                    .pending_client_response
+                    .take()
+                    .ok_or(ProviderHttpError::InvalidProcessCutPointState)?;
+                if self.pending.is_some() {
+                    return Err(ProviderHttpError::InvalidProcessCutPointState);
+                }
+                pending.task.abort();
+            }
+            _ => return Err(ProviderHttpError::InvalidProcessCutPointState),
         }
-        pending.expect_application_disconnect = true;
         Ok(())
     }
 
@@ -272,7 +308,7 @@ impl ProviderHttpAdapter {
         request: &CaseEffectRequest<'_>,
         provider_script: ProviderOutcomeScript,
     ) -> Result<CaseEffectOutput, ProviderHttpError> {
-        if self.pending.is_some() {
+        if self.pending.is_some() || self.pending_client_response.is_some() {
             return Err(ProviderHttpError::RequestAlreadyPending);
         }
         require_checkout_outputs(
@@ -290,34 +326,9 @@ impl ProviderHttpAdapter {
             .map(|payment_intent| payment_intent.id.as_str())
             .collect::<BTreeSet<_>>();
 
-        let response = self
-            .client
-            .post(self.config.driver_url.clone())
-            .json(&self.config.driver_body)
-            .send()
-            .await
-            .map_err(ProviderHttpError::HttpRequest)?;
-        let expected_status = if provider_script.terminal_outcome() == ProviderOutcome::Normal {
-            StatusCode::OK
-        } else {
-            StatusCode::BAD_GATEWAY
-        };
-        if response.status() != expected_status {
-            return Err(ProviderHttpError::UnexpectedStatus {
-                step: "driver checkout",
-                status: response.status(),
-            });
-        }
-        let driver = if expected_status == StatusCode::OK {
-            Some(
-                response
-                    .json::<DriverCheckoutResponse>()
-                    .await
-                    .map_err(ProviderHttpError::HttpRequest)?,
-            )
-        } else {
-            None
-        };
+        let (driver, pending_client_response) = self
+            .request_checkout_at_cut_point(request.action().id(), provider_script)
+            .await?;
 
         let state = self.fixture_state().await?;
         self.validate_control_sequence(&state)?;
@@ -352,7 +363,88 @@ impl ProviderHttpAdapter {
         let captured = payment_intent_captures(request.expected_outputs(), &payment_intent_ids)?;
         self.known_payment_intents
             .extend(payment_intent_ids.into_iter());
+        if let Some(pending_client_response) = pending_client_response {
+            let next_sequence = self
+                .driver_producer_sequence
+                .checked_add(1)
+                .ok_or(ProviderHttpError::SequenceExhausted)?;
+            if let Err(error) = request
+                .record_observation(
+                    ObservationProducer::Driver,
+                    next_sequence,
+                    ObservationEvent::ClientResponseObserved,
+                )
+                .await
+            {
+                pending_client_response.task.abort();
+                return Err(ProviderHttpError::Journal(error));
+            }
+            self.driver_producer_sequence = next_sequence;
+            self.pending_client_response = Some(pending_client_response);
+        }
         Ok(captured)
+    }
+
+    async fn request_checkout_at_cut_point(
+        &self,
+        action_id: ActionId,
+        provider_script: ProviderOutcomeScript,
+    ) -> Result<
+        (
+            Option<DriverCheckoutResponse>,
+            Option<PendingClientResponse>,
+        ),
+        ProviderHttpError,
+    > {
+        if !self.client_response_cut_points.contains(&action_id) {
+            let response = request_driver_checkout(
+                &self.client,
+                self.config.driver_url.clone(),
+                &self.config.driver_body,
+                provider_script,
+            )
+            .await?;
+            return Ok((response, None));
+        }
+
+        let client = self.client.clone();
+        let driver_url = self.config.driver_url.clone();
+        let driver_body = self.config.driver_body.clone();
+        let (observed_tx, observed_rx) = oneshot::channel();
+        let (gate_tx, gate_rx) = oneshot::channel::<()>();
+        let task = tokio::spawn(async move {
+            let observed =
+                request_driver_checkout(&client, driver_url, &driver_body, provider_script).await;
+            observed_tx
+                .send(observed)
+                .map_err(|_| ProviderHttpError::ClientResponseGateClosed)?;
+            let _ = gate_rx.await;
+            Ok(())
+        });
+        let observed = match timeout(self.config.timeout, observed_rx).await {
+            Ok(Ok(observed)) => match observed {
+                Ok(driver) => driver,
+                Err(error) => {
+                    task.abort();
+                    return Err(error);
+                }
+            },
+            Ok(Err(_)) => {
+                task.abort();
+                return Err(ProviderHttpError::ClientResponseGateClosed);
+            }
+            Err(_) => {
+                task.abort();
+                return Err(ProviderHttpError::Timeout("driver checkout response"));
+            }
+        };
+        Ok((
+            observed,
+            Some(PendingClientResponse {
+                task,
+                _gate: gate_tx,
+            }),
+        ))
     }
 
     async fn confirm_payment_intent(
@@ -1048,6 +1140,43 @@ impl Drop for ProviderHttpAdapter {
         if let Some(pending) = self.pending.take() {
             pending.task.abort();
         }
+        if let Some(pending) = self.pending_client_response.take() {
+            pending.task.abort();
+        }
+    }
+}
+
+async fn request_driver_checkout(
+    client: &Client,
+    driver_url: Url,
+    driver_body: &serde_json::Value,
+    provider_script: ProviderOutcomeScript,
+) -> Result<Option<DriverCheckoutResponse>, ProviderHttpError> {
+    let response = client
+        .post(driver_url)
+        .json(driver_body)
+        .send()
+        .await
+        .map_err(ProviderHttpError::HttpRequest)?;
+    let expected_status = if provider_script.terminal_outcome() == ProviderOutcome::Normal {
+        StatusCode::OK
+    } else {
+        StatusCode::BAD_GATEWAY
+    };
+    if response.status() != expected_status {
+        return Err(ProviderHttpError::UnexpectedStatus {
+            step: "driver checkout",
+            status: response.status(),
+        });
+    }
+    if expected_status == StatusCode::OK {
+        response
+            .json::<DriverCheckoutResponse>()
+            .await
+            .map(Some)
+            .map_err(ProviderHttpError::HttpRequest)
+    } else {
+        Ok(None)
     }
 }
 
@@ -1222,6 +1351,11 @@ struct PendingProviderRequest {
     expect_application_disconnect: bool,
 }
 
+struct PendingClientResponse {
+    task: JoinHandle<Result<(), ProviderHttpError>>,
+    _gate: oneshot::Sender<()>,
+}
+
 impl PendingProviderRequest {
     fn payment_intent_ids(&self) -> &[String] {
         match &self.kind {
@@ -1366,6 +1500,8 @@ pub enum ProviderHttpError {
     InvalidProcessCutPointState,
     #[error("application returned a response after its process was killed")]
     ExpectedApplicationDisconnect,
+    #[error("the client-response observation gate closed before process control")]
+    ClientResponseGateClosed,
     #[error("provider HTTP sequence exhausted")]
     SequenceExhausted,
     #[error("provider HTTP request task failed: {0}")]

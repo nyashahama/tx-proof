@@ -1,7 +1,7 @@
 //! Serial composition of the provider and webhook HTTP effect boundaries.
 
 use thiserror::Error;
-use tiv_core::plan::PlanActionKind;
+use tiv_core::plan::{PlanActionKind, ProcessCutPoint};
 
 use crate::{
     campaign::{CaseEffectAdapter, CaseEffectFuture, CaseEffectRequest},
@@ -38,9 +38,12 @@ impl CaseHttpAdapter {
         })
     }
 
-    pub(crate) fn mark_application_killed(&mut self) -> Result<(), CaseHttpError> {
+    pub(crate) fn mark_application_killed(
+        &mut self,
+        cut_point: ProcessCutPoint,
+    ) -> Result<(), CaseHttpError> {
         self.provider
-            .mark_application_killed()
+            .mark_application_killed(cut_point)
             .map_err(CaseHttpError::Provider)
     }
 

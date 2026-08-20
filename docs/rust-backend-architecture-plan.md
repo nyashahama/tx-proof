@@ -387,9 +387,11 @@ data-plane port.
 
 The reference planned-case runner validates the compiled plan before mutation,
 installs the exact flattened provider fault scripts, and executes the full
-serial plan into a durable journal. It supports one honest process cut point:
+serial plan into a durable journal. It supports two honest process cut points:
 `client_request_forwarded` after the fixture has committed and held its
-response. The runner sends SIGKILL to the exact locally attested application
+response, and `client_response_observed` after the driver has validated and
+durably journaled an application response while its logical delivery remains
+blocked. The runner sends SIGKILL to the exact locally attested application
 container, proves that container stopped, starts the same container, and waits
 for both application health and full three-service re-attestation. Releasing
 the provider gate must then end the killed in-flight driver request without a
@@ -397,7 +399,7 @@ manufactured response. Case-derived operation identity and a narrow durable
 order read let a restarted application recover webhook routing from PostgreSQL
 instead of process RAM.
 
-Response-observed, webhook, and SQL-probe cut points remain unsupported and are
+Webhook and SQL-probe cut points remain unsupported and are
 rejected before stack inspection or database provisioning. The reference-only
 quiescence gate requires no held provider request, no queued webhook, no held
 fixture gate, no unused provider outcome, and a validated provider projection.
@@ -408,7 +410,7 @@ same isolated stack.
 
 This slice is proven through real loopback fixture and application endpoints
 and the live Compose reference runner. Durable fixture delivery-attempt
-history and real blocking gates for response-observed, webhook, and SQL-probe
+history and real blocking gates for webhook and SQL-probe
 cut points remain later integration boundaries.
 
 The proposed fixture topology has separate data and control listeners. The data listener is reachable by the SUT on an internal Compose network. The control listener is published only to loopback and requires an unlogged run token plus a monotonic command sequence. Control DTOs are versioned. The truth spike must prove that this protocol is necessary and portable before it becomes part of trace compatibility.
@@ -434,7 +436,8 @@ docker compose --project-name <exact> ... kill --signal SIGKILL <configured-serv
 ```
 
 and then releases or closes the held operation according to the trace. The
-current reference runner implements only `client_request_forwarded` and uses
+current reference runner implements `client_request_forwarded` plus the
+application-checkout form of `client_response_observed`, and uses
 the already-attested local Docker container ID rather than ambient Docker
 context. Restart starts that exact stopped container, then repeats full Docker
 attestation and application-health checks before execution continues.

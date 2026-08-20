@@ -10,8 +10,8 @@ use hyper_util::rt::TokioIo;
 use tiv_core::{
     decision::Seed,
     plan::{
-        ActionBudget, CasePlanCompiler, PlanActionKind, PlanSpec, ProviderOutcome,
-        ProviderOutcomeScript,
+        ActionBudget, CasePlanCompiler, PlanActionKind, PlanSpec, ProcessCutPoint,
+        ProcessFaultSpec, ProviderOutcome, ProviderOutcomeScript, WebhookFaultSpec,
     },
     trace::{CaseCapturedValue, CaseOutputRef, CaseOutputSlot},
 };
@@ -375,6 +375,93 @@ async fn a_real_held_provider_response_is_journaled_before_release_and_driver_co
     assert_eq!(records[4]["observation_kind"], "provider_response_released");
     assert_eq!(records[4]["payload"]["gate_id"], 1);
     assert_eq!(records[5]["observation_kind"], "action_outcome");
+
+    drop(adapter);
+    harness.finish().await;
+    tokio::fs::remove_file(journal_path).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_observed_application_response_is_journaled_while_the_logical_driver_is_held() {
+    let plan = (0..512)
+        .find_map(|seed| {
+            let spec = PlanSpec::new_payment_intent_v1(
+                Seed::new(seed),
+                ActionBudget::new(40).unwrap(),
+                [ProviderOutcome::Normal],
+                WebhookFaultSpec::new(0, [], false, false).unwrap(),
+                ProcessFaultSpec::new([ProcessCutPoint::ClientResponseObserved], 1).unwrap(),
+            )
+            .unwrap();
+            let plan = CasePlanCompiler::compile(&spec).unwrap();
+            matches!(
+                plan.actions()
+                    .get(1)
+                    .map(tiv_core::plan::PlannedAction::kind),
+                Some(PlanActionKind::KillApplication {
+                    cut_point: ProcessCutPoint::ClientResponseObserved
+                })
+            )
+            .then_some(plan)
+        })
+        .expect("the bounded seed corpus contains a response-observed first checkout");
+    let first_action_id = plan.actions()[0].id();
+    let harness = HttpHarness::start(vec![FaultOutcome::Normal], 1).await;
+    let journal_path = journal_path();
+    let config = ProviderHttpConfig::new(
+        format!("http://{}/checkout", harness.driver_address),
+        serde_json::json!({
+            "database": "tiv_case_0123456789abcdef",
+            "operation_id": "op_73",
+            "amount_minor": 2500,
+            "currency": "usd"
+        }),
+        format!("http://{}", harness.data_address),
+        format!("http://{}", harness.control_address),
+        "case-control-token",
+        1,
+        Duration::from_secs(2),
+        Duration::from_millis(2),
+    )
+    .unwrap();
+    let mut adapter = CompletingAdapter {
+        provider_http: ProviderHttpAdapter::new(config)
+            .unwrap()
+            .with_client_response_cut_points([first_action_id]),
+        real_business_actions_remaining: 1,
+        real_confirm_actions_remaining: 0,
+        real_retrieves_remaining: 0,
+        real_gate_pending: false,
+    };
+
+    let execution = execute_planned_case(
+        "run_response_73",
+        "case_response_73",
+        &plan,
+        &journal_path,
+        &mut adapter,
+    )
+    .await
+    .expect("the observed response returns captures while its logical delivery stays held");
+
+    assert!(matches!(
+        execution.trace().resolve(CaseOutputRef::new(
+            first_action_id,
+            CaseOutputSlot::PaymentIntentId,
+        )),
+        Some(CaseCapturedValue::PaymentIntentId(id)) if id.as_str().starts_with("pi_tiv_")
+    ));
+    let records = tokio::fs::read_to_string(&journal_path)
+        .await
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(records[0]["observation_kind"], "action_intent");
+    assert_eq!(records[1]["producer"], "driver");
+    assert_eq!(records[1]["observation_kind"], "client_response_observed");
+    assert_eq!(records[2]["observation_kind"], "action_outcome");
+    assert_eq!(records[3]["observation_kind"], "action_intent");
 
     drop(adapter);
     harness.finish().await;

@@ -104,6 +104,7 @@ pub enum ObservationProducer {
 pub enum ObservationEvent {
     ActionIntent,
     ActionOutcome,
+    ClientResponseObserved,
     ProviderResponseHeld { gate_id: u64 },
     ProviderResponseReleased { gate_id: u64 },
 }
@@ -141,6 +142,7 @@ impl Observation {
 enum ObservationKind {
     ActionIntent,
     ActionOutcome,
+    ClientResponseObserved,
     ProviderResponseHeld,
     ProviderResponseReleased,
 }
@@ -157,6 +159,10 @@ impl ObservationEvent {
         match self {
             Self::ActionIntent => (ObservationKind::ActionIntent, ObservationPayload::None),
             Self::ActionOutcome => (ObservationKind::ActionOutcome, ObservationPayload::None),
+            Self::ClientResponseObserved => (
+                ObservationKind::ClientResponseObserved,
+                ObservationPayload::None,
+            ),
             Self::ProviderResponseHeld { gate_id } => (
                 ObservationKind::ProviderResponseHeld,
                 ObservationPayload::Gate { gate_id },

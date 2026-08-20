@@ -614,8 +614,9 @@ struct ReferenceInvariantEvidence {
 /// Provisions one isolated case database, runs a compiled serial case through
 /// the real reference stack, and evaluates its final `PostgreSQL` checkpoint.
 ///
-/// The current slice executes a `client_request_forwarded` application kill
-/// against the exact attested container. Other process cut points are rejected
+/// The current slice executes `client_request_forwarded` and supported
+/// `client_response_observed` application kills against the exact attested
+/// container. Other process cut points are rejected
 /// before stack or database mutation. Provider, gate, webhook, quiescence,
 /// journal, and oracle boundaries are live.
 ///
