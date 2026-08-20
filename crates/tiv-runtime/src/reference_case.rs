@@ -202,13 +202,15 @@ async fn run_reference_planned_case_inner(
 ) -> Result<ReferenceCaseRunReceipt, ReferenceCaseRunError> {
     preflight_reference_planned_case(planned_case, process.is_some())?;
     let client_response_cut_points = client_response_cut_point_actions(planned_case)?;
+    let webhook_response_cut_points = webhook_response_cut_point_actions(planned_case)?;
     let outcomes = provider_outcomes(planned_case);
     reset_fixture(&config, planned_case, &outcomes).await?;
     let mut adapter = ReferenceCaseAdapter::new(
         CaseHttpAdapter::new(
             ProviderHttpAdapter::new(config.provider)?
                 .with_client_response_cut_points(client_response_cut_points),
-            WebhookHttpAdapter::new(config.webhook)?,
+            WebhookHttpAdapter::new(config.webhook)?
+                .with_webhook_response_cut_points(webhook_response_cut_points),
         ),
         process,
     );
@@ -233,6 +235,7 @@ pub(crate) fn preflight_reference_planned_case(
         .iter()
         .any(|action| matches!(action.kind(), PlanActionKind::KillApplication { .. }));
     if client_response_cut_point_actions(planned_case).is_err()
+        || webhook_response_cut_point_actions(planned_case).is_err()
         || planned_case.actions().iter().any(|action| {
             matches!(
                 action.kind(),
@@ -241,6 +244,7 @@ pub(crate) fn preflight_reference_planned_case(
                         cut_point,
                         ProcessCutPoint::ClientRequestForwarded
                             | ProcessCutPoint::ClientResponseObserved
+                            | ProcessCutPoint::WebhookResponseObserved
                     )
             )
         })
@@ -286,6 +290,46 @@ fn client_response_cut_point_actions(
                 action.kind(),
                 PlanActionKind::KillApplication {
                     cut_point: ProcessCutPoint::ClientResponseObserved
+                }
+            )
+        })
+        .count();
+    if action_ids.len() != expected {
+        return Err(ReferenceCaseRunError::UnsupportedProcessFault);
+    }
+    Ok(action_ids)
+}
+
+fn webhook_response_cut_point_actions(
+    planned_case: &PlannedCase,
+) -> Result<std::collections::BTreeSet<tiv_core::trace::ActionId>, ReferenceCaseRunError> {
+    let mut action_ids = std::collections::BTreeSet::new();
+    for actions in planned_case.actions().windows(2) {
+        if !matches!(
+            actions[1].kind(),
+            PlanActionKind::KillApplication {
+                cut_point: ProcessCutPoint::WebhookResponseObserved
+            }
+        ) {
+            continue;
+        }
+        if matches!(
+            actions[0].kind(),
+            PlanActionKind::DeliverWebhook | PlanActionKind::DuplicateWebhook
+        ) {
+            action_ids.insert(actions[0].id());
+        } else {
+            return Err(ReferenceCaseRunError::UnsupportedProcessFault);
+        }
+    }
+    let expected = planned_case
+        .actions()
+        .iter()
+        .filter(|action| {
+            matches!(
+                action.kind(),
+                PlanActionKind::KillApplication {
+                    cut_point: ProcessCutPoint::WebhookResponseObserved
                 }
             )
         })
@@ -451,7 +495,9 @@ impl<'a> ReferenceCaseAdapter<'a> {
         require_no_outputs(request)?;
         if !matches!(
             cut_point,
-            ProcessCutPoint::ClientRequestForwarded | ProcessCutPoint::ClientResponseObserved
+            ProcessCutPoint::ClientRequestForwarded
+                | ProcessCutPoint::ClientResponseObserved
+                | ProcessCutPoint::WebhookResponseObserved
         ) || !self.application_healthy
         {
             return Err(ReferenceCaseError::InvalidLifecycleOrder);
@@ -461,6 +507,9 @@ impl<'a> ReferenceCaseAdapter<'a> {
             .as_deref_mut()
             .ok_or(ReferenceCaseError::MissingProcessControl)?
             .kill_application()
+            .await?;
+        self.http
+            .complete_application_kill(request, cut_point)
             .await?;
         self.application_healthy = false;
         Ok(Vec::new())
@@ -694,5 +743,39 @@ mod tests {
             preflight_reference_planned_case(&plan, true),
             Err(ReferenceCaseRunError::UnsupportedProcessFault)
         ));
+    }
+
+    #[test]
+    fn webhook_response_observed_passes_preflight_after_a_real_delivery() {
+        let plan = (0..4_096)
+            .find_map(|seed| {
+                let spec = PlanSpec::new_payment_intent_v1(
+                    Seed::new(seed),
+                    ActionBudget::new(40).unwrap(),
+                    [ProviderOutcome::Normal],
+                    WebhookFaultSpec::new(1, [], false, false).unwrap(),
+                    ProcessFaultSpec::new([ProcessCutPoint::WebhookResponseObserved], 1).unwrap(),
+                )
+                .unwrap();
+                let plan = CasePlanCompiler::compile(&spec).unwrap();
+                plan.actions()
+                    .windows(2)
+                    .any(|actions| {
+                        matches!(
+                            actions[0].kind(),
+                            PlanActionKind::DeliverWebhook | PlanActionKind::DuplicateWebhook
+                        ) && matches!(
+                            actions[1].kind(),
+                            PlanActionKind::KillApplication {
+                                cut_point: ProcessCutPoint::WebhookResponseObserved
+                            }
+                        )
+                    })
+                    .then_some(plan)
+            })
+            .expect("the seed corpus contains a webhook-response delivery cut point");
+
+        preflight_reference_planned_case(&plan, true)
+            .expect("a real fixture webhook response can own the process cut point");
     }
 }

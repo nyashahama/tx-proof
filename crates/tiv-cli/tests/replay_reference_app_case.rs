@@ -255,3 +255,102 @@ fn client_response_observed_kill_restarts_and_finishes_the_live_case() {
     std::fs::remove_file(plan_path).unwrap();
     assert!(!String::from_utf8_lossy(&output.stdout).contains("password"));
 }
+
+#[test]
+#[ignore = "requires a fresh isolated reference-app Compose project"]
+fn webhook_response_observed_kill_restarts_and_finishes_the_live_case() {
+    let plan = (0..4_096)
+        .find_map(|seed| {
+            let spec = PlanSpec::new_payment_intent_v1(
+                Seed::new(seed),
+                ActionBudget::new(40).unwrap(),
+                [ProviderOutcome::Normal],
+                WebhookFaultSpec::new(1, [], false, false).unwrap(),
+                ProcessFaultSpec::new([ProcessCutPoint::WebhookResponseObserved], 1).unwrap(),
+            )
+            .unwrap();
+            let plan = CasePlanCompiler::compile(&spec).unwrap();
+            plan.actions()
+                .windows(2)
+                .any(|actions| {
+                    matches!(actions[0].kind(), PlanActionKind::DeliverWebhook)
+                        && matches!(
+                            actions[1].kind(),
+                            PlanActionKind::KillApplication {
+                                cut_point: ProcessCutPoint::WebhookResponseObserved
+                            }
+                        )
+                })
+                .then_some(plan)
+        })
+        .expect("the seed corpus contains a webhook-response delivery cut point");
+    let nonce = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let plan_path = std::env::temp_dir().join(format!(
+        "tiv-reference-webhook-response-plan-{}-{nonce}.json",
+        std::process::id()
+    ));
+    let journal_path = std::env::temp_dir().join(format!(
+        "tiv-reference-webhook-response-case-{}-{nonce}.jsonl",
+        std::process::id()
+    ));
+    std::fs::write(&plan_path, serde_json::to_vec_pretty(&plan).unwrap()).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_tiv"))
+        .args([
+            "replay",
+            "reference-app-case",
+            "--plan",
+            plan_path.to_str().unwrap(),
+            "--journal",
+            journal_path.to_str().unwrap(),
+            "--postgres-port",
+            "15432",
+            "--reference-app-url",
+            "http://127.0.0.1:18080",
+            "--fixture-control-url",
+            "http://127.0.0.1:12112",
+        ])
+        .env("TIV_FIXTURE_CONTROL_TOKEN", "run-scoped-control-token")
+        .env("TIV_POSTGRES_ADMIN_PASSWORD", "tiv-local-only-password")
+        .env(
+            "TIV_POSTGRES_APPLICATION_PASSWORD",
+            "tiv-app-local-only-password",
+        )
+        .env("DOCKER_HOST", "tcp://127.0.0.1:9")
+        .env("DOCKER_CONTEXT", "intentionally-remote")
+        .env("HTTP_PROXY", "http://127.0.0.1:9")
+        .env("HTTPS_PROXY", "http://127.0.0.1:9")
+        .env_remove("NO_PROXY")
+        .env_remove("no_proxy")
+        .output()
+        .expect("the tiv binary executes");
+
+    assert!(
+        output.status.success(),
+        "command failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["schema_version"], 1);
+    assert_eq!(value["seed"], plan.seed().value());
+    assert_eq!(value["planned_action_count"], plan.actions().len());
+    assert_eq!(value["executed_action_count"], plan.actions().len());
+    assert_eq!(value["provider_object_count"], 1);
+    assert!(
+        value["journal_record_count"]
+            .as_u64()
+            .is_some_and(|count| count >= (plan.actions().len() * 2 + 2) as u64)
+    );
+    assert!(
+        value["invariant_outcomes"]
+            .as_array()
+            .is_some_and(|outcomes| outcomes.len() == 5
+                && outcomes.iter().all(|outcome| outcome["verdict"] == "held"))
+    );
+    assert!(journal_path.exists());
+    std::fs::remove_file(journal_path).unwrap();
+    std::fs::remove_file(plan_path).unwrap();
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("password"));
+}

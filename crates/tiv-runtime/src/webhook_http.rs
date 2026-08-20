@@ -10,10 +10,14 @@ use serde::Deserialize;
 use thiserror::Error;
 use tiv_core::{
     plan::PlanActionKind,
-    trace::{CaseCapturedValue, CaseInputSlot, CaseOutputRef, CaseOutputSlot},
+    trace::{ActionId, CaseCapturedValue, CaseInputSlot, CaseOutputRef, CaseOutputSlot},
 };
+use tokio::task::JoinHandle;
 
-use crate::campaign::{CaseEffectAdapter, CaseEffectFuture, CaseEffectOutput, CaseEffectRequest};
+use crate::{
+    campaign::{CaseEffectAdapter, CaseEffectFuture, CaseEffectOutput, CaseEffectRequest},
+    journal::{JournalError, ObservationEvent, ObservationProducer},
+};
 
 const MAX_CONTROL_TOKEN_BYTES: usize = 1_024;
 const MAX_WEBHOOK_DELAY: Duration = Duration::from_secs(5);
@@ -108,6 +112,9 @@ pub struct WebhookHttpAdapter {
     pending: VecDeque<PendingWebhook>,
     generated_events: BTreeSet<String>,
     last_delivered: Option<String>,
+    response_cut_points: BTreeSet<ActionId>,
+    pending_response: Option<PendingWebhookResponse>,
+    fixture_producer_sequence: u64,
 }
 
 impl WebhookHttpAdapter {
@@ -131,7 +138,21 @@ impl WebhookHttpAdapter {
             pending: VecDeque::new(),
             generated_events: BTreeSet::new(),
             last_delivered: None,
+            response_cut_points: BTreeSet::new(),
+            pending_response: None,
+            fixture_producer_sequence: 0,
         })
+    }
+
+    /// Marks delivery actions that must pause after the fixture observes the
+    /// application's webhook response.
+    #[must_use]
+    pub fn with_webhook_response_cut_points<I>(mut self, action_ids: I) -> Self
+    where
+        I: IntoIterator<Item = ActionId>,
+    {
+        self.response_cut_points = action_ids.into_iter().collect();
+        self
     }
 
     pub(crate) const fn control_sequence(&self) -> u64 {
@@ -150,7 +171,29 @@ impl WebhookHttpAdapter {
     }
 
     pub(crate) fn is_idle(&self) -> bool {
-        self.pending.is_empty()
+        self.pending.is_empty() && self.pending_response.is_none()
+    }
+
+    pub(crate) const fn fixture_producer_sequence(&self) -> u64 {
+        self.fixture_producer_sequence
+    }
+
+    pub(crate) fn synchronize_fixture_producer_sequence(
+        &mut self,
+        observed: u64,
+    ) -> Result<(), WebhookHttpError> {
+        if observed < self.fixture_producer_sequence {
+            return Err(WebhookHttpError::UnexpectedControlResponse);
+        }
+        self.fixture_producer_sequence = observed;
+        Ok(())
+    }
+
+    pub(crate) fn require_observed_response(&self) -> Result<(), WebhookHttpError> {
+        self.pending_response
+            .as_ref()
+            .map(|_| ())
+            .ok_or(WebhookHttpError::NoPendingWebhookResponse)
     }
 
     async fn generate_event(
@@ -206,7 +249,7 @@ impl WebhookHttpAdapter {
         if let Some(not_before) = pending.not_before {
             tokio::time::sleep_until(not_before.into()).await;
         }
-        self.deliver_event(&pending.event_id).await?;
+        self.deliver_event(request, &pending.event_id).await?;
         let removed = self
             .pending
             .pop_front()
@@ -227,7 +270,7 @@ impl WebhookHttpAdapter {
             .last_delivered
             .clone()
             .ok_or(WebhookHttpError::UnexpectedQueueState)?;
-        self.deliver_event(&event_id).await?;
+        self.deliver_event(request, &event_id).await?;
         Ok(Vec::new())
     }
 
@@ -279,40 +322,205 @@ impl WebhookHttpAdapter {
         Ok(Vec::new())
     }
 
-    async fn deliver_event(&mut self, event_id: &str) -> Result<(), WebhookHttpError> {
+    async fn deliver_event(
+        &mut self,
+        request: &CaseEffectRequest<'_>,
+        event_id: &str,
+    ) -> Result<(), WebhookHttpError> {
         let next_sequence = self.next_control_sequence()?;
         let timestamp = self.config.next_timestamp;
         let next_timestamp = timestamp
             .checked_add(1)
             .ok_or(WebhookHttpError::SequenceExhausted)?;
-        let response = self
-            .client
-            .post(self.control_endpoint("/v1/control/deliver-event"))
-            .header("X-Tiv-Control-Token", &self.config.fixture_control_token)
-            .json(&serde_json::json!({
-                "command_sequence": next_sequence,
-                "event_id": event_id,
-                "timestamp": timestamp,
-            }))
-            .send()
-            .await
-            .map_err(WebhookHttpError::ControlRequest)?;
-        require_status(response.status(), "deliver event")?;
-        let delivered = response
-            .json::<DeliveredEventResponse>()
-            .await
-            .map_err(WebhookHttpError::ControlRequest)?;
-        if delivered.command_sequence != next_sequence
-            || delivered.event_id != event_id
-            || delivered.timestamp != timestamp
-        {
-            return Err(WebhookHttpError::UnexpectedControlResponse);
-        }
+        let held = self.response_cut_points.contains(&request.action().id());
+        let delivered = if held {
+            self.start_held_delivery(request, event_id, next_sequence, timestamp)
+                .await?
+        } else {
+            send_delivery_request(
+                &self.client,
+                self.control_endpoint("/v1/control/deliver-event"),
+                &self.config.fixture_control_token,
+                next_sequence,
+                event_id,
+                timestamp,
+            )
+            .await?
+        };
         self.config.control_sequence = next_sequence;
         self.config.next_timestamp = next_timestamp;
         if !(200..300).contains(&delivered.status) {
             return Err(WebhookHttpError::UnexpectedDeliveryStatus(delivered.status));
         }
+        Ok(())
+    }
+
+    async fn start_held_delivery(
+        &mut self,
+        request: &CaseEffectRequest<'_>,
+        event_id: &str,
+        command_sequence: u64,
+        timestamp: i64,
+    ) -> Result<DeliveredEventResponse, WebhookHttpError> {
+        if self.pending_response.is_some() {
+            return Err(WebhookHttpError::WebhookResponseAlreadyPending);
+        }
+        let client = self.client.clone();
+        let endpoint = self.control_endpoint("/v1/control/deliver-event-held-response");
+        let token = self.config.fixture_control_token.clone();
+        let task_event_id = event_id.to_owned();
+        let task = tokio::spawn(async move {
+            send_delivery_request(
+                &client,
+                endpoint,
+                &token,
+                command_sequence,
+                &task_event_id,
+                timestamp,
+            )
+            .await
+        });
+        let gate = match self
+            .wait_for_held_webhook_response(event_id, command_sequence, &task)
+            .await
+        {
+            Ok(gate) if !task.is_finished() => gate,
+            Ok(_) => {
+                task.abort();
+                return Err(WebhookHttpError::RequestCompletedBeforeWebhookGate);
+            }
+            Err(error) => {
+                task.abort();
+                return Err(error);
+            }
+        };
+        let next_observation = self
+            .fixture_producer_sequence
+            .checked_add(1)
+            .ok_or(WebhookHttpError::SequenceExhausted)?;
+        if let Err(error) = request
+            .record_observation(
+                ObservationProducer::Fixture,
+                next_observation,
+                ObservationEvent::WebhookResponseObserved {
+                    gate_id: gate.gate_id,
+                },
+            )
+            .await
+        {
+            task.abort();
+            return Err(WebhookHttpError::Journal(error));
+        }
+        self.fixture_producer_sequence = next_observation;
+        self.pending_response = Some(PendingWebhookResponse {
+            task: Some(task),
+            gate_id: gate.gate_id,
+        });
+        Ok(DeliveredEventResponse {
+            command_sequence,
+            event_id: event_id.to_owned(),
+            timestamp,
+            status: gate.status,
+        })
+    }
+
+    async fn wait_for_held_webhook_response(
+        &self,
+        event_id: &str,
+        command_sequence: u64,
+        task: &JoinHandle<Result<DeliveredEventResponse, WebhookHttpError>>,
+    ) -> Result<HeldWebhookResponse, WebhookHttpError> {
+        tokio::time::timeout(self.config.timeout, async {
+            loop {
+                if task.is_finished() {
+                    return Err(WebhookHttpError::RequestCompletedBeforeWebhookGate);
+                }
+                let response = self
+                    .client
+                    .get(self.control_endpoint("/v1/control/webhook-response-state"))
+                    .header("X-Tiv-Control-Token", &self.config.fixture_control_token)
+                    .send()
+                    .await
+                    .map_err(WebhookHttpError::ControlRequest)?;
+                require_status(response.status(), "webhook response state")?;
+                let state = response
+                    .json::<WebhookResponseState>()
+                    .await
+                    .map_err(WebhookHttpError::ControlRequest)?;
+                if state.command_sequence < self.config.control_sequence
+                    || state.command_sequence > command_sequence
+                {
+                    return Err(WebhookHttpError::UnexpectedControlResponse);
+                }
+                match state.held_webhook_responses.as_slice() {
+                    [] => tokio::time::sleep(Duration::from_millis(10)).await,
+                    [gate]
+                        if state.command_sequence == command_sequence
+                            && gate.event_id == event_id
+                            && (200..300).contains(&gate.status) =>
+                    {
+                        return Ok(gate.clone());
+                    }
+                    _ => return Err(WebhookHttpError::UnexpectedControlResponse),
+                }
+            }
+        })
+        .await
+        .map_err(|_| WebhookHttpError::Timeout("webhook response gate"))?
+    }
+
+    pub(crate) async fn discard_observed_response(
+        &mut self,
+        request: &CaseEffectRequest<'_>,
+    ) -> Result<(), WebhookHttpError> {
+        let mut pending = self
+            .pending_response
+            .take()
+            .ok_or(WebhookHttpError::NoPendingWebhookResponse)?;
+        let next_sequence = self.next_control_sequence()?;
+        let response = self
+            .client
+            .post(self.control_endpoint("/v1/control/discard-webhook-response"))
+            .header("X-Tiv-Control-Token", &self.config.fixture_control_token)
+            .json(&serde_json::json!({
+                "command_sequence": next_sequence,
+                "gate_id": pending.gate_id,
+            }))
+            .send()
+            .await
+            .map_err(WebhookHttpError::ControlRequest)?;
+        require_status(response.status(), "discard webhook response")?;
+        let state = response
+            .json::<WebhookResponseState>()
+            .await
+            .map_err(WebhookHttpError::ControlRequest)?;
+        if state.command_sequence != next_sequence || !state.held_webhook_responses.is_empty() {
+            return Err(WebhookHttpError::UnexpectedControlResponse);
+        }
+        self.config.control_sequence = next_sequence;
+        let task_result = pending
+            .task
+            .take()
+            .expect("a pending webhook response always owns its sender task")
+            .await
+            .map_err(WebhookHttpError::RequestJoin)?;
+        if !matches!(task_result, Err(WebhookHttpError::ControlRequest(_))) {
+            return Err(WebhookHttpError::ExpectedDiscardedWebhookConnection);
+        }
+        let next_observation = self
+            .fixture_producer_sequence
+            .checked_add(1)
+            .ok_or(WebhookHttpError::SequenceExhausted)?;
+        request
+            .record_observation(
+                ObservationProducer::Fixture,
+                next_observation,
+                ObservationEvent::WebhookResponseDiscarded {
+                    gate_id: pending.gate_id,
+                },
+            )
+            .await?;
+        self.fixture_producer_sequence = next_observation;
         Ok(())
     }
 
@@ -328,6 +536,45 @@ impl WebhookHttpAdapter {
         url.set_path(path);
         url
     }
+}
+
+impl Drop for WebhookHttpAdapter {
+    fn drop(&mut self) {
+        self.pending_response.take();
+    }
+}
+
+async fn send_delivery_request(
+    client: &Client,
+    endpoint: Url,
+    token: &str,
+    command_sequence: u64,
+    event_id: &str,
+    timestamp: i64,
+) -> Result<DeliveredEventResponse, WebhookHttpError> {
+    let response = client
+        .post(endpoint)
+        .header("X-Tiv-Control-Token", token)
+        .json(&serde_json::json!({
+            "command_sequence": command_sequence,
+            "event_id": event_id,
+            "timestamp": timestamp,
+        }))
+        .send()
+        .await
+        .map_err(WebhookHttpError::ControlRequest)?;
+    require_status(response.status(), "deliver event")?;
+    let delivered = response
+        .json::<DeliveredEventResponse>()
+        .await
+        .map_err(WebhookHttpError::ControlRequest)?;
+    if delivered.command_sequence != command_sequence
+        || delivered.event_id != event_id
+        || delivered.timestamp != timestamp
+    {
+        return Err(WebhookHttpError::UnexpectedControlResponse);
+    }
+    Ok(delivered)
 }
 
 impl CaseEffectAdapter for WebhookHttpAdapter {
@@ -410,12 +657,42 @@ struct DeliveredEventResponse {
     status: u16,
 }
 
+struct PendingWebhookResponse {
+    task: Option<JoinHandle<Result<DeliveredEventResponse, WebhookHttpError>>>,
+    gate_id: u64,
+}
+
+impl Drop for PendingWebhookResponse {
+    fn drop(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+    }
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HeldWebhookResponse {
+    gate_id: u64,
+    event_id: String,
+    status: u16,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WebhookResponseState {
+    command_sequence: u64,
+    held_webhook_responses: Vec<HeldWebhookResponse>,
+}
+
 #[derive(Debug, Error)]
 pub enum WebhookHttpError {
     #[error("could not build the webhook control HTTP client: {0}")]
     ClientBuild(reqwest::Error),
     #[error("fixture webhook control request failed: {0}")]
     ControlRequest(reqwest::Error),
+    #[error("fixture webhook control step timed out: {0}")]
+    Timeout(&'static str),
     #[error("fixture webhook control step {step} returned HTTP {status}")]
     UnexpectedControlStatus {
         step: &'static str,
@@ -431,8 +708,20 @@ pub enum WebhookHttpError {
     UnexpectedInputContract,
     #[error("webhook action did not match the deterministic event queue")]
     UnexpectedQueueState,
+    #[error("a webhook response is already pending at a process cut point")]
+    WebhookResponseAlreadyPending,
+    #[error("no webhook response is pending at the process cut point")]
+    NoPendingWebhookResponse,
+    #[error("the webhook delivery completed before its response gate was observed")]
+    RequestCompletedBeforeWebhookGate,
+    #[error("the discarded webhook response unexpectedly became an acknowledgment")]
+    ExpectedDiscardedWebhookConnection,
     #[error("webhook sequence or timestamp exhausted")]
     SequenceExhausted,
+    #[error("fixture webhook response task failed: {0}")]
+    RequestJoin(tokio::task::JoinError),
+    #[error("fixture webhook observation journal failed: {0}")]
+    Journal(#[from] JournalError),
     #[error("action is outside the webhook HTTP adapter boundary")]
     UnsupportedAction,
 }

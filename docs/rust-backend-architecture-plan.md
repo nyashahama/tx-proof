@@ -399,8 +399,10 @@ manufactured response. Case-derived operation identity and a narrow durable
 order read let a restarted application recover webhook routing from PostgreSQL
 instead of process RAM.
 
-Webhook and SQL-probe cut points remain unsupported and are
-rejected before stack inspection or database provisioning. The reference-only
+Webhook-response cut points are supported only when immediately owned by a
+real fixture delivery; abstract placements and SQL-probe cut points remain
+unsupported and are rejected before stack inspection or database provisioning.
+The reference-only
 quiescence gate requires no held provider request, no queued webhook, no held
 fixture gate, no unused provider outcome, and a validated provider projection.
 The final checkpoint yields the unforgeable permit consumed by the existing
@@ -409,9 +411,8 @@ authenticated fixture sequence so multiple commands can run serially on the
 same isolated stack.
 
 This slice is proven through real loopback fixture and application endpoints
-and the live Compose reference runner. Durable fixture delivery-attempt
-history and real blocking gates for webhook and SQL-probe
-cut points remain later integration boundaries.
+and the live Compose reference runner. Durable fixture delivery-attempt history
+and a real blocking SQL-probe cut point remain later integration boundaries.
 
 The proposed fixture topology has separate data and control listeners. The data listener is reachable by the SUT on an internal Compose network. The control listener is published only to loopback and requires an unlogged run token plus a monotonic command sequence. Control DTOs are versioned. The truth spike must prove that this protocol is necessary and portable before it becomes part of trace compatibility.
 
@@ -436,8 +437,9 @@ docker compose --project-name <exact> ... kill --signal SIGKILL <configured-serv
 ```
 
 and then releases or closes the held operation according to the trace. The
-current reference runner implements `client_request_forwarded` plus the
-application-checkout form of `client_response_observed`, and uses
+current reference runner implements `client_request_forwarded`, the
+application-checkout form of `client_response_observed`, and the
+fixture-delivery form of `webhook_response_observed`. It uses
 the already-attested local Docker container ID rather than ambient Docker
 context. Restart starts that exact stopped container, then repeats full Docker
 attestation and application-health checks before execution continues.

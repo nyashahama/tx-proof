@@ -214,6 +214,21 @@ impl ProviderHttpAdapter {
         self.config.control_sequence
     }
 
+    pub(crate) const fn fixture_producer_sequence(&self) -> u64 {
+        self.fixture_producer_sequence
+    }
+
+    pub(crate) fn synchronize_fixture_producer_sequence(
+        &mut self,
+        observed: u64,
+    ) -> Result<(), ProviderHttpError> {
+        if observed < self.fixture_producer_sequence {
+            return Err(ProviderHttpError::UnexpectedFixtureState);
+        }
+        self.fixture_producer_sequence = observed;
+        Ok(())
+    }
+
     pub(crate) fn synchronize_control_sequence(
         &mut self,
         observed: u64,

@@ -211,6 +211,10 @@ async fn handle_request(
             let snapshot = fixture.lock().await.snapshot();
             json_response(StatusCode::OK, &snapshot)
         }
+        (&Method::GET, "/v1/control/webhook-response-state") => {
+            let state = fixture.lock().await.webhook_response_state();
+            json_response(StatusCode::OK, &state)
+        }
         (&Method::POST, "/v1/control/reset") => {
             let Some(command) = decode_json::<ResetCommand>(request).await else {
                 return Ok(text_response(StatusCode::BAD_REQUEST, "invalid command"));
@@ -244,7 +248,10 @@ async fn handle_request(
             service_result(result)
         }
         (&Method::POST, "/v1/control/deliver-event") => {
-            handle_deliver_event(request, fixture, &webhook_secret, &webhook_target).await
+            handle_deliver_event(request, fixture, &webhook_secret, &webhook_target, false).await
+        }
+        (&Method::POST, "/v1/control/deliver-event-held-response") => {
+            handle_deliver_event(request, fixture, &webhook_secret, &webhook_target, true).await
         }
         (&Method::POST, "/v1/control/release-gate") => {
             let Some(command) = decode_json::<ReleaseGateCommand>(request).await else {
@@ -256,6 +263,16 @@ async fn handle_request(
                 .release_gate(command.command_sequence, command.gate_id);
             service_result(result)
         }
+        (&Method::POST, "/v1/control/discard-webhook-response") => {
+            let Some(command) = decode_json::<DiscardWebhookResponseCommand>(request).await else {
+                return Ok(text_response(StatusCode::BAD_REQUEST, "invalid command"));
+            };
+            let result = fixture
+                .lock()
+                .await
+                .discard_webhook_response(command.command_sequence, command.gate_id);
+            service_result(result)
+        }
         _ => Ok(text_response(StatusCode::NOT_FOUND, "not found")),
     }
 }
@@ -265,6 +282,7 @@ async fn handle_deliver_event(
     fixture: Arc<Mutex<ManagedFixture>>,
     webhook_secret: &WebhookSigningSecret,
     webhook_target: &WebhookTarget,
+    hold_response: bool,
 ) -> Result<Response<ResponseBody>, ControlHttpError> {
     let Some(command) = decode_json::<DeliverEventCommand>(request).await else {
         return Ok(text_response(StatusCode::BAD_REQUEST, "invalid command"));
@@ -295,6 +313,19 @@ async fn handle_deliver_event(
             ));
         }
     };
+    if hold_response {
+        let held = fixture
+            .lock()
+            .await
+            .hold_webhook_response(&command.event_id, status);
+        let held = match held {
+            Ok(held) => held,
+            Err(error) => return service_result::<serde_json::Value>(Err(error)),
+        };
+        return match held.wait().await {
+            Ok(()) | Err(_) => Err(ControlHttpError::WebhookResponseDiscarded),
+        };
+    }
     json_response(
         StatusCode::OK,
         &DeliveryResult {
@@ -350,6 +381,7 @@ where
             FixtureServiceError::CommandSequenceExhausted
             | FixtureServiceError::FaultPlanExhausted
             | FixtureServiceError::GateSequenceExhausted
+            | FixtureServiceError::InvalidWebhookResponseGate
             | FixtureServiceError::Fixture(_)
             | FixtureServiceError::WebhookSignature(_),
         ) => Ok(text_response(
@@ -425,14 +457,29 @@ struct ReleaseGateCommand {
     gate_id: GateId,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DiscardWebhookResponseCommand {
+    command_sequence: u64,
+    gate_id: GateId,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ControlHttpError {
     Serialization,
+    WebhookResponseDiscarded,
 }
 
 impl fmt::Display for ControlHttpError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("fixture control response serialization failed")
+        match self {
+            Self::Serialization => {
+                formatter.write_str("fixture control response serialization failed")
+            }
+            Self::WebhookResponseDiscarded => {
+                formatter.write_str("observed webhook response was intentionally discarded")
+            }
+        }
     }
 }
 

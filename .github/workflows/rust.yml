@@ -258,6 +258,16 @@ jobs:
             client_response_observed_kill_restarts_and_finishes_the_live_case \
             -- --ignored --exact
 
+      - name: Prove a discarded webhook response at an attested SIGKILL boundary
+        env:
+          TIV_FIXTURE_CONTROL_TOKEN: run-scoped-control-token
+          TIV_POSTGRES_ADMIN_PASSWORD: tiv-local-only-password
+          TIV_POSTGRES_APPLICATION_PASSWORD: tiv-app-local-only-password
+        run: |
+          cargo test -p tiv-cli --test replay_reference_app_case \
+            webhook_response_observed_kill_restarts_and_finishes_the_live_case \
+            -- --ignored --exact
+
       - name: Capture isolated service logs after a failure
         if: failure()
         continue-on-error: true

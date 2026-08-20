@@ -225,6 +225,30 @@ pub struct HeldDataPlaneResponse {
     signal: Arc<GateSignal>,
 }
 
+/// A fixture webhook sender paused after observing the application's response.
+#[derive(Debug)]
+pub struct HeldWebhookResponse {
+    gate_id: GateId,
+    signal: Arc<GateSignal>,
+}
+
+impl HeldWebhookResponse {
+    #[must_use]
+    pub const fn gate_id(&self) -> GateId {
+        self.gate_id
+    }
+
+    /// Waits until control explicitly discards this observed acknowledgment.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HeldResponseCancelled`] after the exact discard or a reset
+    /// wakes the sender without acknowledging the response.
+    pub async fn wait(self) -> Result<(), HeldResponseCancelled> {
+        self.signal.wait().await
+    }
+}
+
 impl HeldDataPlaneResponse {
     #[must_use]
     pub const fn gate_id(&self) -> GateId {
@@ -475,6 +499,7 @@ pub struct ManagedFixture {
     fixture: PaymentIntentFixture,
     planned_outcomes: VecDeque<FaultOutcome>,
     held_gates: BTreeMap<GateId, Arc<GateSignal>>,
+    held_webhook_responses: BTreeMap<GateId, HeldWebhookResponseState>,
     next_gate_sequence: u64,
     command_sequence: u64,
 }
@@ -486,6 +511,7 @@ impl ManagedFixture {
             fixture: PaymentIntentFixture::new(seed),
             planned_outcomes: VecDeque::new(),
             held_gates: BTreeMap::new(),
+            held_webhook_responses: BTreeMap::new(),
             next_gate_sequence: 0,
             command_sequence: 0,
         }
@@ -511,9 +537,13 @@ impl ManagedFixture {
         for signal in self.held_gates.values() {
             signal.cancel();
         }
+        for response in self.held_webhook_responses.values() {
+            response.signal.cancel();
+        }
         self.fixture = PaymentIntentFixture::new(seed);
         self.planned_outcomes = outcomes.into();
         self.held_gates.clear();
+        self.held_webhook_responses.clear();
         self.command_sequence = command_sequence;
         Ok(self.snapshot())
     }
@@ -552,11 +582,7 @@ impl ManagedFixture {
                 Ok(ManagedDataPlaneDisposition::CloseConnection)
             }
             DataPlaneDisposition::DelayResponse(response) => {
-                self.next_gate_sequence = self
-                    .next_gate_sequence
-                    .checked_add(1)
-                    .ok_or(FixtureServiceError::GateSequenceExhausted)?;
-                let gate_id = GateId(self.next_gate_sequence);
+                let gate_id = self.next_gate_id()?;
                 let signal = Arc::new(GateSignal::default());
                 self.held_gates.insert(gate_id, Arc::clone(&signal));
                 Ok(ManagedDataPlaneDisposition::Held(HeldDataPlaneResponse {
@@ -587,6 +613,61 @@ impl ManagedFixture {
         signal.release();
         self.command_sequence = command_sequence;
         Ok(self.snapshot())
+    }
+
+    /// Holds one fixture sender after a real application webhook response.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if another webhook response is already held, the
+    /// response is invalid, or the run-scoped gate sequence is exhausted.
+    pub fn hold_webhook_response(
+        &mut self,
+        event_id: &str,
+        status: u16,
+    ) -> Result<HeldWebhookResponse, FixtureServiceError> {
+        if !self.held_webhook_responses.is_empty()
+            || !(100..=599).contains(&status)
+            || !self
+                .fixture
+                .events()
+                .iter()
+                .any(|event| event.id() == event_id)
+        {
+            return Err(FixtureServiceError::InvalidWebhookResponseGate);
+        }
+        let gate_id = self.next_gate_id()?;
+        let signal = Arc::new(GateSignal::default());
+        self.held_webhook_responses.insert(
+            gate_id,
+            HeldWebhookResponseState {
+                event_id: event_id.to_owned(),
+                status,
+                signal: Arc::clone(&signal),
+            },
+        );
+        Ok(HeldWebhookResponse { gate_id, signal })
+    }
+
+    /// Discards one exact observed webhook response without acknowledging it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an out-of-order command or a gate that is not a
+    /// held webhook-response gate in the current run.
+    pub fn discard_webhook_response(
+        &mut self,
+        command_sequence: u64,
+        gate_id: GateId,
+    ) -> Result<WebhookResponseState, FixtureServiceError> {
+        self.require_next_sequence(command_sequence)?;
+        let held = self
+            .held_webhook_responses
+            .remove(&gate_id)
+            .ok_or(FixtureServiceError::GateNotFound)?;
+        held.signal.cancel();
+        self.command_sequence = command_sequence;
+        Ok(self.webhook_response_state())
     }
 
     /// Executes one confirmation against the next planned provider outcome.
@@ -736,6 +817,30 @@ impl ManagedFixture {
         }
     }
 
+    #[must_use]
+    pub fn webhook_response_state(&self) -> WebhookResponseState {
+        WebhookResponseState {
+            command_sequence: self.command_sequence,
+            held_webhook_responses: self
+                .held_webhook_responses
+                .iter()
+                .map(|(gate_id, held)| HeldWebhookResponseSnapshot {
+                    gate_id: *gate_id,
+                    event_id: held.event_id.clone(),
+                    status: held.status,
+                })
+                .collect(),
+        }
+    }
+
+    fn next_gate_id(&mut self) -> Result<GateId, FixtureServiceError> {
+        self.next_gate_sequence = self
+            .next_gate_sequence
+            .checked_add(1)
+            .ok_or(FixtureServiceError::GateSequenceExhausted)?;
+        Ok(GateId(self.next_gate_sequence))
+    }
+
     fn require_next_sequence(&self, received: u64) -> Result<(), FixtureServiceError> {
         let expected = self
             .command_sequence
@@ -746,6 +851,25 @@ impl ManagedFixture {
         }
         Ok(())
     }
+}
+
+struct HeldWebhookResponseState {
+    event_id: String,
+    status: u16,
+    signal: Arc<GateSignal>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct WebhookResponseState {
+    command_sequence: u64,
+    held_webhook_responses: Vec<HeldWebhookResponseSnapshot>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct HeldWebhookResponseSnapshot {
+    gate_id: GateId,
+    event_id: String,
+    status: u16,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -933,6 +1057,7 @@ pub enum FixtureServiceError {
     FaultPlanExhausted,
     GateNotFound,
     GateSequenceExhausted,
+    InvalidWebhookResponseGate,
     Fixture(FixtureError),
     UnexpectedCommandSequence { expected: u64, received: u64 },
     WebhookSignature(WebhookSignatureError),

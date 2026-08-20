@@ -42,8 +42,34 @@ impl CaseHttpAdapter {
         &mut self,
         cut_point: ProcessCutPoint,
     ) -> Result<(), CaseHttpError> {
+        if cut_point == ProcessCutPoint::WebhookResponseObserved {
+            self.webhook
+                .require_observed_response()
+                .map_err(CaseHttpError::Webhook)
+        } else {
+            self.provider
+                .mark_application_killed(cut_point)
+                .map_err(CaseHttpError::Provider)
+        }
+    }
+
+    pub(crate) async fn complete_application_kill(
+        &mut self,
+        request: &CaseEffectRequest<'_>,
+        cut_point: ProcessCutPoint,
+    ) -> Result<(), CaseHttpError> {
+        if cut_point != ProcessCutPoint::WebhookResponseObserved {
+            return Ok(());
+        }
+        self.webhook
+            .discard_observed_response(request)
+            .await
+            .map_err(CaseHttpError::Webhook)?;
         self.provider
-            .mark_application_killed(cut_point)
+            .synchronize_control_sequence(self.webhook.control_sequence())
+            .map_err(CaseHttpError::Provider)?;
+        self.provider
+            .synchronize_fixture_producer_sequence(self.webhook.fixture_producer_sequence())
             .map_err(CaseHttpError::Provider)
     }
 
@@ -59,6 +85,9 @@ impl CaseHttpAdapter {
         self.webhook
             .synchronize_control_sequence(self.provider.control_sequence())
             .map_err(CaseHttpError::Webhook)?;
+        self.webhook
+            .synchronize_fixture_producer_sequence(self.provider.fixture_producer_sequence())
+            .map_err(CaseHttpError::Webhook)?;
         Ok(output)
     }
 
@@ -73,6 +102,9 @@ impl CaseHttpAdapter {
             .map_err(CaseHttpError::Webhook)?;
         self.provider
             .synchronize_control_sequence(self.webhook.control_sequence())
+            .map_err(CaseHttpError::Provider)?;
+        self.provider
+            .synchronize_fixture_producer_sequence(self.webhook.fixture_producer_sequence())
             .map_err(CaseHttpError::Provider)?;
         Ok(output)
     }

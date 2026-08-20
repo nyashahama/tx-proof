@@ -131,6 +131,153 @@ async fn one_trace_bound_provider_event_is_signed_and_delivered_by_the_fixture()
     target_server.await.unwrap();
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_observed_webhook_response_stays_held_until_the_exact_discard_command() {
+    let (target_address, mut deliveries, target_server) = start_webhook_target().await;
+    let fixture = Arc::new(Mutex::new(ManagedFixture::new(Seed::new(73))));
+    fixture
+        .lock()
+        .await
+        .reset(1, Seed::new(73), vec![FaultOutcome::Normal])
+        .unwrap();
+    fixture
+        .lock()
+        .await
+        .create_data_plane(
+            IdempotencyKey::new("op-73-attempt-1").unwrap(),
+            CreatePaymentIntent::new(2_500, "usd")
+                .unwrap()
+                .with_operation_id(OperationId::new("op_73").unwrap()),
+        )
+        .unwrap();
+    let payment_intent_id = fixture.lock().await.snapshot().payment_intents()[0]
+        .id()
+        .to_owned();
+    let (control_address, control_server) =
+        start_control_server(Arc::clone(&fixture), target_address).await;
+    let client = reqwest::Client::new();
+    let timestamp = current_timestamp();
+
+    let event_id = generate_event(&client, control_address, &payment_intent_id).await;
+    let held_client = client.clone();
+    let held_endpoint = format!("http://{control_address}/v1/control/deliver-event-held-response");
+    let held_event_id = event_id.clone();
+    let held_delivery = tokio::spawn(async move {
+        held_client
+            .post(held_endpoint)
+            .header("X-Tiv-Control-Token", "run-scoped-control-token")
+            .json(&json!({
+                "command_sequence": 3,
+                "event_id": held_event_id,
+                "timestamp": timestamp,
+            }))
+            .send()
+            .await
+    });
+
+    let observed = timeout(Duration::from_secs(2), deliveries.recv())
+        .await
+        .expect("the application receives the real webhook")
+        .expect("the delivery is recorded");
+    assert_eq!(observed.event_id(), event_id);
+    let gate = wait_for_response_gate(&client, control_address).await;
+    let gate_id = gate["gate_id"].as_u64().unwrap();
+    assert_eq!(gate["event_id"], event_id);
+    assert_eq!(gate["status"], 200);
+    assert!(
+        !held_delivery.is_finished(),
+        "the fixture sender must remain blocked after observing the response"
+    );
+
+    let discarded: serde_json::Value = client
+        .post(format!(
+            "http://{control_address}/v1/control/discard-webhook-response"
+        ))
+        .header("X-Tiv-Control-Token", "run-scoped-control-token")
+        .json(&json!({"command_sequence": 4, "gate_id": gate_id}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(discarded["command_sequence"], 4);
+    assert_eq!(discarded["held_webhook_responses"], json!([]));
+    let delivery_result = timeout(Duration::from_secs(2), held_delivery)
+        .await
+        .expect("discard wakes the held fixture task")
+        .expect("the held task does not panic");
+    assert!(
+        delivery_result.is_err(),
+        "a discarded webhook response must not become an acknowledgment"
+    );
+
+    drop(client);
+    control_server.abort();
+    let _ = control_server.await;
+    target_server.await.unwrap();
+}
+
+async fn generate_event(
+    client: &reqwest::Client,
+    control_address: std::net::SocketAddr,
+    payment_intent_id: &str,
+) -> String {
+    let generated: serde_json::Value = client
+        .post(format!(
+            "http://{control_address}/v1/control/generate-event"
+        ))
+        .header("X-Tiv-Control-Token", "run-scoped-control-token")
+        .json(&json!({
+            "command_sequence": 2,
+            "payment_intent_id": payment_intent_id,
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    generated["event_id"].as_str().unwrap().to_owned()
+}
+
+async fn wait_for_response_gate(
+    client: &reqwest::Client,
+    control_address: std::net::SocketAddr,
+) -> serde_json::Value {
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let state: serde_json::Value = client
+                .get(format!(
+                    "http://{control_address}/v1/control/webhook-response-state"
+                ))
+                .header("X-Tiv-Control-Token", "run-scoped-control-token")
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            if let [gate] = state["held_webhook_responses"]
+                .as_array()
+                .unwrap()
+                .as_slice()
+            {
+                break gate.clone();
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the fixture exposes the response-observed gate")
+}
+
 struct ObservedDelivery {
     raw_body: Vec<u8>,
     signature: String,

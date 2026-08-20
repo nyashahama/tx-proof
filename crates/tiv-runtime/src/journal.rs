@@ -107,6 +107,8 @@ pub enum ObservationEvent {
     ClientResponseObserved,
     ProviderResponseHeld { gate_id: u64 },
     ProviderResponseReleased { gate_id: u64 },
+    WebhookResponseObserved { gate_id: u64 },
+    WebhookResponseDiscarded { gate_id: u64 },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -145,6 +147,8 @@ enum ObservationKind {
     ClientResponseObserved,
     ProviderResponseHeld,
     ProviderResponseReleased,
+    WebhookResponseObserved,
+    WebhookResponseDiscarded,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -169,6 +173,14 @@ impl ObservationEvent {
             ),
             Self::ProviderResponseReleased { gate_id } => (
                 ObservationKind::ProviderResponseReleased,
+                ObservationPayload::Gate { gate_id },
+            ),
+            Self::WebhookResponseObserved { gate_id } => (
+                ObservationKind::WebhookResponseObserved,
+                ObservationPayload::Gate { gate_id },
+            ),
+            Self::WebhookResponseDiscarded { gate_id } => (
+                ObservationKind::WebhookResponseDiscarded,
                 ObservationPayload::Gate { gate_id },
             ),
         }
