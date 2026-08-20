@@ -16,13 +16,11 @@ use tiv_core::{
 };
 use tiv_reference_app::{CheckoutOperation, create_with_changed_retry_key};
 use tiv_runtime::{
-    campaign::{CaseEffectAdapter, CaseEffectFuture, CaseEffectRequest, execute_planned_case},
-    case_http::{CaseHttpAdapter, CaseHttpError},
-    provider_http::{ProviderHttpAdapter, ProviderHttpConfig},
-    webhook_http::{WebhookHttpAdapter, WebhookHttpConfig},
+    postgres::safety::DatabaseName,
+    reference_case::{ReferenceCaseRunConfig, run_reference_planned_case},
 };
 use tiv_stripe_pi::{
-    FaultOutcome, ManagedFixture,
+    ManagedFixture,
     control::{
         ControlToken, WebhookSigningSecret, WebhookTarget,
         serve_http1_connection as serve_control_connection,
@@ -32,96 +30,48 @@ use tiv_stripe_pi::{
 use tokio::{net::TcpListener, sync::Mutex, sync::mpsc, task::JoinHandle, time::timeout};
 use uuid::Uuid;
 
-struct CompletingHttpAdapter {
-    http: CaseHttpAdapter,
-}
-
-impl CaseEffectAdapter for CompletingHttpAdapter {
-    type Error = CaseHttpError;
-
-    fn execute<'a>(
-        &'a mut self,
-        request: CaseEffectRequest<'a>,
-    ) -> CaseEffectFuture<'a, Self::Error> {
-        if !matches!(
-            request.action().kind(),
-            PlanActionKind::WaitForQuiescence | PlanActionKind::CheckCheckpoint { .. }
-        ) {
-            return self.http.execute(request);
-        }
-
-        Box::pin(async move {
-            if request.expected_outputs().is_empty() {
-                Ok(Vec::new())
-            } else {
-                Err(CaseHttpError::UnsupportedAction)
-            }
-        })
-    }
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn provider_gates_and_webhooks_share_one_fixture_control_sequence() {
     let plan = held_provider_then_webhook_plan();
     let fixture = Arc::new(Mutex::new(ManagedFixture::new(Seed::new(3))));
-    fixture
-        .lock()
-        .await
-        .reset(
-            1,
-            Seed::new(3),
-            vec![FaultOutcome::CommitThenDelay, FaultOutcome::CommitThenDelay],
-        )
-        .unwrap();
     let (target_address, mut deliveries, target_server) = start_webhook_target().await;
     let (data_address, data_server) = start_data_server(Arc::clone(&fixture), 2).await;
     let (control_address, control_server) =
         start_control_server(Arc::clone(&fixture), target_address).await;
     let (driver_address, driver_server) = start_driver_server(data_address).await;
-    let provider_config = ProviderHttpConfig::new(
-        format!("http://{driver_address}/checkout"),
-        serde_json::json!({
-            "database": "tiv_case_0123456789abcdef",
-            "operation_id": "op_3",
-            "amount_minor": 2500,
-            "currency": "usd"
-        }),
+    let config = ReferenceCaseRunConfig::new(
+        &DatabaseName::parse("tiv_case_0123456789abcdef").unwrap(),
         format!("http://{driver_address}"),
         format!("http://{control_address}"),
         "case-control-token",
         1,
+        1_800_000_000,
+        "op_3",
+        2_500,
+        "usd",
         Duration::from_secs(2),
         Duration::from_millis(2),
     )
     .unwrap();
-    let webhook_config = WebhookHttpConfig::new(
-        format!("http://{control_address}"),
-        "case-control-token",
-        1,
-        1_800_000_000,
-        Duration::from_secs(2),
-    )
-    .unwrap();
-    let mut adapter = CompletingHttpAdapter {
-        http: CaseHttpAdapter::new(
-            ProviderHttpAdapter::new(provider_config).unwrap(),
-            WebhookHttpAdapter::new(webhook_config).unwrap(),
-        ),
-    };
     let journal_path = journal_path();
 
-    let executed = execute_planned_case("run_3", "case_3", &plan, &journal_path, &mut adapter)
+    let receipt = run_reference_planned_case("run_3", "case_3", &plan, &journal_path, config)
         .await
         .expect("one sequenced fixture control plane executes the complete HTTP case");
+    let (executed, checkpoint) = receipt.into_parts();
 
     assert_eq!(executed.trace().action_count(), plan.actions().len());
+    assert_eq!(checkpoint.provider_payment_intents().len(), 1);
+    assert_eq!(
+        checkpoint.provider_payment_intents()[0].status(),
+        "succeeded"
+    );
     timeout(Duration::from_secs(2), deliveries.recv())
         .await
         .unwrap()
         .expect("the exact generated event reaches the application target");
     assert_eq!(fixture.lock().await.snapshot().command_sequence(), 5);
 
-    drop(adapter);
     control_server.abort();
     let _ = control_server.await;
     target_server.abort();
@@ -135,6 +85,48 @@ async fn provider_gates_and_webhooks_share_one_fixture_control_sequence() {
         .unwrap()
         .unwrap();
     tokio::fs::remove_file(journal_path).await.unwrap();
+}
+
+#[tokio::test]
+async fn unsupported_process_faults_fail_before_fixture_reset() {
+    let plan = (0..512)
+        .find_map(|seed| {
+            let plan = CasePlanCompiler::compile(&PlanSpec::payment_intent_v1(
+                Seed::new(seed),
+                ActionBudget::new(40).unwrap(),
+            ))
+            .unwrap();
+            plan.actions()
+                .iter()
+                .any(|action| matches!(action.kind(), PlanActionKind::KillApplication { .. }))
+                .then_some(plan)
+        })
+        .expect("the deterministic v1 campaign contains process-fault cases");
+    let config = ReferenceCaseRunConfig::new(
+        &DatabaseName::parse("tiv_case_0123456789abcdef").unwrap(),
+        "http://127.0.0.1:1",
+        "http://127.0.0.1:2",
+        "case-control-token",
+        1,
+        1_800_000_000,
+        "op_3",
+        2_500,
+        "usd",
+        Duration::from_millis(100),
+        Duration::from_millis(2),
+    )
+    .unwrap();
+    let journal_path = journal_path();
+
+    let result =
+        run_reference_planned_case("run_process", "case_process", &plan, &journal_path, config)
+            .await;
+
+    assert!(matches!(
+        result,
+        Err(tiv_runtime::reference_case::ReferenceCaseRunError::UnsupportedProcessFault)
+    ));
+    assert!(!journal_path.exists());
 }
 
 fn held_provider_then_webhook_plan() -> tiv_core::plan::PlannedCase {

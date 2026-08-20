@@ -28,6 +28,10 @@ fn reference_app_evidence_command_ignores_remote_docker_context_and_emits_the_co
         )
         .env("DOCKER_HOST", "tcp://127.0.0.1:9")
         .env("DOCKER_CONTEXT", "intentionally-remote")
+        .env("HTTP_PROXY", "http://127.0.0.1:9")
+        .env("HTTPS_PROXY", "http://127.0.0.1:9")
+        .env_remove("NO_PROXY")
+        .env_remove("no_proxy")
         .output()
         .expect("the tiv binary executes");
 

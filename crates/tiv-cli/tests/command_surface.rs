@@ -1,7 +1,7 @@
 use clap::Parser;
 use tiv_cli::{
-    Cli, Command, DoctorArgs, ReferenceAppEvidenceArgs, ReferenceAppReplayArgs, ReplayCommand,
-    TraceCommand,
+    Cli, Command, DoctorArgs, ReferenceAppCaseArgs, ReferenceAppEvidenceArgs,
+    ReferenceAppReplayArgs, ReplayCommand, TraceCommand,
 };
 
 #[test]
@@ -123,6 +123,40 @@ fn the_cli_exposes_a_self_contained_reference_app_evidence_run() {
         Command::Replay {
             command: ReplayCommand::ReferenceAppEvidence(ReferenceAppEvidenceArgs {
                 trace: "compiled-trace.json".into(),
+                postgres_port: 15_432,
+                postgres_admin_role: "tiv_admin".to_owned(),
+                reference_app_url: "http://127.0.0.1:18080".to_owned(),
+                fixture_control_url: "http://127.0.0.1:12112".to_owned(),
+            }),
+        }
+    );
+}
+
+#[test]
+fn the_cli_exposes_an_attested_planned_reference_case_run() {
+    let cli = Cli::try_parse_from([
+        "tiv",
+        "replay",
+        "reference-app-case",
+        "--plan",
+        "planned-case.json",
+        "--journal",
+        "artifacts/case.jsonl",
+        "--postgres-port",
+        "15432",
+        "--reference-app-url",
+        "http://127.0.0.1:18080",
+        "--fixture-control-url",
+        "http://127.0.0.1:12112",
+    ])
+    .expect("the planned reference case command parses");
+
+    assert_eq!(
+        cli.command,
+        Command::Replay {
+            command: ReplayCommand::ReferenceAppCase(ReferenceAppCaseArgs {
+                plan: "planned-case.json".into(),
+                journal: "artifacts/case.jsonl".into(),
                 postgres_port: 15_432,
                 postgres_admin_role: "tiv_admin".to_owned(),
                 reference_app_url: "http://127.0.0.1:18080".to_owned(),

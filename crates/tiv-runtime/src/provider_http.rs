@@ -15,6 +15,7 @@ use tokio::{task::JoinHandle, time::timeout};
 use crate::{
     campaign::{CaseEffectAdapter, CaseEffectFuture, CaseEffectOutput, CaseEffectRequest},
     journal::{JournalError, ObservationEvent, ObservationProducer},
+    postgres::oracle::ProviderPaymentIntent,
 };
 
 const MAX_DRIVER_BODY_BYTES: usize = 16 * 1024;
@@ -177,6 +178,7 @@ impl ProviderHttpAdapter {
     /// be constructed.
     pub fn new(config: ProviderHttpConfig) -> Result<Self, ProviderHttpError> {
         let client = Client::builder()
+            .no_proxy()
             .redirect(Policy::none())
             .connect_timeout(config.timeout)
             .timeout(config.timeout)
@@ -204,6 +206,51 @@ impl ProviderHttpAdapter {
         }
         self.config.control_sequence = observed;
         Ok(())
+    }
+
+    pub(crate) const fn is_idle(&self) -> bool {
+        self.pending.is_none()
+    }
+
+    pub(crate) async fn quiescent_provider_projection(
+        &self,
+    ) -> Result<Vec<ProviderPaymentIntent>, ProviderHttpError> {
+        if !self.is_idle() {
+            return Err(ProviderHttpError::UnexpectedFixtureState);
+        }
+        let state = self.fixture_state().await?;
+        self.validate_control_sequence(&state)?;
+        let observed = state
+            .payment_intents
+            .iter()
+            .map(|payment_intent| payment_intent.id.as_str())
+            .collect::<BTreeSet<_>>();
+        if !state.held_gates.is_empty()
+            || state.remaining_outcomes != 0
+            || observed.len() != self.known_payment_intents.len()
+            || !observed
+                .iter()
+                .all(|payment_intent_id| self.known_payment_intents.contains(*payment_intent_id))
+            || state
+                .payment_intents
+                .iter()
+                .any(|payment_intent| !self.valid_payment_intent(payment_intent))
+        {
+            return Err(ProviderHttpError::UnexpectedFixtureState);
+        }
+        state
+            .payment_intents
+            .into_iter()
+            .map(|payment_intent| {
+                ProviderPaymentIntent::new(
+                    payment_intent.id,
+                    payment_intent.amount_minor,
+                    payment_intent.currency,
+                    payment_intent.status,
+                )
+                .map_err(|_| ProviderHttpError::UnexpectedFixtureState)
+            })
+            .collect()
     }
 
     async fn drive_checkout(

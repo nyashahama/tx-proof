@@ -10,5 +10,6 @@ pub mod journal;
 pub mod postgres;
 pub mod provider_http;
 pub mod reference_app;
+pub mod reference_case;
 pub mod replay;
 pub mod webhook_http;

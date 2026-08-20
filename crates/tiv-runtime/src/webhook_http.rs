@@ -149,6 +149,10 @@ impl WebhookHttpAdapter {
         Ok(())
     }
 
+    pub(crate) fn is_idle(&self) -> bool {
+        self.pending.is_empty()
+    }
+
     async fn generate_event(
         &mut self,
         request: &CaseEffectRequest<'_>,

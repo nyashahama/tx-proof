@@ -2,13 +2,17 @@
 
 use std::{
     collections::BTreeMap,
+    path::Path,
     process::{ExitStatus, Stdio},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tiv_core::result::{AttemptResult, FailureIdentity};
+use tiv_core::{
+    plan::PlannedCase,
+    result::{AttemptResult, FailureIdentity},
+};
 use tokio::{
     io::{AsyncRead, AsyncReadExt},
     process::Command,
@@ -23,6 +27,10 @@ use crate::{
         oracle::{InvariantVerdict, ProviderPaymentIntent, QuiescencePermit, SnapshotReport},
         safety::{ComposeProjectId, DatabaseName},
         spike::{SpikePostgresConfig, SpikePostgresError, TruthSpikePostgres},
+    },
+    reference_case::{
+        ReferenceCaseRunConfig, ReferenceCaseRunConfigError, ReferenceCaseRunError,
+        run_reference_planned_case,
     },
     replay::{
         ReferenceAppReplayConfig, ReferenceAppReplayConfigError, ReferenceAppReplayError,
@@ -44,6 +52,7 @@ const LOCAL_DOCKER_HOST: &str = "unix:///var/run/docker.sock";
 const DOCKER_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 const DOCKER_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_DOCKER_OUTPUT_BYTES: u64 = 64 * 1024;
+const MAX_FIXTURE_STATE_BYTES: usize = 16 * 1024;
 
 /// Attested inputs for one provision-reset-replay evidence run.
 pub struct ReferenceAppEvidenceConfig {
@@ -472,6 +481,7 @@ pub async fn run_reference_app_evidence(
     if observed_stack != config.stack_attestation {
         return Err(ReferenceAppEvidenceConfigError::ReferenceStackMismatch.into());
     }
+    restart_reference_application(config).await?;
     let postgres =
         TruthSpikePostgres::connect(SpikePostgresConfig::loopback_reference_app_with_archive(
             config.postgres_port,
@@ -491,6 +501,7 @@ pub async fn run_reference_app_evidence(
     if post_connect_stack != config.stack_attestation {
         return Err(ReferenceAppEvidenceConfigError::ReferenceStackMismatch.into());
     }
+    let initial_control_sequence = fixture_control_sequence(config).await?;
     let suffix = Uuid::new_v4().simple().to_string()[..16].to_owned();
     let provisioned = postgres
         .provision_reference_databases(&suffix, config.compose_project.clone())
@@ -502,8 +513,15 @@ pub async fn run_reference_app_evidence(
         .map_err(ReferenceAppEvidenceError::postgres)?;
     let first_database_oid = first_case_target.identity().database_oid();
 
-    let (first_provider_object_count, first_report) =
-        run_reference_app_attempt(&postgres, plan, config, &case_name, 1, 2).await?;
+    let (first_provider_object_count, first_report) = run_reference_app_attempt_at_offset(
+        &postgres,
+        plan,
+        config,
+        &case_name,
+        initial_control_sequence,
+        0,
+    )
+    .await?;
     let (expected_failure, first_attempt) = provider_uniqueness_attempt(&first_report)?;
 
     let first_reset_target = postgres
@@ -512,8 +530,15 @@ pub async fn run_reference_app_evidence(
         .map_err(ReferenceAppEvidenceError::postgres)?;
     let second_database_oid = first_reset_target.identity().database_oid();
 
-    let (second_provider_object_count, second_report) =
-        run_reference_app_attempt(&postgres, plan, config, &case_name, 3, 4).await?;
+    let (second_provider_object_count, second_report) = run_reference_app_attempt_at_offset(
+        &postgres,
+        plan,
+        config,
+        &case_name,
+        initial_control_sequence,
+        2,
+    )
+    .await?;
     let (_, second_attempt) = provider_uniqueness_attempt(&second_report)?;
 
     let second_reset_target = postgres
@@ -527,8 +552,15 @@ pub async fn run_reference_app_evidence(
         .map_err(ReferenceAppEvidenceError::postgres)?;
     let third_database_oid = second_reset_target.identity().database_oid();
 
-    let (third_provider_object_count, third_report) =
-        run_reference_app_attempt(&postgres, plan, config, &case_name, 5, 6).await?;
+    let (third_provider_object_count, third_report) = run_reference_app_attempt_at_offset(
+        &postgres,
+        plan,
+        config,
+        &case_name,
+        initial_control_sequence,
+        4,
+    )
+    .await?;
     let (_, third_attempt) = provider_uniqueness_attempt(&third_report)?;
 
     let attempts = [first_attempt, second_attempt, third_attempt];
@@ -544,6 +576,275 @@ pub async fn run_reference_app_evidence(
         &attempts,
     )
     .map_err(ReferenceAppEvidenceError::Evidence)
+}
+
+/// One attested, journaled planned-case execution and its final oracle result.
+#[derive(Serialize)]
+pub struct ReferencePlannedCaseEvidence {
+    schema_version: u16,
+    seed: u64,
+    planned_action_count: usize,
+    executed_action_count: usize,
+    journal_record_count: usize,
+    journal_last_record_hash: Option<String>,
+    database_oid: u32,
+    provider_object_count: usize,
+    invariant_outcomes: Vec<ReferenceInvariantEvidence>,
+}
+
+impl ReferencePlannedCaseEvidence {
+    /// Encodes the allowlisted evidence document.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`serde_json::Error`] if serialization fails.
+    pub fn to_pretty_json(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string_pretty(self)
+    }
+}
+
+#[derive(Serialize)]
+struct ReferenceInvariantEvidence {
+    invariant_id: String,
+    checkpoint_id: String,
+    verdict: &'static str,
+    witness_count: usize,
+}
+
+/// Provisions one isolated case database, runs a compiled serial case through
+/// the real reference stack, and evaluates its final `PostgreSQL` checkpoint.
+///
+/// The current slice rejects process-kill plans before fixture reset. All
+/// provider, gate, webhook, quiescence, journal, and oracle boundaries are
+/// live.
+///
+/// # Errors
+///
+/// Returns [`ReferenceAppEvidenceError`] when stack attestation, provisioning,
+/// planned execution, or oracle evaluation fails.
+pub async fn run_reference_app_planned_case(
+    planned_case: &PlannedCase,
+    config: &ReferenceAppEvidenceConfig,
+    journal_path: impl AsRef<Path>,
+) -> Result<ReferencePlannedCaseEvidence, ReferenceAppEvidenceError> {
+    let observed_stack = attest_reference_stack(
+        config.postgres_port,
+        &config.reference_app_url,
+        &config.fixture_control_url,
+    )
+    .await?;
+    if observed_stack != config.stack_attestation {
+        return Err(ReferenceAppEvidenceConfigError::ReferenceStackMismatch.into());
+    }
+    restart_reference_application(config).await?;
+    let postgres =
+        TruthSpikePostgres::connect(SpikePostgresConfig::loopback_reference_app_with_archive(
+            config.postgres_port,
+            config.postgres_admin_role.clone(),
+            config.postgres_admin_password.clone(),
+            config.postgres_application_password.clone(),
+            config.stack_attestation.postgres.clone(),
+        ))
+        .await
+        .map_err(ReferenceAppEvidenceError::postgres)?;
+    let post_connect_stack = attest_reference_stack(
+        config.postgres_port,
+        &config.reference_app_url,
+        &config.fixture_control_url,
+    )
+    .await?;
+    if post_connect_stack != config.stack_attestation {
+        return Err(ReferenceAppEvidenceConfigError::ReferenceStackMismatch.into());
+    }
+    let reset_sequence = fixture_control_sequence(config)
+        .await?
+        .checked_add(1)
+        .ok_or(ReferenceAppEvidenceError::FixtureSequenceExhausted)?;
+    let suffix = Uuid::new_v4().simple().to_string()[..16].to_owned();
+    let provisioned = postgres
+        .provision_reference_databases(&suffix, config.compose_project.clone())
+        .await
+        .map_err(ReferenceAppEvidenceError::postgres)?;
+    let (_baseline_target, case_name, case_target, _baseline_archive) = provisioned
+        .into_archive_parts()
+        .ok_or(SpikePostgresError::ArchiveUnavailable)
+        .map_err(ReferenceAppEvidenceError::postgres)?;
+    let database_oid = case_target.identity().database_oid();
+    let timestamp = current_unix_timestamp()?;
+    let run_config = ReferenceCaseRunConfig::new(
+        &case_name,
+        &config.reference_app_url,
+        &config.fixture_control_url,
+        config.fixture_control_token.clone(),
+        reset_sequence,
+        timestamp,
+        OPERATION_ID,
+        2_500,
+        "usd",
+        Duration::from_secs(10),
+        Duration::from_millis(10),
+    )?;
+    let receipt = run_reference_planned_case(
+        format!("run_{suffix}"),
+        format!("case_{suffix}"),
+        planned_case,
+        journal_path,
+        run_config,
+    )
+    .await?;
+    let executed_action_count = receipt.executed().trace().action_count();
+    let journal_record_count = receipt.executed().journal_summary().record_count();
+    let journal_last_record_hash = receipt
+        .executed()
+        .journal_summary()
+        .last_record_hash()
+        .map(str::to_owned);
+    let (_executed, checkpoint) = receipt.into_parts();
+    let (provider_payment_intents, quiescence) = checkpoint.into_oracle_parts();
+    let provider_object_count = provider_payment_intents.len();
+    let report = postgres
+        .check_reference_invariants(&case_name, &provider_payment_intents, quiescence)
+        .await
+        .map_err(ReferenceAppEvidenceError::postgres)?;
+    let invariant_outcomes = reference_invariant_evidence(&report);
+    Ok(ReferencePlannedCaseEvidence {
+        schema_version: 1,
+        seed: planned_case.seed().value(),
+        planned_action_count: planned_case.actions().len(),
+        executed_action_count,
+        journal_record_count,
+        journal_last_record_hash,
+        database_oid,
+        provider_object_count,
+        invariant_outcomes,
+    })
+}
+
+async fn fixture_control_sequence(
+    config: &ReferenceAppEvidenceConfig,
+) -> Result<u64, ReferenceAppEvidenceError> {
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(Duration::from_secs(2))
+        .timeout(Duration::from_secs(2))
+        .build()
+        .map_err(ReferenceAppEvidenceError::FixtureStateRequest)?;
+    let response = client
+        .get(format!(
+            "{}/v1/control/state",
+            config.fixture_control_url.trim_end_matches('/')
+        ))
+        .header("X-Tiv-Control-Token", &config.fixture_control_token)
+        .send()
+        .await
+        .map_err(ReferenceAppEvidenceError::FixtureStateRequest)?;
+    if response.status() != reqwest::StatusCode::OK {
+        return Err(ReferenceAppEvidenceError::UnexpectedFixtureState);
+    }
+    let body = response
+        .bytes()
+        .await
+        .map_err(ReferenceAppEvidenceError::FixtureStateRequest)?;
+    if body.len() > MAX_FIXTURE_STATE_BYTES {
+        return Err(ReferenceAppEvidenceError::UnexpectedFixtureState);
+    }
+    let state = serde_json::from_slice::<ReferenceFixtureState>(&body)
+        .map_err(|_| ReferenceAppEvidenceError::UnexpectedFixtureState)?;
+    if !state.held_gates.is_empty() {
+        return Err(ReferenceAppEvidenceError::UnexpectedFixtureState);
+    }
+    Ok(state.command_sequence)
+}
+
+async fn restart_reference_application(
+    config: &ReferenceAppEvidenceConfig,
+) -> Result<(), ReferenceAppEvidenceError> {
+    let container_id = config.stack_attestation.reference_app.as_str();
+    let restarted = docker_output(&["restart", container_id])
+        .await
+        .map_err(|_| ReferenceAppEvidenceError::ReferenceApplicationRestart)?;
+    if restarted.trim() != container_id {
+        return Err(ReferenceAppEvidenceError::ReferenceApplicationRestart);
+    }
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(Duration::from_millis(500))
+        .timeout(Duration::from_millis(500))
+        .build()
+        .map_err(|_| ReferenceAppEvidenceError::ReferenceApplicationRestart)?;
+    timeout(Duration::from_secs(30), async {
+        loop {
+            let http_healthy = client
+                .get(format!(
+                    "{}/health",
+                    config.reference_app_url.trim_end_matches('/')
+                ))
+                .send()
+                .await
+                .is_ok_and(|response| response.status() == reqwest::StatusCode::OK);
+            let fully_attested = if http_healthy {
+                attest_reference_stack(
+                    config.postgres_port,
+                    &config.reference_app_url,
+                    &config.fixture_control_url,
+                )
+                .await
+                .is_ok_and(|observed| observed == config.stack_attestation)
+            } else {
+                false
+            };
+            if fully_attested {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .map_err(|_| ReferenceAppEvidenceError::ReferenceApplicationHealth)?;
+    Ok(())
+}
+
+fn replay_sequences(initial: u64, offset: u64) -> Result<(u64, u64), ReferenceAppEvidenceError> {
+    let reset = initial
+        .checked_add(offset)
+        .and_then(|sequence| sequence.checked_add(1))
+        .ok_or(ReferenceAppEvidenceError::FixtureSequenceExhausted)?;
+    let confirm = reset
+        .checked_add(1)
+        .ok_or(ReferenceAppEvidenceError::FixtureSequenceExhausted)?;
+    Ok((reset, confirm))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReferenceFixtureState {
+    command_sequence: u64,
+    #[serde(rename = "remaining_outcomes")]
+    _remaining_outcomes: usize,
+    held_gates: Vec<serde_json::Value>,
+    #[serde(rename = "payment_intents")]
+    _payment_intents: Vec<serde_json::Value>,
+}
+
+fn reference_invariant_evidence(report: &SnapshotReport) -> Vec<ReferenceInvariantEvidence> {
+    report
+        .outcomes()
+        .iter()
+        .map(|outcome| {
+            let (verdict, witness_count) = match outcome.verdict() {
+                InvariantVerdict::Held => ("held", 0),
+                InvariantVerdict::Violated(witnesses) => ("violated", witnesses.len()),
+            };
+            ReferenceInvariantEvidence {
+                invariant_id: outcome.identity().invariant().as_str().to_owned(),
+                checkpoint_id: outcome.identity().checkpoint().as_str().to_owned(),
+                verdict,
+                witness_count,
+            }
+        })
+        .collect()
 }
 
 async fn run_reference_app_attempt(
@@ -565,6 +866,26 @@ async fn run_reference_app_attempt(
     let provider_object_count = receipt.provider_payment_intents().len();
     let report = evaluate_completed_replay(postgres, case_name, receipt).await?;
     Ok((provider_object_count, report))
+}
+
+async fn run_reference_app_attempt_at_offset(
+    postgres: &TruthSpikePostgres,
+    plan: &ReplayPlan,
+    config: &ReferenceAppEvidenceConfig,
+    case_name: &DatabaseName,
+    initial_control_sequence: u64,
+    offset: u64,
+) -> Result<(usize, SnapshotReport), ReferenceAppEvidenceError> {
+    let (reset_sequence, confirm_sequence) = replay_sequences(initial_control_sequence, offset)?;
+    run_reference_app_attempt(
+        postgres,
+        plan,
+        config,
+        case_name,
+        reset_sequence,
+        confirm_sequence,
+    )
+    .await
 }
 
 fn current_unix_timestamp() -> Result<i64, ReferenceAppEvidenceError> {
@@ -641,6 +962,20 @@ pub enum ReferenceAppEvidenceError {
     Config(#[from] ReferenceAppEvidenceConfigError),
     #[error("reference app replay failed: {0}")]
     Replay(#[from] ReferenceAppReplayError),
+    #[error("reference planned-case configuration is invalid: {0}")]
+    PlannedCaseConfig(#[from] ReferenceCaseRunConfigError),
+    #[error("reference planned-case execution failed: {0}")]
+    PlannedCaseRun(#[from] ReferenceCaseRunError),
+    #[error("reference fixture state request failed: {0}")]
+    FixtureStateRequest(reqwest::Error),
+    #[error("reference fixture state was incoherent or had a held provider gate")]
+    UnexpectedFixtureState,
+    #[error("reference fixture command sequence was exhausted")]
+    FixtureSequenceExhausted,
+    #[error("the attested reference application could not be restarted")]
+    ReferenceApplicationRestart,
+    #[error("the restarted reference application did not become healthy")]
+    ReferenceApplicationHealth,
     #[error("reference replay returned an invalid provider projection")]
     InvalidProviderProjection,
     #[error("the system clock could not produce a valid webhook timestamp")]

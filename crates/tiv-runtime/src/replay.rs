@@ -390,7 +390,12 @@ pub async fn run_reference_app_replay(
     config: &ReferenceAppReplayConfig,
 ) -> Result<ReferenceAppReplayReceipt, ReferenceAppReplayError> {
     let script = ReferenceReplayScript::from_plan(plan)?;
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(10))
+        .build()?;
 
     reset_fixture(&client, config, script.fixture_seed()).await?;
     let checkout_payment_intent_id = drive_reference_checkout(&client, config, &script).await?;

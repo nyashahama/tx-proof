@@ -1,0 +1,114 @@
+{
+  "schema_version": 3,
+  "scheduler_algorithm": "rand/0.10.2/random_range+rand_chacha/0.10.0/ChaCha20Rng-seed_from_u64",
+  "spec": {
+    "seed": 3,
+    "max_actions": 40,
+    "provider_adapter": "payment_intent_v1",
+    "provider_api_version": "2026-02-25.clover",
+    "provider_outcomes": [
+      "normal",
+      "commit_then_delay"
+    ],
+    "webhook_faults": {
+      "duplicate_max": 0,
+      "delays_millis": [],
+      "allow_reorder": false,
+      "allow_drop": false
+    },
+    "process_faults": {
+      "cut_points": [],
+      "max_kills": 0
+    }
+  },
+  "decision_count": 8,
+  "actions": [
+    {
+      "id": 1,
+      "logical_sequence": 1,
+      "dependencies": [],
+      "decision_number": 0,
+      "eligible_count": 2,
+      "kind": {
+        "kind": "drive_checkout",
+        "provider_script": {
+          "first": "commit_then_delay"
+        }
+      }
+    },
+    {
+      "id": 2,
+      "logical_sequence": 2,
+      "dependencies": [1],
+      "decision_number": 1,
+      "eligible_count": 1,
+      "kind": {
+        "kind": "release_provider_gate"
+      }
+    },
+    {
+      "id": 3,
+      "logical_sequence": 3,
+      "dependencies": [2],
+      "decision_number": 2,
+      "eligible_count": 2,
+      "kind": {
+        "kind": "confirm_payment_intent",
+        "provider_script": {
+          "first": "commit_then_delay"
+        }
+      }
+    },
+    {
+      "id": 4,
+      "logical_sequence": 4,
+      "dependencies": [3],
+      "decision_number": 3,
+      "eligible_count": 1,
+      "kind": {
+        "kind": "release_provider_gate"
+      }
+    },
+    {
+      "id": 5,
+      "logical_sequence": 5,
+      "dependencies": [4],
+      "decision_number": 4,
+      "eligible_count": 1,
+      "kind": {
+        "kind": "generate_provider_event"
+      }
+    },
+    {
+      "id": 6,
+      "logical_sequence": 6,
+      "dependencies": [5],
+      "decision_number": 5,
+      "eligible_count": 1,
+      "kind": {
+        "kind": "deliver_webhook"
+      }
+    },
+    {
+      "id": 7,
+      "logical_sequence": 7,
+      "dependencies": [6],
+      "decision_number": 6,
+      "eligible_count": 1,
+      "kind": {
+        "kind": "wait_for_quiescence"
+      }
+    },
+    {
+      "id": 8,
+      "logical_sequence": 8,
+      "dependencies": [7],
+      "decision_number": 7,
+      "eligible_count": 1,
+      "kind": {
+        "kind": "check_checkpoint",
+        "checkpoint": "final"
+      }
+    }
+  ]
+}

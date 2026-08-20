@@ -9,7 +9,7 @@ use std::{
 use clap::{Args, Parser, Subcommand};
 use serde::Serialize;
 use thiserror::Error;
-use tiv_core::trace::CompiledTrace;
+use tiv_core::{plan::PlannedCase, trace::CompiledTrace};
 use tiv_runtime::{
     config::ProcessEnvironment,
     doctor::{DoctorError, run_doctor},
@@ -17,7 +17,7 @@ use tiv_runtime::{
     postgres::safety::DatabaseName,
     reference_app::{
         ReferenceAppEvidenceConfig, ReferenceAppEvidenceConfigError, ReferenceAppEvidenceError,
-        run_reference_app_evidence,
+        run_reference_app_evidence, run_reference_app_planned_case,
     },
     replay::{
         ReferenceAppReplayConfig, ReferenceAppReplayConfigError, ReferenceAppReplayError,
@@ -75,6 +75,8 @@ pub enum ReplayCommand {
     ReferenceApp(ReferenceAppReplayArgs),
     /// Run three fresh-baseline reference attempts into bounded evidence.
     ReferenceAppEvidence(ReferenceAppEvidenceArgs),
+    /// Execute one compiled serial case through the attested reference stack.
+    ReferenceAppCase(ReferenceAppCaseArgs),
 }
 
 #[derive(Clone, Debug, PartialEq, Args)]
@@ -124,6 +126,28 @@ pub struct ReferenceAppEvidenceArgs {
     pub fixture_control_url: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Args)]
+pub struct ReferenceAppCaseArgs {
+    /// Validated compiled planned-case JSON document to execute.
+    #[arg(long)]
+    pub plan: PathBuf,
+    /// New JSON-lines observation journal path for this case.
+    #[arg(long)]
+    pub journal: PathBuf,
+    /// Loopback host port for the isolated `PostgreSQL` service.
+    #[arg(long, default_value_t = 15_432)]
+    pub postgres_port: u16,
+    /// Administrative role for the isolated `PostgreSQL` service.
+    #[arg(long, default_value = "tiv_admin")]
+    pub postgres_admin_role: String,
+    /// Loopback URL for the real reference application.
+    #[arg(long)]
+    pub reference_app_url: String,
+    /// Loopback URL for the fixture control listener.
+    #[arg(long)]
+    pub fixture_control_url: String,
+}
+
 #[derive(Debug, PartialEq, Subcommand)]
 pub enum TraceCommand {
     /// Validate schema, graph, captured values, and replay bindings.
@@ -150,7 +174,10 @@ pub fn execute(cli: Cli) -> Result<String, CliError> {
         }
         Command::Doctor(_)
         | Command::Replay {
-            command: ReplayCommand::ReferenceApp(_) | ReplayCommand::ReferenceAppEvidence(_),
+            command:
+                ReplayCommand::ReferenceApp(_)
+                | ReplayCommand::ReferenceAppEvidence(_)
+                | ReplayCommand::ReferenceAppCase(_),
         } => Err(CliError::AsyncCommand),
         Command::Trace {
             command: TraceCommand::Validate { path },
@@ -215,6 +242,28 @@ pub async fn execute_async(cli: Cli) -> Result<String, CliError> {
             let evidence = run_reference_app_evidence(&plan, &config).await?;
             evidence.to_pretty_json().map_err(CliError::Encode)
         }
+        Command::Replay {
+            command: ReplayCommand::ReferenceAppCase(args),
+        } => {
+            let document = read_trace_document(&args.plan)?;
+            let plan: PlannedCase =
+                serde_json::from_str(&document).map_err(CliError::InvalidPlannedCase)?;
+            let admin_password = required_env("TIV_POSTGRES_ADMIN_PASSWORD")?;
+            let application_password = required_env("TIV_POSTGRES_APPLICATION_PASSWORD")?;
+            let fixture_control_token = required_env("TIV_FIXTURE_CONTROL_TOKEN")?;
+            let config = ReferenceAppEvidenceConfig::attest(
+                args.postgres_port,
+                args.postgres_admin_role,
+                admin_password,
+                application_password,
+                args.reference_app_url,
+                args.fixture_control_url,
+                fixture_control_token,
+            )
+            .await?;
+            let evidence = run_reference_app_planned_case(&plan, &config, args.journal).await?;
+            evidence.to_pretty_json().map_err(CliError::Encode)
+        }
         read_only => execute(Cli { command: read_only }),
     }
 }
@@ -267,6 +316,8 @@ pub enum CliError {
     },
     #[error("compiled trace is invalid: {0}")]
     InvalidTrace(#[from] serde_json::Error),
+    #[error("compiled planned case is invalid: {0}")]
+    InvalidPlannedCase(serde_json::Error),
     #[error("compiled trace cannot be replayed by this runtime: {0}")]
     ReplayPlan(#[from] ReplayPlanError),
     #[error("this command requires async execution")]

@@ -5,6 +5,7 @@ use tiv_core::plan::PlanActionKind;
 
 use crate::{
     campaign::{CaseEffectAdapter, CaseEffectFuture, CaseEffectRequest},
+    postgres::oracle::ProviderPaymentIntent,
     provider_http::{ProviderHttpAdapter, ProviderHttpError},
     webhook_http::{WebhookHttpAdapter, WebhookHttpError},
 };
@@ -19,6 +20,22 @@ impl CaseHttpAdapter {
     #[must_use]
     pub const fn new(provider: ProviderHttpAdapter, webhook: WebhookHttpAdapter) -> Self {
         Self { provider, webhook }
+    }
+
+    pub(crate) async fn await_reference_quiescence(
+        &self,
+    ) -> Result<ReferenceCaseHttpCompletion, CaseHttpError> {
+        if !self.provider.is_idle() || !self.webhook.is_idle() {
+            return Err(CaseHttpError::NotQuiescent);
+        }
+        let provider_payment_intents = self
+            .provider
+            .quiescent_provider_projection()
+            .await
+            .map_err(CaseHttpError::Provider)?;
+        Ok(ReferenceCaseHttpCompletion {
+            provider_payment_intents,
+        })
     }
 
     async fn execute_provider(
@@ -92,4 +109,16 @@ pub enum CaseHttpError {
     Webhook(#[source] WebhookHttpError),
     #[error("action is outside the combined HTTP adapter boundary")]
     UnsupportedAction,
+    #[error("the provider or webhook HTTP boundary is not quiescent")]
+    NotQuiescent,
+}
+
+pub(crate) struct ReferenceCaseHttpCompletion {
+    provider_payment_intents: Vec<ProviderPaymentIntent>,
+}
+
+impl ReferenceCaseHttpCompletion {
+    pub(crate) fn into_provider_payment_intents(self) -> Vec<ProviderPaymentIntent> {
+        self.provider_payment_intents
+    }
 }

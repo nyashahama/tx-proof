@@ -103,6 +103,27 @@ TIV_POSTGRES_APPLICATION_PASSWORD=tiv-app-local-only-password \
     --postgres-port 15432 \
     --reference-app-url http://127.0.0.1:18080 \
     --fixture-control-url http://127.0.0.1:12112
+
+Run the compiled serial provider/webhook case with a new durable journal path:
+
+```sh
+TIV_FIXTURE_CONTROL_TOKEN=run-scoped-control-token \
+TIV_POSTGRES_ADMIN_PASSWORD=tiv-local-only-password \
+TIV_POSTGRES_APPLICATION_PASSWORD=tiv-app-local-only-password \
+  cargo run --quiet -p tiv-cli --bin tiv -- \
+    replay reference-app-case \
+    --plan spike/planned-case-http-v1.json \
+    --journal /tmp/tiv-reference-app-case.jsonl \
+    --postgres-port 15432 \
+    --reference-app-url http://127.0.0.1:18080 \
+    --fixture-control-url http://127.0.0.1:12112
+```
+
+Each self-contained public run restarts only the previously attested reference
+application container, waits for both HTTP and Docker health, re-attests the
+same container identity, and then allocates the fixture's next authenticated
+control sequence. This makes consecutive evidence and planned-case commands
+safe on one isolated stack without weakening the monotonic sequence contract.
 ```
 
 The command provisions a generated case database, installs a sequenced

@@ -5,7 +5,7 @@ use tiv_core::{
 };
 use tokio_postgres::{Client, IsolationLevel};
 
-use crate::replay::ReferenceAppReplayCompletion;
+use crate::{case_http::ReferenceCaseHttpCompletion, replay::ReferenceAppReplayCompletion};
 
 const CHECKPOINT_ID: &str = "checkout-quiescent";
 const PROVIDER_UNIQUENESS_ID: &str = "provider-object-unique";
@@ -35,6 +35,12 @@ impl QuiescencePermit {
 
     pub(crate) const fn after_reference_app_replay_completed(
         _completion: ReferenceAppReplayCompletion,
+    ) -> Self {
+        Self { _private: () }
+    }
+
+    pub(crate) const fn after_reference_case_http_quiescent(
+        _completion: &ReferenceCaseHttpCompletion,
     ) -> Self {
         Self { _private: () }
     }
@@ -79,19 +85,23 @@ impl ProviderPaymentIntent {
         })
     }
 
-    pub(crate) fn id(&self) -> &str {
+    #[must_use]
+    pub fn id(&self) -> &str {
         self.id.as_str()
     }
 
-    pub(crate) const fn amount_minor(&self) -> i64 {
+    #[must_use]
+    pub const fn amount_minor(&self) -> i64 {
         self.amount_minor
     }
 
-    pub(crate) fn currency(&self) -> &str {
+    #[must_use]
+    pub fn currency(&self) -> &str {
         &self.currency
     }
 
-    pub(crate) fn status(&self) -> &str {
+    #[must_use]
+    pub fn status(&self) -> &str {
         &self.status
     }
 }

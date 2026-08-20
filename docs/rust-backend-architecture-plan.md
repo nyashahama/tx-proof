@@ -385,6 +385,17 @@ proxy preserves provider status/body and propagates a real upstream transport
 close by ending the driver connection; the host does not receive a fixture
 data-plane port.
 
+The reference planned-case runner validates the compiled plan before mutation,
+rejects process-fault cases before fixture reset, installs the exact flattened
+provider fault scripts, and executes the full serial HTTP plan into a durable
+journal. Its reference-only quiescence gate requires no held provider request,
+no queued webhook, no held fixture gate, no unused provider outcome, and a
+validated provider projection. The final checkpoint yields the unforgeable
+permit consumed by the existing five-query PostgreSQL oracle. Self-contained
+public runs restart and re-attest only the known reference-app container and
+allocate the next authenticated fixture sequence so multiple commands can run
+serially on the same isolated stack.
+
 This slice is proven through real loopback fixture and application endpoints,
 but is not yet wired into the live Compose campaign runner. Durable fixture
 delivery-attempt history, webhook cut-point gates, crash injection, and final
