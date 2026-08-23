@@ -9,6 +9,8 @@ use uuid::Uuid;
 fn only_generated_baseline_and_case_database_names_are_accepted() {
     assert!(DatabaseName::parse("tiv_base_01234567").is_ok());
     assert!(DatabaseName::parse("tiv_case_0123456789abcdef").is_ok());
+    assert!(DatabaseName::parse("tiv_base_checkout").is_ok());
+    assert!(DatabaseName::parse("tiv_case_checkout").is_ok());
 
     for invalid in [
         "postgres",
@@ -17,6 +19,7 @@ fn only_generated_baseline_and_case_database_names_are_accepted() {
         "tiv_case_has-dash",
         "tiv_case_../postgres",
         "tiv_case_0123456",
+        "tiv_case_check.out",
     ] {
         assert!(
             DatabaseName::parse(invalid).is_err(),

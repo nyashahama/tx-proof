@@ -25,13 +25,15 @@ The preflight performs these bounded checks:
    repository.
 3. Enforce local-disposable mode, serial execution, run/time/database limits,
    the supported Stripe fixture protocol, and exactly five invariants.
-4. Resolve the referenced database URLs and webhook secret from environment
+4. Bind future mutating commands to one explicit lowercase Compose
+   `project_name`; service names alone are not an ownership boundary.
+5. Resolve the referenced database URLs and webhook secret from environment
    names while keeping their values in non-serializable types.
-5. Invoke only `docker --host unix:///var/run/docker.sock compose ... version
+6. Invoke only `docker --host unix:///var/run/docker.sock compose ... version
    --short` and `docker --host unix:///var/run/docker.sock compose ... config
    --format json`, with exact project/file arguments, timeouts, and output
    limits.
-6. Require the configured application, PostgreSQL, Stripe fixture, and worker
+7. Require the configured application, PostgreSQL, Stripe fixture, and worker
    services; reject live Stripe material and public database targets; redact
    all Compose environment values before hashing the resolved graph.
 

@@ -14,6 +14,7 @@ use tiv_core::{
     trace::CompiledTrace,
 };
 use tiv_runtime::{
+    baseline::{BaselineError, run_configured_baseline},
     config::{ConfigError, ProcessEnvironment, load_resolved_config},
     doctor::{DoctorError, run_doctor},
     init::{InitError, initialize_project},
@@ -54,6 +55,8 @@ pub enum Command {
     Init,
     /// Validate configuration and inspect local Compose readiness without mutation.
     Doctor(DoctorArgs),
+    /// Seal and reset-prove one attested disposable `PostgreSQL` baseline.
+    Baseline(BaselineArgs),
     /// Inspect replay readiness without executing customer code.
     Replay {
         #[command(subcommand)]
@@ -64,6 +67,16 @@ pub enum Command {
         #[command(subcommand)]
         command: TraceCommand,
     },
+}
+
+#[derive(Clone, Debug, PartialEq, Args)]
+pub struct BaselineArgs {
+    /// Typed TOML configuration for the disposable customer stack.
+    #[arg(long, default_value = "tiv.toml")]
+    pub config: PathBuf,
+    /// Exact identity-bound phrase emitted by the challenge stage.
+    #[arg(long)]
+    pub acknowledge_reset: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Args)]
@@ -182,6 +195,7 @@ pub fn execute(cli: Cli) -> Result<String, CliError> {
             serde_json::to_string(&plan).map_err(CliError::Encode)
         }
         Command::Doctor(_)
+        | Command::Baseline(_)
         | Command::Replay {
             command:
                 ReplayCommand::ReferenceApp(_)
@@ -209,6 +223,16 @@ pub async fn execute_async(cli: Cli) -> Result<String, CliError> {
         Command::Doctor(args) => {
             let report = run_doctor(&args.config, &ProcessEnvironment).await?;
             report.to_pretty_json().map_err(CliError::Encode)
+        }
+        Command::Baseline(args) => {
+            run_doctor(&args.config, &ProcessEnvironment).await?;
+            let output = run_configured_baseline(
+                &args.config,
+                &ProcessEnvironment,
+                args.acknowledge_reset.as_deref(),
+            )
+            .await?;
+            output.to_pretty_json().map_err(CliError::Encode)
         }
         Command::Replay {
             command: ReplayCommand::ReferenceApp(args),
@@ -358,6 +382,8 @@ pub enum CliError {
     AsyncCommand,
     #[error("doctor preflight failed: {0}")]
     Doctor(#[from] DoctorError),
+    #[error("customer baseline execution failed: {0}")]
+    Baseline(#[from] BaselineError),
     #[error("could not determine the current directory: {0}")]
     CurrentDirectory(std::io::Error),
     #[error("project initialization failed: {0}")]
@@ -393,6 +419,7 @@ impl CliError {
     pub fn exit_code(&self) -> u8 {
         match self {
             Self::Doctor(error) if error.is_infrastructure_failure() => 3,
+            Self::Baseline(error) if error.is_infrastructure_failure() => 3,
             _ => 2,
         }
     }

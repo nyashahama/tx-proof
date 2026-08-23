@@ -17,6 +17,7 @@ require_database_marker = true
 max_database_bytes = 2147483648
 
 [compose]
+project_name = "tiv-reference-app-spike"
 files = ["../../../spike/reference-app.compose.yaml"]
 application_service = "reference-app"
 postgres_service = "postgres"

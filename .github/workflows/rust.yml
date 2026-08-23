@@ -175,6 +175,11 @@ jobs:
             --file spike/reference-app.compose.yaml \
             up --detach --build --wait
 
+      - name: Prove the customer baseline challenge and destructive reset
+        run: |
+          cargo test -p tiv-cli --test baseline \
+            -- --ignored --nocapture --test-threads=1
+
       - name: Prove three fresh-baseline reference application attempts
         env:
           TIV_FIXTURE_CONTROL_TOKEN: run-scoped-control-token

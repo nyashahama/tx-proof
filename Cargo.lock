@@ -1239,6 +1239,8 @@ dependencies = [
  "tiv-core",
  "tiv-runtime",
  "tokio",
+ "tokio-postgres",
+ "uuid",
 ]
 
 [[package]]

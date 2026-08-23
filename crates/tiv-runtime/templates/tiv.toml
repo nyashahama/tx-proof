@@ -22,6 +22,7 @@ max_database_bytes = 2147483648
 
 [compose]
 # TODO: map the repository's disposable Compose file and exact service names.
+project_name = "tiv-local-disposable"
 files = ["compose.yaml"]
 application_service = "app"
 postgres_service = "postgres"

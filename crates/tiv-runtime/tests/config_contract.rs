@@ -26,6 +26,36 @@ fn the_blueprint_config_resolves_and_redacts_every_secret_value() {
 }
 
 #[test]
+fn config_binds_mutating_commands_to_one_explicit_compose_project() {
+    let document = blueprint_document();
+    let config = resolve_document(&document).expect("the explicit Compose project resolves");
+    let encoded = serde_json::to_value(config.redacted()).unwrap();
+
+    assert_eq!(
+        encoded["compose"]["project_name"],
+        serde_json::json!("tiv-reference-app-spike")
+    );
+}
+
+#[test]
+fn config_rejects_database_names_outside_the_runtime_reset_grammar() {
+    let document = blueprint_document();
+
+    for invalid in ["tiv_case_", "tiv_case_short", "tiv_case_has-dash"] {
+        assert!(matches!(
+            resolve_document(&document.replace("tiv_case_checkout", invalid)),
+            Err(ConfigError::InvalidDatabaseName)
+        ));
+    }
+    for invalid in ["tiv_base_", "tiv_base_short", "tiv_base_has-dash"] {
+        assert!(matches!(
+            resolve_document(&document.replace("tiv_base_checkout", invalid)),
+            Err(ConfigError::InvalidDatabaseName)
+        ));
+    }
+}
+
+#[test]
 fn config_rejects_unknown_fields_unsupported_versions_and_non_serial_execution() {
     let document = blueprint_document();
     assert!(matches!(

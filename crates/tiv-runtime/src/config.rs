@@ -104,6 +104,7 @@ enum SafetyMode {
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct RawComposeConfig {
+    project_name: String,
     files: Vec<PathBuf>,
     application_service: String,
     postgres_service: String,
@@ -239,6 +240,7 @@ enum InvariantExpectation {
 /// `Serialize`, because it owns validated secret-bearing URLs.
 pub struct ResolvedConfig {
     root: PathBuf,
+    compose_project: String,
     compose_files: Vec<PathBuf>,
     application_service: String,
     postgres_service: String,
@@ -266,6 +268,30 @@ impl ResolvedConfig {
 
     pub(crate) fn compose_files(&self) -> &[PathBuf] {
         &self.compose_files
+    }
+
+    pub(crate) fn compose_project(&self) -> &str {
+        &self.compose_project
+    }
+
+    pub(crate) fn admin_url(&self) -> &Url {
+        &self.private.admin_url.value
+    }
+
+    pub(crate) fn case_url(&self) -> &Url {
+        &self.private.case_url.value
+    }
+
+    pub(crate) fn case_database(&self) -> &str {
+        &self.private.case_database
+    }
+
+    pub(crate) fn baseline_database(&self) -> &str {
+        &self.private.baseline_database
+    }
+
+    pub(crate) const fn max_database_bytes(&self) -> u64 {
+        self.private.max_database_bytes
     }
 
     pub(crate) fn application_service(&self) -> &str {
@@ -310,7 +336,7 @@ impl ResolvedConfig {
 }
 
 struct SecretUrl {
-    _value: Url,
+    value: Url,
 }
 
 struct SecretString {
@@ -322,8 +348,11 @@ struct ResolvedPrivate {
     _case_timeout: Duration,
     _health_url: Url,
     _health_timeout: Duration,
-    _admin_url: SecretUrl,
-    _case_url: SecretUrl,
+    admin_url: SecretUrl,
+    case_url: SecretUrl,
+    case_database: String,
+    baseline_database: String,
+    max_database_bytes: u64,
     _webhook_secret: SecretString,
     _quiescence_sql: PathBuf,
     _quiescence_stable_for: Duration,
@@ -390,6 +419,7 @@ struct RedactedSafetyConfig {
 
 #[derive(Serialize)]
 struct RedactedComposeConfig {
+    project_name: String,
     files: Vec<String>,
     application_service: String,
     postgres_service: String,
@@ -551,6 +581,7 @@ fn resolve_raw_config(
         return Err(ConfigError::UnsafeSafetyPolicy);
     }
 
+    validate_compose_project(&raw.compose.project_name)?;
     validate_service_name(&raw.compose.application_service)?;
     validate_service_name(&raw.compose.postgres_service)?;
     if raw.compose.application_service == raw.compose.postgres_service {
@@ -722,6 +753,7 @@ fn resolve_raw_config(
             max_database_bytes: raw.safety.max_database_bytes,
         },
         compose: RedactedComposeConfig {
+            project_name: raw.compose.project_name.clone(),
             files: compose_files
                 .iter()
                 .map(|path| display_path(path))
@@ -736,8 +768,8 @@ fn resolve_raw_config(
             admin_url_env: raw.database.admin_url_env,
             case_url_env: raw.database.case_url_env,
             strategy: raw.database.strategy,
-            case_database: raw.database.case_database,
-            baseline_database: raw.database.baseline_database,
+            case_database: raw.database.case_database.clone(),
+            baseline_database: raw.database.baseline_database.clone(),
             invariant_role: raw.database.invariant_role.clone(),
             quiescence_sql: display_path(&quiescence_sql),
             quiescence_stable_for_ms: duration_millis(quiescence_stable_for)?,
@@ -763,6 +795,7 @@ fn resolve_raw_config(
 
     Ok(ResolvedConfig {
         root: canonical_root,
+        compose_project: raw.compose.project_name,
         compose_files,
         application_service: raw.compose.application_service,
         postgres_service: raw.compose.postgres_service,
@@ -774,8 +807,11 @@ fn resolve_raw_config(
             _case_timeout: case_timeout,
             _health_url: health_url,
             _health_timeout: health_timeout,
-            _admin_url: SecretUrl { _value: admin_url },
-            _case_url: SecretUrl { _value: case_url },
+            admin_url: SecretUrl { value: admin_url },
+            case_url: SecretUrl { value: case_url },
+            case_database: raw.database.case_database,
+            baseline_database: raw.database.baseline_database,
+            max_database_bytes: raw.safety.max_database_bytes,
             _webhook_secret: SecretString {
                 _value: webhook_secret,
             },
@@ -865,10 +901,28 @@ fn validate_service_name(name: &str) -> Result<(), ConfigError> {
     Ok(())
 }
 
-fn validate_database_name(name: &str, prefix: &str) -> Result<(), ConfigError> {
+fn validate_compose_project(name: &str) -> Result<(), ConfigError> {
+    let mut bytes = name.bytes();
+    let Some(first) = bytes.next() else {
+        return Err(ConfigError::InvalidComposeProject);
+    };
     if name.len() > 63
-        || !name.starts_with(prefix)
-        || !name
+        || !(first.is_ascii_lowercase() || first.is_ascii_digit())
+        || !bytes.all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_')
+        })
+    {
+        return Err(ConfigError::InvalidComposeProject);
+    }
+    Ok(())
+}
+
+fn validate_database_name(name: &str, prefix: &str) -> Result<(), ConfigError> {
+    let Some(suffix) = name.strip_prefix(prefix) else {
+        return Err(ConfigError::InvalidDatabaseName);
+    };
+    if !(8..=54).contains(&suffix.len())
+        || !suffix
             .bytes()
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
     {
@@ -1125,6 +1179,8 @@ pub enum ConfigError {
     UnsafeSafetyPolicy,
     #[error("Compose service name is invalid")]
     InvalidComposeService,
+    #[error("Compose project name is invalid")]
+    InvalidComposeProject,
     #[error("Compose service mappings overlap")]
     AmbiguousComposeServices,
     #[error("at least one Compose file is required")]

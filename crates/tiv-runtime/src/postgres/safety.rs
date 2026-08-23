@@ -20,7 +20,7 @@ impl DatabaseName {
     /// # Errors
     ///
     /// Returns [`InvalidDatabaseName`] unless the name starts with `tiv_base_`
-    /// or `tiv_case_` and ends in 8 to 32 lowercase hexadecimal characters.
+    /// or `tiv_case_` and ends in 8 to 54 lowercase identifier characters.
     pub fn parse(value: impl Into<String>) -> Result<Self, InvalidDatabaseName> {
         let value = value.into();
         let (kind, suffix) = value
@@ -32,10 +32,10 @@ impl DatabaseName {
                     .map(|suffix| (DatabaseKind::Case, suffix))
             })
             .ok_or(InvalidDatabaseName)?;
-        if !(8..=32).contains(&suffix.len())
+        if !(8..=54).contains(&suffix.len())
             || !suffix
                 .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
         {
             return Err(InvalidDatabaseName);
         }

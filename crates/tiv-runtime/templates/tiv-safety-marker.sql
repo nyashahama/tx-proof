@@ -10,7 +10,7 @@ SELECT tiv_configuration_required('safety-marker');
 CREATE TABLE tiv_verifier_marker (
     singleton boolean PRIMARY KEY DEFAULT true CHECK (singleton),
     marker_uuid uuid NOT NULL,
-    marker_kind text NOT NULL CHECK (marker_kind = 'case'),
+    marker_kind text NOT NULL CHECK (marker_kind IN ('baseline', 'case')),
     compose_project text NOT NULL,
     application_role text NOT NULL
 );

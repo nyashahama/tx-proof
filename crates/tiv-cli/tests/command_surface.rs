@@ -1,8 +1,36 @@
 use clap::Parser;
 use tiv_cli::{
-    Cli, Command, DoctorArgs, ReferenceAppCaseArgs, ReferenceAppEvidenceArgs,
+    BaselineArgs, Cli, Command, DoctorArgs, ReferenceAppCaseArgs, ReferenceAppEvidenceArgs,
     ReferenceAppReplayArgs, ReplayCommand, TraceCommand,
 };
+
+#[test]
+fn the_cli_exposes_the_two_stage_customer_baseline_command() {
+    let challenge = Cli::try_parse_from(["tiv", "baseline", "--config", "safe/tiv.toml"])
+        .expect("the baseline challenge command parses");
+    assert_eq!(
+        challenge.command,
+        Command::Baseline(BaselineArgs {
+            config: "safe/tiv.toml".into(),
+            acknowledge_reset: None,
+        })
+    );
+
+    let acknowledged = Cli::try_parse_from([
+        "tiv",
+        "baseline",
+        "--acknowledge-reset",
+        "RESET exact identity",
+    ])
+    .expect("the exact reset acknowledgement parses as one argument");
+    assert_eq!(
+        acknowledged.command,
+        Command::Baseline(BaselineArgs {
+            config: "tiv.toml".into(),
+            acknowledge_reset: Some("RESET exact identity".to_owned()),
+        })
+    );
+}
 
 #[test]
 fn the_cli_exposes_doctor_with_a_safe_default_config_path() {

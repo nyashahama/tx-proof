@@ -14,6 +14,10 @@ tiv-core = { path = "../tiv-core" }
 tiv-runtime = { path = "../tiv-runtime" }
 tokio.workspace = true
 
+[dev-dependencies]
+tokio-postgres.workspace = true
+uuid.workspace = true
+
 [[bin]]
 name = "tiv"
 path = "src/main.rs"
