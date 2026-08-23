@@ -204,10 +204,16 @@ async fn sealed_customer_baseline_supports_two_fresh_attested_case_resets() {
 
     let config = load_resolved_config(config_path.as_ref(), &test_environment())
         .expect("the live customer config resolves");
+    let sealed_before = database_catalog_with_comment("tiv_base_checkout").await;
     let session = ConfiguredBaselineSession::attest(&config)
         .await
         .expect("the sealed baseline and current case are freshly attested");
-    let sealed_before = database_catalog_with_comment("tiv_base_checkout").await;
+    assert_eq!(
+        database_catalog_with_comment("tiv_base_checkout").await,
+        sealed_before,
+        "internal attestation must not change the sealed baseline catalog identity"
+    );
+    assert_eq!(temporary_database_count().await, 0);
     let first_oid = session.case_identity().database_oid();
     let first_marker = session.case_identity().marker().marker_uuid().to_string();
 
@@ -282,6 +288,68 @@ async fn tampered_sealed_baseline_is_rejected_before_case_mutation_and_services_
     cleanup_databases().await;
 }
 
+#[tokio::test]
+#[ignore = "requires the isolated reference-app Compose project"]
+async fn in_database_baseline_marker_tampering_is_rejected_before_case_mutation() {
+    prepare_case_database().await;
+    let config_path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/golden/doctor-project/tiv.toml"
+    );
+    seal_customer_baseline(config_path);
+
+    let config = load_resolved_config(config_path.as_ref(), &test_environment()).unwrap();
+    let session = ConfiguredBaselineSession::attest(&config).await.unwrap();
+    install_dirty_case_state("must-survive-in-database-baseline-tampering").await;
+    let case_oid = database_oid("tiv_case_checkout").await;
+    let baseline_catalog = database_catalog_with_comment("tiv_base_checkout").await;
+    tamper_sealed_baseline_marker().await;
+    assert_eq!(
+        database_catalog_with_comment("tiv_base_checkout").await,
+        baseline_catalog,
+        "the poisoned baseline deliberately preserves its catalog attestation"
+    );
+
+    assert!(matches!(
+        session.reset_case().await,
+        Err(BaselineError::BaselineIdentityMismatch)
+    ));
+    assert_eq!(database_oid("tiv_case_checkout").await, case_oid);
+    assert!(relation_exists("customer_dirty").await);
+    assert_eq!(temporary_database_count().await, 0);
+    assert!(application_service_is_healthy());
+    cleanup_databases().await;
+}
+
+#[tokio::test]
+#[ignore = "requires the isolated reference-app Compose project"]
+async fn failed_replacement_restores_the_exact_original_case_before_services_restart() {
+    prepare_case_database().await;
+    let config_path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/golden/doctor-project/tiv.toml"
+    );
+    seal_customer_baseline(config_path);
+
+    let config = load_resolved_config(config_path.as_ref(), &test_environment()).unwrap();
+    let session = ConfiguredBaselineSession::attest(&config).await.unwrap();
+    install_dirty_case_state("must-survive-replacement-failure").await;
+    let case_oid = database_oid("tiv_case_checkout").await;
+    let case_marker = session.case_identity().marker().marker_uuid();
+    install_baseline_marker_update_failure().await;
+
+    assert!(matches!(
+        session.reset_case().await,
+        Err(BaselineError::Database(_))
+    ));
+    assert_eq!(database_oid("tiv_case_checkout").await, case_oid);
+    assert_eq!(case_marker_uuid().await, case_marker);
+    assert!(relation_exists("customer_dirty").await);
+    assert_eq!(temporary_database_count().await, 0);
+    assert!(application_service_is_healthy());
+    cleanup_databases().await;
+}
+
 fn baseline_command(config: &str) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_tiv"));
     command
@@ -294,6 +362,28 @@ fn baseline_command(config: &str) -> Command {
         .env("DOCKER_TLS_VERIFY", "1")
         .env("DOCKER_CERT_PATH", "/definitely/not/a/docker/certificate");
     command
+}
+
+fn seal_customer_baseline(config: &str) {
+    let challenge = baseline_command(config).output().unwrap();
+    assert!(
+        challenge.status.success(),
+        "baseline challenge failed: {}",
+        String::from_utf8_lossy(&challenge.stderr)
+    );
+    let challenge: serde_json::Value = serde_json::from_slice(&challenge.stdout).unwrap();
+    let completed = baseline_command(config)
+        .args([
+            "--acknowledge-reset",
+            challenge["reset_acknowledgement"].as_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        completed.status.success(),
+        "baseline failed: {}",
+        String::from_utf8_lossy(&completed.stderr)
+    );
 }
 
 async fn install_limited_admin() {
@@ -631,7 +721,115 @@ async fn set_database_comment(database: &str, comment: &str) {
     connection.await.unwrap().unwrap();
 }
 
+async fn tamper_sealed_baseline_marker() {
+    set_database_connections("tiv_base_checkout", true).await;
+    let baseline_url = ADMIN_URL.replace("/postgres", "/tiv_base_checkout");
+    let (client, connection) = tokio_postgres::connect(&baseline_url, NoTls).await.unwrap();
+    let connection = tokio::spawn(connection);
+    client
+        .execute(
+            "UPDATE tiv_verifier_marker SET marker_uuid = $1",
+            &[&Uuid::new_v4()],
+        )
+        .await
+        .unwrap();
+    drop(client);
+    connection.await.unwrap().unwrap();
+    set_database_connections("tiv_base_checkout", false).await;
+}
+
+async fn install_baseline_marker_update_failure() {
+    set_database_connections("tiv_base_checkout", true).await;
+    let baseline_url = ADMIN_URL.replace("/postgres", "/tiv_base_checkout");
+    let (client, connection) = tokio_postgres::connect(&baseline_url, NoTls).await.unwrap();
+    let connection = tokio::spawn(connection);
+    client
+        .batch_execute(
+            "CREATE FUNCTION tiv_reject_marker_update() RETURNS trigger LANGUAGE plpgsql AS $$ \
+                 BEGIN RAISE EXCEPTION 'injected marker update failure'; END \
+             $$; \
+             CREATE TRIGGER tiv_reject_marker_update \
+                 BEFORE UPDATE ON tiv_verifier_marker \
+                 FOR EACH ROW EXECUTE FUNCTION tiv_reject_marker_update()",
+        )
+        .await
+        .unwrap();
+    drop(client);
+    connection.await.unwrap().unwrap();
+    set_database_connections("tiv_base_checkout", false).await;
+}
+
+async fn set_database_connections(database: &str, enabled: bool) {
+    let (client, connection) = tokio_postgres::connect(ADMIN_URL, NoTls).await.unwrap();
+    let connection = tokio::spawn(connection);
+    let setting = if enabled { "true" } else { "false" };
+    client
+        .batch_execute(&format!(
+            "ALTER DATABASE {database} ALLOW_CONNECTIONS {setting}"
+        ))
+        .await
+        .unwrap();
+    drop(client);
+    connection.await.unwrap().unwrap();
+}
+
+async fn case_marker_uuid() -> Uuid {
+    let admin_case_url = ADMIN_URL.replace("/postgres", "/tiv_case_checkout");
+    let (client, connection) = tokio_postgres::connect(&admin_case_url, NoTls)
+        .await
+        .unwrap();
+    let connection = tokio::spawn(connection);
+    let marker = client
+        .query_one("SELECT marker_uuid FROM tiv_verifier_marker", &[])
+        .await
+        .unwrap()
+        .get(0);
+    drop(client);
+    connection.await.unwrap().unwrap();
+    marker
+}
+
+async fn temporary_database_count() -> i64 {
+    let (client, connection) = tokio_postgres::connect(ADMIN_URL, NoTls).await.unwrap();
+    let connection = tokio::spawn(connection);
+    let count = client
+        .query_one(
+            "SELECT count(*) FROM pg_database \
+             WHERE datname LIKE 'tiv_case_attest_%' \
+                OR datname LIKE 'tiv_case_recovery_%'",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    drop(client);
+    connection.await.unwrap().unwrap();
+    count
+}
+
 fn application_service_is_healthy() -> bool {
+    let container = Command::new("docker")
+        .args([
+            "--host",
+            "unix:///var/run/docker.sock",
+            "ps",
+            "--filter",
+            "label=com.docker.compose.project=tiv-reference-app-spike",
+            "--filter",
+            "label=com.docker.compose.service=reference-app",
+            "--format",
+            "{{.ID}}",
+        ])
+        .output()
+        .unwrap();
+    if !container.status.success() {
+        return false;
+    }
+    let container = String::from_utf8_lossy(&container.stdout);
+    let ids = container.lines().collect::<Vec<_>>();
+    let [container_id] = ids.as_slice() else {
+        return false;
+    };
     let output = Command::new("docker")
         .args([
             "--host",
@@ -639,7 +837,7 @@ fn application_service_is_healthy() -> bool {
             "inspect",
             "--format",
             "{{.State.Running}} {{if .State.Health}}{{.State.Health.Status}}{{end}}",
-            "tiv-reference-app-spike-reference-app-1",
+            container_id,
         ])
         .output()
         .unwrap();

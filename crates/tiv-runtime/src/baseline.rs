@@ -89,7 +89,9 @@ pub struct ConfiguredBaselineSession {
 
 impl ConfiguredBaselineSession {
     /// Re-attests the configured local `PostgreSQL` container, current case
-    /// identity, and immutable sealed-baseline catalog marker without mutation.
+    /// identity, and both catalog and in-database sealed-baseline markers.
+    /// Baseline contents are inspected through a short-lived disposable clone,
+    /// so the sealed baseline itself never accepts a connection.
     ///
     /// # Errors
     ///
@@ -160,6 +162,12 @@ impl ConfiguredBaselineSession {
             reset_verified_case(&inputs, verified, permit, &fresh_baseline).await
         }
         .await;
+        if matches!(&execution, Err(BaselineError::CaseDatabaseRecoveryFailed)) {
+            // The exact original case could not be proven restored. Keeping
+            // database clients stopped is safer than starting them against an
+            // absent, partial, or unverified replacement.
+            return Err(BaselineError::CaseDatabaseRecoveryFailed);
+        }
         let restart = start_customer_services(&inputs).await;
         match (execution, restart) {
             (Ok((case_identity, report)), Ok(())) => {
@@ -797,6 +805,18 @@ async fn seal_and_reset_prove(
 async fn observe_sealed_baseline_identity(
     inputs: &BaselineInputs,
 ) -> Result<DatabaseIdentity, BaselineError> {
+    let before = observe_sealed_baseline_catalog_identity(inputs).await?;
+    attest_sealed_baseline_contents(inputs, &before).await?;
+    let after = observe_sealed_baseline_catalog_identity(inputs).await?;
+    if after != before {
+        return Err(BaselineError::BaselineIdentityMismatch);
+    }
+    Ok(after)
+}
+
+async fn observe_sealed_baseline_catalog_identity(
+    inputs: &BaselineInputs,
+) -> Result<DatabaseIdentity, BaselineError> {
     let maintenance = PostgresSession::connect(&inputs.admin_url).await?;
     let row = maintenance
         .client
@@ -855,6 +875,63 @@ async fn observe_sealed_baseline_identity(
     .map_err(BaselineError::InvalidIdentity)
 }
 
+async fn attest_sealed_baseline_contents(
+    inputs: &BaselineInputs,
+    expected: &DatabaseIdentity,
+) -> Result<(), BaselineError> {
+    let clone_name = temporary_case_name("attest")?;
+    let clone_identity = create_database_from_template(
+        inputs,
+        &clone_name,
+        expected.database_name(),
+        expected.owner_oid(),
+    )
+    .await?;
+    let inspection = inspect_baseline_clone_marker(inputs, &clone_name, expected).await;
+    let cleanup = drop_database_exact(inputs, &clone_name, clone_identity).await;
+    match (inspection, cleanup) {
+        (_, Err(_)) => Err(BaselineError::TemporaryDatabaseCleanupFailed),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(()), Ok(())) => Ok(()),
+    }
+}
+
+async fn inspect_baseline_clone_marker(
+    inputs: &BaselineInputs,
+    clone_name: &DatabaseName,
+    expected: &DatabaseIdentity,
+) -> Result<(), BaselineError> {
+    let clone = PostgresSession::connect(&inputs.database_url(clone_name)).await?;
+    let rows = clone
+        .client
+        .query(
+            "SELECT marker_uuid, marker_kind, compose_project, application_role \
+             FROM tiv_verifier_marker LIMIT 2",
+            &[],
+        )
+        .await
+        .map_err(|_| BaselineError::BaselineIdentityMismatch)?;
+    let reset_probe_absent = clone
+        .client
+        .query_one("SELECT to_regclass('public.tiv_reset_probe') IS NULL", &[])
+        .await
+        .map_err(|_| BaselineError::BaselineIdentityMismatch)?
+        .get::<_, bool>(0);
+    clone.close().await?;
+    let [marker] = rows.as_slice() else {
+        return Err(BaselineError::BaselineIdentityMismatch);
+    };
+    if marker.get::<_, Uuid>(0) != expected.marker().marker_uuid()
+        || marker.get::<_, &str>(1) != "baseline"
+        || marker.get::<_, &str>(2) != inputs.compose_project
+        || marker.get::<_, &str>(3) != inputs.application_role
+        || !reset_probe_absent
+    {
+        return Err(BaselineError::BaselineIdentityMismatch);
+    }
+    Ok(())
+}
+
 fn parse_baseline_catalog_marker(
     value: &str,
     expected_project: &str,
@@ -892,6 +969,10 @@ fn require_compatible_baseline(
     Ok(())
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "keep each reset phase and its exact recovery boundary visible in one sequence"
+)]
 async fn reset_verified_case(
     inputs: &BaselineInputs,
     verified: DatabaseTarget<Verified>,
@@ -904,29 +985,217 @@ async fn reset_verified_case(
     let after_marker_uuid = Uuid::new_v4();
     let case = inputs.case_name.as_str();
     let baseline = expected_baseline.database_name().as_str();
+    let recovery_name = temporary_case_name("recovery")?;
 
-    let maintenance = PostgresSession::connect(&inputs.admin_url).await?;
-    maintenance
+    if let Err(failure) =
+        prepare_case_replacement(inputs, before, &recovery_name, case, baseline).await
+    {
+        return fail_case_reset(inputs, before, &recovery_name, failure).await;
+    }
+
+    let marker_update = replace_case_marker(inputs, after_marker_uuid).await;
+    if let Err(error) = marker_update {
+        return fail_case_reset(
+            inputs,
+            before,
+            &recovery_name,
+            CaseResetFailure::new(CaseResetPhase::MarkerUpdateStarted, error),
+        )
+        .await;
+    }
+
+    let after = match observe_case_identity(inputs).await {
+        Ok(after) => after,
+        Err(error) => {
+            return fail_case_reset(
+                inputs,
+                before,
+                &recovery_name,
+                CaseResetFailure::new(CaseResetPhase::CaseAttestationStarted, error),
+            )
+            .await;
+        }
+    };
+    if after.database_oid() == before_database_oid
+        || after.owner_oid() != before.owner_oid()
+        || after.server_fingerprint() != before.server_fingerprint()
+        || after.endpoint() != before.endpoint()
+        || after.database_name() != before.database_name()
+        || after.marker().marker_uuid() != after_marker_uuid
+        || after.marker().compose_project() != before.marker().compose_project()
+        || after.expected_application_role() != before.expected_application_role()
+    {
+        return fail_case_reset(
+            inputs,
+            before,
+            &recovery_name,
+            CaseResetFailure::new(
+                CaseResetPhase::CaseAttestationStarted,
+                BaselineError::ResetProofFailed,
+            ),
+        )
+        .await;
+    }
+    let baseline_after = match observe_sealed_baseline_identity(inputs).await {
+        Ok(baseline) => baseline,
+        Err(error) => {
+            return fail_case_reset(
+                inputs,
+                before,
+                &recovery_name,
+                CaseResetFailure::new(CaseResetPhase::BaselineAttestationStarted, error),
+            )
+            .await;
+        }
+    };
+    if &baseline_after != expected_baseline {
+        return fail_case_reset(
+            inputs,
+            before,
+            &recovery_name,
+            CaseResetFailure::new(
+                CaseResetPhase::BaselineAttestationStarted,
+                BaselineError::BaselineIdentityMismatch,
+            ),
+        )
+        .await;
+    }
+    if drop_database_exact(
+        inputs,
+        &recovery_name,
+        CatalogDatabaseIdentity::from(before),
+    )
+    .await
+    .is_err()
+    {
+        return fail_case_reset(
+            inputs,
+            before,
+            &recovery_name,
+            CaseResetFailure::new(
+                CaseResetPhase::CommitStarted,
+                BaselineError::CaseBackupCleanupFailed,
+            ),
+        )
+        .await;
+    }
+    let report = ConfiguredCaseResetReport {
+        before_database_oid,
+        after_database_oid: after.database_oid(),
+        before_marker_uuid: before_marker_uuid.to_string(),
+        after_marker_uuid: after_marker_uuid.to_string(),
+    };
+    Ok((after, report))
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum CaseResetPhase {
+    PreMutation,
+    FenceStarted,
+    RenameStarted,
+    CloneStarted,
+    MarkerUpdateStarted,
+    CaseAttestationStarted,
+    BaselineAttestationStarted,
+    CommitStarted,
+}
+
+struct CaseResetFailure {
+    phase: CaseResetPhase,
+    error: BaselineError,
+}
+
+impl CaseResetFailure {
+    const fn new(phase: CaseResetPhase, error: BaselineError) -> Self {
+        Self { phase, error }
+    }
+}
+
+async fn prepare_case_replacement(
+    inputs: &BaselineInputs,
+    before: &DatabaseIdentity,
+    recovery_name: &DatabaseName,
+    case: &str,
+    baseline: &str,
+) -> Result<(), CaseResetFailure> {
+    let maintenance = PostgresSession::connect(&inputs.admin_url)
+        .await
+        .map_err(|error| CaseResetFailure::new(CaseResetPhase::PreMutation, error))?;
+    let execution = async {
+        require_database_absent(&maintenance.client, recovery_name)
+            .await
+            .map_err(|error| CaseResetFailure::new(CaseResetPhase::PreMutation, error))?;
+        maintenance
+            .client
+            .batch_execute(&format!("ALTER DATABASE {case} ALLOW_CONNECTIONS false"))
+            .await
+            .map_err(|error| CaseResetFailure::new(CaseResetPhase::FenceStarted, error.into()))?;
+        terminate_database_connections(&maintenance.client, before.database_oid())
+            .await
+            .map_err(|error| CaseResetFailure::new(CaseResetPhase::FenceStarted, error))?;
+        require_database_identity(
+            &maintenance.client,
+            &inputs.case_name,
+            CatalogDatabaseIdentity::from(before),
+        )
+        .await
+        .map_err(|error| CaseResetFailure::new(CaseResetPhase::FenceStarted, error))?;
+        maintenance
+            .client
+            .batch_execute(&format!(
+                "ALTER DATABASE {case} RENAME TO {}",
+                recovery_name.as_str()
+            ))
+            .await
+            .map_err(|error| CaseResetFailure::new(CaseResetPhase::RenameStarted, error.into()))?;
+        maintenance
+            .client
+            .batch_execute(&format!(
+                "CREATE DATABASE {case} WITH OWNER = {} TEMPLATE = {baseline}",
+                inputs.admin_role,
+            ))
+            .await
+            .map_err(|error| CaseResetFailure::new(CaseResetPhase::CloneStarted, error.into()))?;
+        configure_case_connect(&maintenance.client, inputs)
+            .await
+            .map_err(|error| CaseResetFailure::new(CaseResetPhase::CloneStarted, error))
+    }
+    .await;
+    let close = maintenance.close().await;
+    match (execution, close) {
+        (Err(failure), _) => Err(failure),
+        (Ok(()), Err(error)) => Err(CaseResetFailure::new(CaseResetPhase::CloneStarted, error)),
+        (Ok(()), Ok(())) => Ok(()),
+    }
+}
+
+async fn replace_case_marker(
+    inputs: &BaselineInputs,
+    marker_uuid: Uuid,
+) -> Result<(), BaselineError> {
+    let reset = PostgresSession::connect(&inputs.database_url(&inputs.case_name)).await?;
+    let update = reset
         .client
         .execute(
-            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
-             WHERE datid::bigint = $1 AND pid <> pg_backend_pid()",
-            &[&i64::from(before_database_oid)],
+            "UPDATE tiv_verifier_marker SET marker_uuid = $1, marker_kind = 'case'",
+            &[&marker_uuid],
         )
-        .await?;
-    maintenance
-        .client
-        .batch_execute(&format!("DROP DATABASE {case}"))
-        .await?;
-    maintenance
-        .client
-        .batch_execute(&format!(
-            "CREATE DATABASE {case} WITH OWNER = {} TEMPLATE = {baseline}",
-            inputs.admin_role,
-        ))
-        .await?;
-    maintenance
-        .client
+        .await;
+    let close = reset.close().await;
+    let updated = update?;
+    close?;
+    if updated != 1 {
+        return Err(BaselineError::UnexpectedMarker);
+    }
+    Ok(())
+}
+
+async fn configure_case_connect(
+    client: &tokio_postgres::Client,
+    inputs: &BaselineInputs,
+) -> Result<(), BaselineError> {
+    let case = inputs.case_name.as_str();
+    client
         .batch_execute(&format!(
             "REVOKE CONNECT ON DATABASE {case} FROM PUBLIC; \
              REVOKE CONNECT ON DATABASE {case} FROM {}; \
@@ -939,45 +1208,241 @@ async fn reset_verified_case(
             inputs.invariant_role,
         ))
         .await?;
-    maintenance.close().await?;
+    Ok(())
+}
 
-    let reset = PostgresSession::connect(&inputs.database_url(&inputs.case_name)).await?;
-    if reset
+async fn fail_case_reset<T>(
+    inputs: &BaselineInputs,
+    expected_original: &DatabaseIdentity,
+    recovery_name: &DatabaseName,
+    failure: CaseResetFailure,
+) -> Result<T, BaselineError> {
+    if failure.phase == CaseResetPhase::PreMutation {
+        return Err(failure.error);
+    }
+    match restore_original_case(inputs, expected_original, recovery_name).await {
+        Ok(()) => Err(failure.error),
+        Err(_) => Err(BaselineError::CaseDatabaseRecoveryFailed),
+    }
+}
+
+async fn restore_original_case(
+    inputs: &BaselineInputs,
+    expected: &DatabaseIdentity,
+    recovery_name: &DatabaseName,
+) -> Result<(), BaselineError> {
+    let maintenance = PostgresSession::connect(&inputs.admin_url).await?;
+    let case_identity =
+        database_catalog_identity_if_present(&maintenance.client, &inputs.case_name).await?;
+    let recovery_identity =
+        database_catalog_identity_if_present(&maintenance.client, recovery_name).await?;
+    let expected_catalog = CatalogDatabaseIdentity::from(expected);
+    match (case_identity, recovery_identity) {
+        (Some(case_identity), None) if case_identity == expected_catalog => {
+            maintenance
+                .client
+                .batch_execute(&format!(
+                    "ALTER DATABASE {} ALLOW_CONNECTIONS true",
+                    inputs.case_name.as_str()
+                ))
+                .await?;
+        }
+        (replacement_identity, Some(recovery_identity))
+            if recovery_identity == expected_catalog =>
+        {
+            if let Some(replacement_identity) = replacement_identity {
+                if replacement_identity == expected_catalog
+                    || replacement_identity.owner_oid != expected.owner_oid()
+                {
+                    return Err(BaselineError::CaseDatabaseRecoveryFailed);
+                }
+                terminate_database_connections(&maintenance.client, replacement_identity.oid)
+                    .await?;
+                maintenance
+                    .client
+                    .batch_execute(&format!("DROP DATABASE {}", inputs.case_name.as_str()))
+                    .await?;
+            }
+            maintenance
+                .client
+                .batch_execute(&format!(
+                    "ALTER DATABASE {} ALLOW_CONNECTIONS true",
+                    recovery_name.as_str()
+                ))
+                .await?;
+            maintenance
+                .client
+                .batch_execute(&format!(
+                    "ALTER DATABASE {} RENAME TO {}",
+                    recovery_name.as_str(),
+                    inputs.case_name.as_str()
+                ))
+                .await?;
+        }
+        _ => return Err(BaselineError::CaseDatabaseRecoveryFailed),
+    }
+    maintenance.close().await?;
+    let restored = observe_case_identity(inputs).await?;
+    if &restored != expected {
+        return Err(BaselineError::CaseDatabaseRecoveryFailed);
+    }
+    Ok(())
+}
+
+fn temporary_case_name(purpose: &str) -> Result<DatabaseName, BaselineError> {
+    DatabaseName::parse(format!("tiv_case_{purpose}_{}", Uuid::new_v4().simple()))
+        .map_err(BaselineError::DatabaseName)
+}
+
+async fn create_database_from_template(
+    inputs: &BaselineInputs,
+    database_name: &DatabaseName,
+    template_name: &DatabaseName,
+    expected_owner_oid: u32,
+) -> Result<CatalogDatabaseIdentity, BaselineError> {
+    let maintenance = PostgresSession::connect(&inputs.admin_url).await?;
+    let creation = async {
+        require_database_absent(&maintenance.client, database_name).await?;
+        maintenance
+            .client
+            .batch_execute(&format!(
+                "CREATE DATABASE {} WITH OWNER = {} TEMPLATE = {}",
+                database_name.as_str(),
+                inputs.admin_role,
+                template_name.as_str()
+            ))
+            .await?;
+        let identity = database_catalog_identity_if_present(&maintenance.client, database_name)
+            .await?
+            .ok_or(BaselineError::UnexpectedDatabaseIdentity)?;
+        if identity.owner_oid != expected_owner_oid {
+            return Err(BaselineError::UnexpectedDatabaseIdentity);
+        }
+        Ok(identity)
+    }
+    .await;
+    let close = maintenance.close().await;
+    match (creation, close) {
+        (Ok(identity), Ok(())) => Ok(identity),
+        (Err(error), _) | (Ok(_), Err(error)) => {
+            match cleanup_temporary_database_if_present(inputs, database_name, expected_owner_oid)
+                .await
+            {
+                Ok(()) => Err(error),
+                Err(_) => Err(BaselineError::TemporaryDatabaseCleanupFailed),
+            }
+        }
+    }
+}
+
+async fn cleanup_temporary_database_if_present(
+    inputs: &BaselineInputs,
+    database_name: &DatabaseName,
+    expected_owner_oid: u32,
+) -> Result<(), BaselineError> {
+    let maintenance = PostgresSession::connect(&inputs.admin_url).await?;
+    let identity = database_catalog_identity_if_present(&maintenance.client, database_name).await?;
+    let Some(identity) = identity else {
+        return maintenance.close().await;
+    };
+    if identity.owner_oid != expected_owner_oid {
+        return Err(BaselineError::UnexpectedDatabaseIdentity);
+    }
+    terminate_database_connections(&maintenance.client, identity.oid).await?;
+    maintenance
         .client
-        .execute(
-            "UPDATE tiv_verifier_marker SET marker_uuid = $1, marker_kind = 'case'",
-            &[&after_marker_uuid],
+        .batch_execute(&format!("DROP DATABASE {}", database_name.as_str()))
+        .await?;
+    maintenance.close().await
+}
+
+async fn drop_database_exact(
+    inputs: &BaselineInputs,
+    database_name: &DatabaseName,
+    expected: CatalogDatabaseIdentity,
+) -> Result<(), BaselineError> {
+    let maintenance = PostgresSession::connect(&inputs.admin_url).await?;
+    require_database_identity(&maintenance.client, database_name, expected).await?;
+    terminate_database_connections(&maintenance.client, expected.oid).await?;
+    maintenance
+        .client
+        .batch_execute(&format!("DROP DATABASE {}", database_name.as_str()))
+        .await?;
+    maintenance.close().await
+}
+
+async fn require_database_absent(
+    client: &tokio_postgres::Client,
+    database_name: &DatabaseName,
+) -> Result<(), BaselineError> {
+    if database_catalog_identity_if_present(client, database_name)
+        .await?
+        .is_some()
+    {
+        return Err(BaselineError::UnexpectedDatabaseIdentity);
+    }
+    Ok(())
+}
+
+async fn require_database_identity(
+    client: &tokio_postgres::Client,
+    database_name: &DatabaseName,
+    expected: CatalogDatabaseIdentity,
+) -> Result<(), BaselineError> {
+    if database_catalog_identity_if_present(client, database_name).await? != Some(expected) {
+        return Err(BaselineError::UnexpectedDatabaseIdentity);
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct CatalogDatabaseIdentity {
+    oid: u32,
+    owner_oid: u32,
+}
+
+impl From<&DatabaseIdentity> for CatalogDatabaseIdentity {
+    fn from(identity: &DatabaseIdentity) -> Self {
+        Self {
+            oid: identity.database_oid(),
+            owner_oid: identity.owner_oid(),
+        }
+    }
+}
+
+async fn database_catalog_identity_if_present(
+    client: &tokio_postgres::Client,
+    database_name: &DatabaseName,
+) -> Result<Option<CatalogDatabaseIdentity>, BaselineError> {
+    client
+        .query_opt(
+            "SELECT oid::bigint, datdba::bigint FROM pg_database WHERE datname = $1",
+            &[&database_name.as_str()],
         )
         .await?
-        != 1
-    {
-        return Err(BaselineError::UnexpectedMarker);
-    }
-    reset.close().await?;
+        .map(|row| {
+            Ok(CatalogDatabaseIdentity {
+                oid: u32::try_from(row.get::<_, i64>(0))
+                    .map_err(|_| BaselineError::UnexpectedDatabaseIdentity)?,
+                owner_oid: u32::try_from(row.get::<_, i64>(1))
+                    .map_err(|_| BaselineError::UnexpectedDatabaseIdentity)?,
+            })
+        })
+        .transpose()
+}
 
-    let after = observe_case_identity(inputs).await?;
-    if after.database_oid() == before_database_oid
-        || after.owner_oid() != before.owner_oid()
-        || after.server_fingerprint() != before.server_fingerprint()
-        || after.endpoint() != before.endpoint()
-        || after.database_name() != before.database_name()
-        || after.marker().marker_uuid() != after_marker_uuid
-        || after.marker().compose_project() != before.marker().compose_project()
-        || after.expected_application_role() != before.expected_application_role()
-    {
-        return Err(BaselineError::ResetProofFailed);
-    }
-    let baseline_after = observe_sealed_baseline_identity(inputs).await?;
-    if &baseline_after != expected_baseline {
-        return Err(BaselineError::BaselineIdentityMismatch);
-    }
-    let report = ConfiguredCaseResetReport {
-        before_database_oid,
-        after_database_oid: after.database_oid(),
-        before_marker_uuid: before_marker_uuid.to_string(),
-        after_marker_uuid: after_marker_uuid.to_string(),
-    };
-    Ok((after, report))
+async fn terminate_database_connections(
+    client: &tokio_postgres::Client,
+    database_oid: u32,
+) -> Result<(), BaselineError> {
+    client
+        .execute(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+             WHERE datid::bigint = $1 AND pid <> pg_backend_pid()",
+            &[&i64::from(database_oid)],
+        )
+        .await?;
+    Ok(())
 }
 
 async fn stop_customer_services(inputs: &BaselineInputs) -> Result<(), BaselineError> {
@@ -1171,6 +1636,14 @@ pub enum BaselineError {
     DockerOutputTooLarge,
     #[error("customer services could not be restored after a baseline lifecycle failure")]
     CustomerServicesRecoveryFailed,
+    #[error("the exact original case database could not be restored after replacement failed")]
+    CaseDatabaseRecoveryFailed,
+    #[error(
+        "the verified replacement is active but its private recovery database could not be removed"
+    )]
+    CaseBackupCleanupFailed,
+    #[error("a private baseline-attestation database could not be removed")]
+    TemporaryDatabaseCleanupFailed,
     #[error("the configured PostgreSQL container does not match the local Compose boundary")]
     PostgresContainerMismatch,
     #[error("the PostgreSQL container changed across the attested reset boundary")]
@@ -1223,6 +1696,9 @@ impl BaselineError {
                 | Self::DockerOutput
                 | Self::DockerOutputTooLarge
                 | Self::CustomerServicesRecoveryFailed
+                | Self::CaseDatabaseRecoveryFailed
+                | Self::CaseBackupCleanupFailed
+                | Self::TemporaryDatabaseCleanupFailed
                 | Self::Database(_)
                 | Self::DatabaseConnectionTask
         )
