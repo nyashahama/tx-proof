@@ -99,6 +99,19 @@ fn the_cli_exposes_init_without_an_implicit_overwrite_flag() {
 }
 
 #[test]
+fn the_cli_exposes_read_only_complete_artifact_inspection() {
+    let cli = Cli::try_parse_from(["tiv", "inspect", ".tiv/runs/run_deadbeef"])
+        .expect("the documented artifact inspection command parses");
+
+    assert_eq!(
+        cli.command,
+        Command::Inspect {
+            path: ".tiv/runs/run_deadbeef".into(),
+        }
+    );
+}
+
+#[test]
 fn the_cli_exposes_only_the_narrow_trace_validation_command_for_this_slice() {
     let cli = Cli::try_parse_from(["tiv", "trace", "validate", "compiled-trace.json"])
         .expect("the documented command parses");

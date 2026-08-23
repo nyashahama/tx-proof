@@ -14,6 +14,7 @@ use tiv_core::{
     trace::CompiledTrace,
 };
 use tiv_runtime::{
+    artifacts::{ArtifactError, verify_complete_run_artifact},
     baseline::{BaselineError, run_configured_baseline},
     config::{ConfigError, ProcessEnvironment, load_resolved_config},
     configured_campaign::{
@@ -48,6 +49,17 @@ use tiv_runtime::{
 pub struct TraceSummary {
     pub schema_version: u16,
     pub action_count: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct ArtifactInspectionReceipt<'a> {
+    schema_version: u16,
+    status: &'static str,
+    run_id: &'a str,
+    complete: bool,
+    checksums_verified: bool,
+    compatibility_verified: bool,
+    indexed_file_count: usize,
 }
 
 #[derive(Debug)]
@@ -93,6 +105,8 @@ pub enum Command {
     Baseline(BaselineArgs),
     /// Execute a serial configured campaign against the attested disposable stack.
     Run(RunArgs),
+    /// Verify one complete run artifact without executing customer code.
+    Inspect { path: PathBuf },
     /// Inspect replay readiness without executing customer code.
     Replay {
         #[command(subcommand)]
@@ -289,6 +303,19 @@ pub fn execute(cli: Cli) -> Result<String, CliError> {
         } => {
             let plan = replay_plan_from_path(&path)?;
             serde_json::to_string(&plan).map_err(CliError::Encode)
+        }
+        Command::Inspect { path } => {
+            let verified = verify_complete_run_artifact(&path)?;
+            let receipt = ArtifactInspectionReceipt {
+                schema_version: 1,
+                status: "complete_artifact_verified",
+                run_id: verified.run_id(),
+                complete: true,
+                checksums_verified: true,
+                compatibility_verified: true,
+                indexed_file_count: verified.indexed_file_count(),
+            };
+            serde_json::to_string(&receipt).map_err(CliError::Encode)
         }
         Command::Doctor(_)
         | Command::Baseline(_)
@@ -616,6 +643,8 @@ pub enum CliError {
     ConfiguredShrinkOptions(#[from] ConfiguredShrinkOptionsError),
     #[error("configured shrink failed: {0}")]
     ConfiguredShrink(#[from] ConfiguredShrinkError),
+    #[error("run artifact inspection failed: {0}")]
+    Artifact(#[from] ArtifactError),
     #[error("the system clock could not produce a valid webhook timestamp")]
     InvalidSystemTime,
     #[error("reference app replay configuration is invalid: {0}")]

@@ -610,6 +610,21 @@ tiv cleanup --run RUN_ID
 
 `replay` fails before mutation if the compatibility fingerprint is missing or incompatible. `inspect` never executes customer code.
 
+### Implemented complete-artifact inspection contract
+
+`tiv inspect PATH` is a synchronous, read-only trust-boundary command. It
+accepts only a finalized complete run directory whose private permissions,
+manifest, bounded file set, exact byte digests, checksum index, and v1
+compatibility document all verify. Partial, corrupt, malformed, oversized, or
+unsafe artifacts fail with exit `2` and no success document on standard output.
+
+Successful inspection emits a versioned JSON receipt containing only the run
+ID, complete status, verification flags, and indexed-file count. It does not
+load project configuration, inspect evidence payloads, contact Docker or
+PostgreSQL, or execute customer code. Paths, compatibility contents, summary
+contents, filenames, and digests are deliberately excluded from the public
+receipt so that inspection cannot turn secret-bearing evidence into CLI output.
+
 ### Implemented configured-shrink contract
 
 `tiv shrink configured` accepts only a complete, checksum-valid configured-replay

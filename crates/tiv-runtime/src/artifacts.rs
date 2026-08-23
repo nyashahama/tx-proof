@@ -263,6 +263,14 @@ impl VerifiedRunArtifact {
         &self.compatibility
     }
 
+    /// Returns the number of content files covered by the verified manifest
+    /// and checksum index. The structural manifest and checksum-index files
+    /// are not included in this count.
+    #[must_use]
+    pub fn indexed_file_count(&self) -> usize {
+        self.required_files.len()
+    }
+
     pub(crate) fn read_indexed_bytes(&self, relative: &Path) -> Result<Vec<u8>, ArtifactError> {
         let relative = validate_relative(relative)?;
         let key = relative
