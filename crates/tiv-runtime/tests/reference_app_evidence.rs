@@ -12,6 +12,9 @@ fn reference_stack_routes_fixture_webhooks_only_over_the_shared_data_network() {
 
     assert!(compose.contains("TIV_WEBHOOK_URL: http://reference-app:18080/webhooks/stripe"));
     assert!(compose.contains("TIV_REFERENCE_APP_BIND: 0.0.0.0:18080"));
+    assert!(compose.contains(
+        "TIV_REFERENCE_APP_RETRY_KEY_MODE: ${TIV_REFERENCE_APP_RETRY_KEY_MODE:-faulty_changed_key}"
+    ));
     assert!(compose.contains("127.0.0.1:18080:18080"));
     assert!(!compose.contains("TIV_REFERENCE_APP_BIND: reference-app-host:18080"));
 }

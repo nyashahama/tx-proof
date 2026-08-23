@@ -179,6 +179,64 @@ async fn the_planned_webhook_queue_reorders_drops_and_duplicates_exact_events() 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn aliased_payment_intent_attempts_reuse_one_immutable_provider_event() {
+    let (target_address, _deliveries, target_server) = start_webhook_target().await;
+    let (fixture, payment_intent_ids) = prepared_fixture(42, 1).await;
+    let payment_intent_id = payment_intent_ids[0].clone();
+    let (control_address, control_server) =
+        start_control_server(Arc::clone(&fixture), target_address).await;
+    let config = WebhookHttpConfig::new(
+        format!("http://{control_address}"),
+        "case-control-token",
+        1,
+        current_timestamp(),
+        Duration::from_secs(2),
+    )
+    .unwrap();
+    let mut adapter = CompletingAdapter {
+        webhook_http: WebhookHttpAdapter::new(config).unwrap(),
+        payment_intent_ids: vec![payment_intent_id.clone(), payment_intent_id],
+    };
+    let plan = seeded_plan(42);
+    let event_actions = plan
+        .actions()
+        .iter()
+        .filter(|action| matches!(action.kind(), PlanActionKind::GenerateProviderEvent))
+        .map(tiv_core::plan::PlannedAction::id)
+        .collect::<Vec<_>>();
+    assert_eq!(event_actions.len(), 2);
+    let journal_path = journal_path();
+
+    let executed = execute_planned_case("run_42", "case_42", &plan, &journal_path, &mut adapter)
+        .await
+        .expect("aliased provider attempts reuse the fixture's immutable event");
+    let first_event = executed
+        .trace()
+        .resolve(tiv_core::trace::CaseOutputRef::new(
+            event_actions[0],
+            CaseOutputSlot::EventId,
+        ))
+        .expect("the first event attempt is captured");
+    let retry_event = executed
+        .trace()
+        .resolve(tiv_core::trace::CaseOutputRef::new(
+            event_actions[1],
+            CaseOutputSlot::EventId,
+        ))
+        .expect("the aliased event attempt is captured");
+
+    assert_eq!(first_event, retry_event);
+    assert_eq!(fixture.lock().await.snapshot().payment_intents().len(), 1);
+
+    drop(adapter);
+    control_server.abort();
+    let _ = control_server.await;
+    target_server.abort();
+    let _ = target_server.await;
+    tokio::fs::remove_file(journal_path).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_nonzero_planned_delay_defers_the_next_real_delivery() {
     let (target_address, mut deliveries, target_server) = start_webhook_target().await;
     let (fixture, payment_intent_ids) = prepared_fixture(7, 1).await;

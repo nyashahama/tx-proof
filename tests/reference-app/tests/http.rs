@@ -3,7 +3,7 @@ use std::{sync::Arc, time::Duration};
 use reqwest::StatusCode;
 use serde_json::json;
 use tiv_core::decision::Seed;
-use tiv_reference_app::{ReferenceApp, ReferenceAppConfig, serve_http1_connection};
+use tiv_reference_app::{ReferenceApp, ReferenceAppConfig, RetryKeyMode, serve_http1_connection};
 use tiv_stripe_pi::{
     CreatePaymentIntent, FaultOutcome, IdempotencyKey, ManagedFixture, OperationId,
     http::serve_managed_http1_connection,
@@ -29,9 +29,31 @@ async fn health_and_control_isolation_probe_do_not_touch_postgres() {
         .expect("the isolation probe is an HTTP response");
 
     assert_eq!(health.status(), StatusCode::OK);
+    let health: serde_json::Value = health.json().await.expect("health is JSON");
+    assert_eq!(health["status"], "ok");
+    assert_eq!(health["retry_key_mode"], "faulty_changed_key");
     assert_eq!(probe.status(), StatusCode::OK);
     let probe: serde_json::Value = probe.json().await.expect("the probe is JSON");
     assert_eq!(probe["reachable"], false);
+    await_server(server).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn health_reports_the_process_selected_repaired_retry_key_mode() {
+    let app = Arc::new(test_app_with_mode(RetryKeyMode::RepairedSameKey));
+    let (address, server) = serve_connections(app, 1).await;
+
+    let health = reqwest::Client::new()
+        .get(format!("http://{address}/health"))
+        .header("Connection", "close")
+        .send()
+        .await
+        .expect("health is an HTTP response");
+
+    assert_eq!(health.status(), StatusCode::OK);
+    let health: serde_json::Value = health.json().await.expect("health is JSON");
+    assert_eq!(health["status"], "ok");
+    assert_eq!(health["retry_key_mode"], "repaired_same_key");
     await_server(server).await;
 }
 
@@ -206,6 +228,22 @@ async fn provider_confirmation_proxy_preserves_an_internal_transport_close() {
 
 fn test_app(control_probe_address: &str) -> ReferenceApp {
     test_app_with_fixture(control_probe_address, "http://127.0.0.1:1")
+}
+
+fn test_app_with_mode(retry_key_mode: RetryKeyMode) -> ReferenceApp {
+    ReferenceApp::new(
+        ReferenceAppConfig::new(
+            "http://127.0.0.1:1",
+            "127.0.0.1",
+            1,
+            "tiv_app",
+            "synthetic-app-password",
+            "whsec_test_secret",
+            "127.0.0.1:1",
+        )
+        .expect("the synthetic config is valid")
+        .with_retry_key_mode(retry_key_mode),
+    )
 }
 
 fn test_app_with_fixture(control_probe_address: &str, fixture_base_url: &str) -> ReferenceApp {

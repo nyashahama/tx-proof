@@ -166,6 +166,19 @@ jobs:
             --project-directory "$PWD" \
             --file spike/reference-app.compose.yaml \
             config --hash '*' > ci-evidence/reference-app.compose.hash
+          TIV_REFERENCE_APP_RETRY_KEY_MODE=faulty_changed_key docker compose \
+            --project-name tiv-reference-app-spike \
+            --project-directory "$PWD" \
+            --file spike/reference-app.compose.yaml \
+            config --hash reference-app > ci-evidence/reference-app.faulty.hash
+          TIV_REFERENCE_APP_RETRY_KEY_MODE=repaired_same_key docker compose \
+            --project-name tiv-reference-app-spike \
+            --project-directory "$PWD" \
+            --file spike/reference-app.compose.yaml \
+            config --hash reference-app > ci-evidence/reference-app.repaired.hash
+          ! cmp --silent \
+            ci-evidence/reference-app.faulty.hash \
+            ci-evidence/reference-app.repaired.hash
 
       - name: Build and start the isolated reference stack
         run: |
@@ -180,7 +193,7 @@ jobs:
           cargo test -p tiv-cli --test baseline \
             -- --ignored --nocapture --test-threads=1
 
-      - name: Prove configured campaign execution, interruption, and recovery
+      - name: Prove configured campaigns, paired retry modes, and recovery
         run: |
           cargo test -p tiv-cli --test configured_run \
             -- --ignored --nocapture --test-threads=1

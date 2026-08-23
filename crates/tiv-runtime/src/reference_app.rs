@@ -211,6 +211,7 @@ async fn attest_reference_stack(
     let postgres_container_id = attest_reference_service(&postgres_service(postgres_port)).await?;
     let reference_app_container_id =
         attest_reference_service(&reference_app_service(reference_app_port)).await?;
+    attest_faulty_reference_app_retry_mode(&reference_app_container_id).await?;
     let fixture_container_id =
         attest_reference_service(&fixture_service(fixture_control_port)).await?;
     if postgres_container_id == reference_app_container_id
@@ -224,6 +225,35 @@ async fn attest_reference_stack(
         reference_app: reference_app_container_id,
         fixture: fixture_container_id,
     })
+}
+
+async fn attest_faulty_reference_app_retry_mode(
+    container_id: &str,
+) -> Result<(), ReferenceAppEvidenceConfigError> {
+    let inspection = docker_output(&[
+        "inspect",
+        "--format",
+        concat!(
+            "{{range .Config.Env}}",
+            "{{if eq . \"TIV_REFERENCE_APP_RETRY_KEY_MODE=faulty_changed_key\"}}",
+            "true",
+            "{{end}}",
+            "{{end}}"
+        ),
+        container_id,
+    ])
+    .await?;
+    validate_faulty_retry_mode_inspection(&inspection)
+}
+
+fn validate_faulty_retry_mode_inspection(
+    inspection: &str,
+) -> Result<(), ReferenceAppEvidenceConfigError> {
+    if inspection == "true\n" {
+        Ok(())
+    } else {
+        Err(ReferenceAppEvidenceConfigError::ReferenceStackMismatch)
+    }
 }
 
 fn exact_ipv4_loopback_port(url: &str) -> Result<u16, ReferenceAppEvidenceConfigError> {
@@ -1148,6 +1178,17 @@ mod tests {
             validate_reference_service_inspection(app_inspection, &reference_app_service(12_112)),
             Err(ReferenceAppEvidenceConfigError::ReferenceStackMismatch)
         ));
+    }
+
+    #[test]
+    fn direct_fault_evidence_accepts_only_the_faulty_reference_app_retry_mode() {
+        assert!(validate_faulty_retry_mode_inspection("true\n").is_ok());
+        for mismatched in ["", "false\n", "true\ntrue\n", "repaired_same_key\n"] {
+            assert!(matches!(
+                validate_faulty_retry_mode_inspection(mismatched),
+                Err(ReferenceAppEvidenceConfigError::ReferenceStackMismatch)
+            ));
+        }
     }
 
     #[tokio::test]

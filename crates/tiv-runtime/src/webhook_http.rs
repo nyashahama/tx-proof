@@ -1,7 +1,7 @@
 //! Fixture-side webhook generation and deterministic delivery-queue execution.
 
 use std::{
-    collections::{BTreeSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     time::{Duration, Instant},
 };
 
@@ -110,7 +110,7 @@ pub struct WebhookHttpAdapter {
     config: WebhookHttpConfig,
     client: Client,
     pending: VecDeque<PendingWebhook>,
-    generated_events: BTreeSet<String>,
+    generated_events: BTreeMap<String, String>,
     last_delivered: Option<String>,
     request_cut_points: BTreeSet<ActionId>,
     response_cut_points: BTreeSet<ActionId>,
@@ -138,7 +138,7 @@ impl WebhookHttpAdapter {
             config,
             client,
             pending: VecDeque::new(),
-            generated_events: BTreeSet::new(),
+            generated_events: BTreeMap::new(),
             last_delivered: None,
             request_cut_points: BTreeSet::new(),
             response_cut_points: BTreeSet::new(),
@@ -243,14 +243,20 @@ impl WebhookHttpAdapter {
             .map_err(WebhookHttpError::ControlRequest)?;
         if generated.command_sequence != next_sequence
             || generated.payment_intent_id != payment_intent_id
-            || self.generated_events.contains(&generated.event_id)
+            || matches!(
+                self.generated_events.get(&generated.event_id),
+                Some(existing_payment_intent_id)
+                    if existing_payment_intent_id != &generated.payment_intent_id
+            )
         {
             return Err(WebhookHttpError::UnexpectedControlResponse);
         }
         let captured = CaseCapturedValue::event_id(generated.event_id.clone())
             .map_err(|_| WebhookHttpError::UnexpectedControlResponse)?;
         self.config.control_sequence = next_sequence;
-        self.generated_events.insert(generated.event_id.clone());
+        self.generated_events
+            .entry(generated.event_id.clone())
+            .or_insert_with(|| generated.payment_intent_id.clone());
         self.pending.push_back(PendingWebhook {
             event_id: generated.event_id,
             not_before: None,

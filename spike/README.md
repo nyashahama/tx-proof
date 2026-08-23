@@ -91,6 +91,39 @@ docker compose \
   up --detach --build --wait
 ```
 
+### Retry-key fault and repaired control
+
+The reference application selects its retry behavior once at process startup
+through `TIV_REFERENCE_APP_RETRY_KEY_MODE`. The only accepted values are
+`faulty_changed_key` and `repaired_same_key`; the Compose default is the faulty
+mode. There is no request header or route parameter that can switch behavior
+inside a run. `/health` reports the selected non-secret mode, and the direct
+`reference-app-evidence` command additionally attests the container is in the
+faulty mode before it labels a changed-key counterexample.
+
+The resolved Compose configuration, and therefore its configuration hash,
+includes this mode. A command inspecting a stack started in repaired mode must
+receive the same environment value; evidence from one mode is intentionally
+not compatible with a stack resolved in the other mode.
+
+The paired row-three acceptance test owns both mode changes, executes campaign
+seed `69` against a fresh baseline in each mode, verifies both finalized
+artifacts, requires a verified default-mode restore on normal completion, and
+makes a best-effort default-mode restore if an assertion unwinds the test:
+
+```sh
+CARGO_INCREMENTAL=0 cargo test -p tiv-cli --test configured_run \
+  row_three_changed_key_fault_violates_and_same_key_repair_holds \
+  -- --ignored --exact --nocapture
+```
+
+The compiled trace is identical in both executions: one checkout with
+`commit_then_close` followed by `normal`. The faulty app commits two provider
+objects and violates `provider-object-unique`; the repaired app reuses one
+provider object, aliases both attempt outputs to that identity, and all five
+configured invariants hold. This is a bounded paired regression for reference
+fault row 3, not a proof over arbitrary schedules or customer applications.
+
 Then run the real application path:
 
 ```sh
@@ -189,7 +222,8 @@ docker compose \
 ```
 
 This remains bounded truth-spike evidence. It proves one synthetic known-bug
-application and one implemented operation-level invariant. It does not yet
-prove arbitrary customer repositories, all five business invariants, schedule
-generation or shrinking, production secret management, or distributed image
+application, the five-query configured oracle, and the faulty/corrected
+execution pair for reference fault row 3. It does not yet prove arbitrary
+customer repositories, the other five reference fault variants, exhaustive
+schedule coverage, production secret management, or distributed image
 provenance.

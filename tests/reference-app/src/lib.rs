@@ -2,6 +2,7 @@ use std::{
     collections::BTreeMap,
     error::Error,
     fmt,
+    str::FromStr,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -134,6 +135,51 @@ impl CheckoutOperation {
     }
 }
 
+/// Controls whether an ambiguous provider create is retried with the known
+/// faulty changed key or the repaired original key.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum RetryKeyMode {
+    /// Reproduces the reference bug by changing the key after a transport
+    /// failure.
+    #[default]
+    FaultyChangedKey,
+    /// Reuses the original key so an executed provider request is not repeated.
+    RepairedSameKey,
+}
+
+impl RetryKeyMode {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::FaultyChangedKey => "faulty_changed_key",
+            Self::RepairedSameKey => "repaired_same_key",
+        }
+    }
+}
+
+impl FromStr for RetryKeyMode {
+    type Err = InvalidRetryKeyMode;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "faulty_changed_key" => Ok(Self::FaultyChangedKey),
+            "repaired_same_key" => Ok(Self::RepairedSameKey),
+            _ => Err(InvalidRetryKeyMode),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InvalidRetryKeyMode;
+
+impl fmt::Display for InvalidRetryKeyMode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("invalid reference-app retry-key mode")
+    }
+}
+
+impl Error for InvalidRetryKeyMode {}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ObservedPaymentIntent {
     id: String,
@@ -182,11 +228,34 @@ pub async fn create_with_changed_retry_key(
     fixture_base_url: &str,
     operation: &CheckoutOperation,
 ) -> Result<ObservedPaymentIntent, ReferenceAppError> {
-    create_with_changed_retry_key_in_scope(
+    create_with_retry_key_mode_in_scope(
         client,
         fixture_base_url,
         operation,
         operation.operation_id(),
+        RetryKeyMode::FaultyChangedKey,
+    )
+    .await
+}
+
+/// Executes one provider create with the selected retry-key behavior.
+///
+/// # Errors
+///
+/// Returns [`ReferenceAppError`] when both attempts fail or the fixture returns
+/// an invalid response.
+pub async fn create_with_retry_key_mode(
+    client: &reqwest::Client,
+    fixture_base_url: &str,
+    operation: &CheckoutOperation,
+    retry_key_mode: RetryKeyMode,
+) -> Result<ObservedPaymentIntent, ReferenceAppError> {
+    create_with_retry_key_mode_in_scope(
+        client,
+        fixture_base_url,
+        operation,
+        operation.operation_id(),
+        retry_key_mode,
     )
     .await
 }
@@ -208,19 +277,50 @@ pub async fn create_with_changed_retry_key_for_business_request(
     operation: &CheckoutOperation,
     business_request_id: u32,
 ) -> Result<ObservedPaymentIntent, ReferenceAppError> {
+    create_with_retry_key_mode_for_business_request(
+        client,
+        fixture_base_url,
+        operation,
+        business_request_id,
+        RetryKeyMode::FaultyChangedKey,
+    )
+    .await
+}
+
+/// Executes one caller-owned business request with the selected retry-key
+/// behavior.
+///
+/// # Errors
+///
+/// Returns [`ReferenceAppError`] when both attempts fail or the fixture returns
+/// an invalid response.
+pub async fn create_with_retry_key_mode_for_business_request(
+    client: &reqwest::Client,
+    fixture_base_url: &str,
+    operation: &CheckoutOperation,
+    business_request_id: u32,
+    retry_key_mode: RetryKeyMode,
+) -> Result<ObservedPaymentIntent, ReferenceAppError> {
     let idempotency_scope = format!(
         "{}-business-{business_request_id}",
         operation.operation_id()
     );
-    create_with_changed_retry_key_in_scope(client, fixture_base_url, operation, &idempotency_scope)
-        .await
+    create_with_retry_key_mode_in_scope(
+        client,
+        fixture_base_url,
+        operation,
+        &idempotency_scope,
+        retry_key_mode,
+    )
+    .await
 }
 
-async fn create_with_changed_retry_key_in_scope(
+async fn create_with_retry_key_mode_in_scope(
     client: &reqwest::Client,
     fixture_base_url: &str,
     operation: &CheckoutOperation,
     idempotency_scope: &str,
+    retry_key_mode: RetryKeyMode,
 ) -> Result<ObservedPaymentIntent, ReferenceAppError> {
     let endpoint = format!(
         "{}/v1/payment_intents",
@@ -231,7 +331,10 @@ async fn create_with_changed_retry_key_in_scope(
     if let Ok(response) = first {
         decode_provider_response(response, operation).await
     } else {
-        let retry_key = format!("{idempotency_scope}-attempt-2");
+        let retry_key = match retry_key_mode {
+            RetryKeyMode::FaultyChangedKey => format!("{idempotency_scope}-attempt-2"),
+            RetryKeyMode::RepairedSameKey => first_key,
+        };
         let retry = send_create(client, &endpoint, &retry_key, operation)
             .await
             .map_err(|_| ReferenceAppError::ProviderTransport)?;
@@ -431,6 +534,7 @@ pub struct ReferenceAppConfig {
     postgres_password: String,
     webhook_secret: Vec<u8>,
     control_probe_address: String,
+    retry_key_mode: RetryKeyMode,
 }
 
 impl ReferenceAppConfig {
@@ -474,7 +578,19 @@ impl ReferenceAppConfig {
             postgres_password,
             webhook_secret,
             control_probe_address,
+            retry_key_mode: RetryKeyMode::default(),
         })
+    }
+
+    #[must_use]
+    pub const fn with_retry_key_mode(mut self, retry_key_mode: RetryKeyMode) -> Self {
+        self.retry_key_mode = retry_key_mode;
+        self
+    }
+
+    #[must_use]
+    pub const fn retry_key_mode(&self) -> RetryKeyMode {
+        self.retry_key_mode
     }
 }
 
@@ -705,9 +821,13 @@ async fn handle_app_request(
         return handle_provider_proxy(request, &app).await;
     }
     match (request.method(), request.uri().path()) {
-        (&Method::GET, "/health") => {
-            json_response(StatusCode::OK, &serde_json::json!({"status": "ok"}))
-        }
+        (&Method::GET, "/health") => json_response(
+            StatusCode::OK,
+            &serde_json::json!({
+                "status": "ok",
+                "retry_key_mode": app.config.retry_key_mode.as_str(),
+            }),
+        ),
         (&Method::GET, "/probe-fixture-control") => {
             let reachable = app.control_listener_is_reachable().await;
             json_response(StatusCode::OK, &serde_json::json!({"reachable": reachable}))
@@ -836,19 +956,21 @@ async fn handle_checkout(
     }
     let payment_intent = match business_request_id {
         Some(business_request_id) => {
-            create_with_changed_retry_key_for_business_request(
+            create_with_retry_key_mode_for_business_request(
                 &app.http_client,
                 &app.config.fixture_base_url,
                 &operation,
                 business_request_id,
+                app.config.retry_key_mode,
             )
             .await
         }
         None => {
-            create_with_changed_retry_key(
+            create_with_retry_key_mode(
                 &app.http_client,
                 &app.config.fixture_base_url,
                 &operation,
+                app.config.retry_key_mode,
             )
             .await
         }
@@ -1093,6 +1215,24 @@ impl Error for ReferenceAppError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reference_app_config_defaults_to_the_fault_and_can_select_the_repaired_control() {
+        let config = ReferenceAppConfig::new(
+            "http://127.0.0.1:12111",
+            "127.0.0.1",
+            5_432,
+            "tiv_app",
+            "synthetic-app-password",
+            "whsec_test_secret",
+            "127.0.0.1:12112",
+        )
+        .expect("the synthetic config is valid");
+        assert_eq!(config.retry_key_mode(), RetryKeyMode::FaultyChangedKey);
+
+        let repaired = config.with_retry_key_mode(RetryKeyMode::RepairedSameKey);
+        assert_eq!(repaired.retry_key_mode(), RetryKeyMode::RepairedSameKey);
+    }
 
     #[test]
     fn driver_action_identity_is_optional_but_strict_when_present() {

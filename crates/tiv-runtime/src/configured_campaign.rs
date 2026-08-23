@@ -1494,6 +1494,60 @@ mod tests {
     }
 
     #[test]
+    fn row_three_campaign_seed_has_one_supported_commit_close_checkout() {
+        let process_faults = ProcessFaultSpec::new(
+            [
+                ProcessCutPoint::ClientRequestForwarded,
+                ProcessCutPoint::ClientResponseObserved,
+                ProcessCutPoint::WebhookRequestForwarded,
+                ProcessCutPoint::WebhookResponseObserved,
+                ProcessCutPoint::SqlProbe,
+            ],
+            1,
+        )
+        .unwrap();
+        let spec = CampaignSpec::new_payment_intent_v1(
+            Seed::new(69),
+            CaseCount::new(1).unwrap(),
+            ActionBudget::new(40).unwrap(),
+            [
+                ProviderOutcome::Normal,
+                ProviderOutcome::PreExecute429,
+                ProviderOutcome::PreExecute500,
+                ProviderOutcome::PostExecute500,
+                ProviderOutcome::CommitThenClose,
+                ProviderOutcome::CommitThenDelay,
+            ],
+            WebhookFaultSpec::new(3, [0, 10, 100, 1_000, 5_000], true, true).unwrap(),
+            process_faults,
+        )
+        .unwrap();
+        let campaign = CampaignPlanner::compile(&spec).expect("the row-three campaign compiles");
+        let plan = campaign.cases()[0].plan();
+        let business_scripts = plan
+            .actions()
+            .iter()
+            .filter_map(|action| match action.kind() {
+                tiv_core::plan::PlanActionKind::DriveCheckout { provider_script }
+                | tiv_core::plan::PlanActionKind::RetryBusinessRequest { provider_script } => {
+                    Some(provider_script.outcomes().collect::<Vec<ProviderOutcome>>())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            business_scripts,
+            vec![vec![
+                ProviderOutcome::CommitThenClose,
+                ProviderOutcome::Normal,
+            ]]
+        );
+        preflight_reference_planned_case(plan, true, true)
+            .expect("the row-three campaign uses supported process boundaries");
+    }
+
+    #[test]
     fn full_configured_fault_model_reaches_two_persisted_provider_objects() {
         let process_faults = ProcessFaultSpec::new(
             [

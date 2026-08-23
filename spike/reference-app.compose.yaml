@@ -74,6 +74,7 @@ services:
       TIV_POSTGRES_PORT: "5432"
       TIV_POSTGRES_ROLE: tiv_app
       TIV_REFERENCE_APP_BIND: 0.0.0.0:18080
+      TIV_REFERENCE_APP_RETRY_KEY_MODE: ${TIV_REFERENCE_APP_RETRY_KEY_MODE:-faulty_changed_key}
       TIV_WEBHOOK_SECRET: whsec_test_secret
     healthcheck:
       test: ["CMD", "tiv-reference-app", "healthcheck"]

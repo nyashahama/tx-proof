@@ -24,6 +24,8 @@ const ARTIFACT_ROOT: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../tests/configured-run-project/.tiv"
 );
+const RETRY_KEY_MODE_ENV: &str = "TIV_REFERENCE_APP_RETRY_KEY_MODE";
+const FAULTY_RETRY_KEY_MODE: &str = "faulty_changed_key";
 
 #[tokio::test]
 #[ignore = "requires the isolated reference-app Compose project"]
@@ -154,6 +156,79 @@ async fn configured_run_executes_a_real_case_and_finalizes_private_evidence() {
 
     cleanup_reference_databases().await;
     fs::remove_dir_all(ARTIFACT_ROOT).unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires the isolated reference-app Compose project"]
+#[allow(clippy::too_many_lines)]
+async fn row_three_changed_key_fault_violates_and_same_key_repair_holds() {
+    let _guard = E2E_LOCK.lock().await;
+    let mut restore = FaultyRetryModeRestore::armed();
+    let _ = fs::remove_dir_all(ARTIFACT_ROOT);
+
+    recreate_reference_app_in_retry_mode("faulty_changed_key");
+    prepare_reference_baseline().await;
+    reset_fixture_process().await;
+    let faulty_output = run_configured_command_in_retry_mode(69, "faulty_changed_key");
+    assert_eq!(
+        faulty_output.status.code(),
+        Some(10),
+        "the changed-key reference fault must violate: {}",
+        String::from_utf8_lossy(&faulty_output.stderr)
+    );
+    let faulty_receipt: serde_json::Value =
+        serde_json::from_slice(&faulty_output.stdout).expect("faulty stdout is JSON");
+    assert_eq!(faulty_receipt["verdict"], "violated");
+    let faulty_path = Path::new(faulty_receipt["artifact_path"].as_str().unwrap());
+    verify_complete_run_artifact(faulty_path).expect("the faulty artifact verifies");
+    let faulty_summary: serde_json::Value =
+        serde_json::from_slice(&fs::read(faulty_path.join("summary.json")).unwrap()).unwrap();
+    assert_eq!(faulty_summary["cases"][0]["provider_object_count"], 2);
+    let faulty_invariants = faulty_summary["cases"][0]["invariants"]
+        .as_array()
+        .expect("faulty invariants are recorded");
+    let uniqueness = faulty_invariants
+        .iter()
+        .find(|invariant| invariant["invariant_id"] == "provider-object-unique")
+        .expect("provider uniqueness is evaluated");
+    assert_eq!(uniqueness["verdict"], "violated");
+    assert_eq!(uniqueness["witness_count"], 1);
+    assert_row_three_trace(faulty_path);
+
+    recreate_reference_app_in_retry_mode("repaired_same_key");
+    prepare_reference_baseline().await;
+    reset_fixture_process().await;
+    let repaired_output = run_configured_command_in_retry_mode(69, "repaired_same_key");
+    assert_eq!(
+        repaired_output.status.code(),
+        Some(0),
+        "the same-key control must hold: {}",
+        String::from_utf8_lossy(&repaired_output.stderr)
+    );
+    let repaired_receipt: serde_json::Value =
+        serde_json::from_slice(&repaired_output.stdout).expect("repaired stdout is JSON");
+    assert_eq!(repaired_receipt["verdict"], "held");
+    let repaired_path = Path::new(repaired_receipt["artifact_path"].as_str().unwrap());
+    verify_complete_run_artifact(repaired_path).expect("the repaired artifact verifies");
+    let repaired_summary: serde_json::Value =
+        serde_json::from_slice(&fs::read(repaired_path.join("summary.json")).unwrap()).unwrap();
+    assert_eq!(repaired_summary["cases"][0]["provider_object_count"], 1);
+    assert!(
+        repaired_summary["cases"][0]["invariants"]
+            .as_array()
+            .is_some_and(|invariants| {
+                invariants.len() == 5
+                    && invariants
+                        .iter()
+                        .all(|invariant| invariant["verdict"] == "held")
+            })
+    );
+    assert_row_three_trace(repaired_path);
+
+    cleanup_reference_databases().await;
+    fs::remove_dir_all(ARTIFACT_ROOT).unwrap();
+    recreate_reference_app_in_retry_mode("faulty_changed_key");
+    restore.disarm();
 }
 
 #[tokio::test]
@@ -909,6 +984,14 @@ fn run_configured_command_with_cases(seed: u64, cases: u32) -> std::process::Out
         .expect("the configured campaign command executes")
 }
 
+fn run_configured_command_in_retry_mode(seed: u64, retry_key_mode: &str) -> std::process::Output {
+    require_retry_key_mode(retry_key_mode);
+    configured_command(seed, 1)
+        .env(RETRY_KEY_MODE_ENV, retry_key_mode)
+        .output()
+        .expect("the mode-bound configured campaign command executes")
+}
+
 fn configured_command(seed: u64, cases: u32) -> Command {
     configured_command_with_config(seed, cases, Path::new(CONFIG))
 }
@@ -1001,6 +1084,35 @@ fn configured_replay_command_with_config(artifact: &Path, config: &Path) -> Comm
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
     command
+}
+
+fn assert_row_three_trace(artifact: &Path) {
+    let campaign: serde_json::Value =
+        serde_json::from_slice(&fs::read(artifact.join("campaign-plan.json")).unwrap())
+            .expect("the campaign plan is JSON");
+    assert_eq!(campaign["spec"]["campaign_seed"], 69);
+    let trace: serde_json::Value =
+        serde_json::from_slice(&fs::read(artifact.join("cases/case_0001/trace.json")).unwrap())
+            .expect("the configured case trace is JSON");
+    let business_scripts = trace["planned_case"]["actions"]
+        .as_array()
+        .expect("planned actions are recorded")
+        .iter()
+        .filter(|action| {
+            matches!(
+                action["kind"]["kind"].as_str(),
+                Some("drive_checkout" | "retry_business_request")
+            )
+        })
+        .map(|action| action["kind"]["provider_script"].clone())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        business_scripts,
+        vec![serde_json::json!({
+            "first": "commit_then_close",
+            "retry": "normal"
+        })]
+    );
 }
 
 async fn wait_for_observation(
@@ -1118,6 +1230,101 @@ fn assert_reference_app_healthy() {
         String::from_utf8_lossy(&inspection.stdout).trim(),
         "true healthy"
     );
+}
+
+struct FaultyRetryModeRestore {
+    armed: bool,
+}
+
+impl FaultyRetryModeRestore {
+    const fn armed() -> Self {
+        Self { armed: true }
+    }
+
+    const fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for FaultyRetryModeRestore {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = reference_app_recreate_command(FAULTY_RETRY_KEY_MODE).status();
+        }
+    }
+}
+
+fn recreate_reference_app_in_retry_mode(retry_key_mode: &str) {
+    let output = reference_app_recreate_command(retry_key_mode)
+        .output()
+        .expect("Docker Compose recreates the reference application");
+    assert!(
+        output.status.success(),
+        "reference app recreation failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_reference_app_healthy();
+
+    let expected = format!("{RETRY_KEY_MODE_ENV}={retry_key_mode}");
+    let template = format!(
+        "{{{{range .Config.Env}}}}{{{{if eq . \"{expected}\"}}}}true{{{{end}}}}{{{{end}}}}"
+    );
+    let inspection = Command::new("docker")
+        .args([
+            "--host",
+            "unix:///var/run/docker.sock",
+            "inspect",
+            "--format",
+            &template,
+            "tiv-reference-app-spike-reference-app-1",
+        ])
+        .output()
+        .expect("Docker inspects the selected non-secret retry mode");
+    assert!(inspection.status.success());
+    assert_eq!(String::from_utf8_lossy(&inspection.stdout).trim(), "true");
+}
+
+fn reference_app_recreate_command(retry_key_mode: &str) -> Command {
+    require_retry_key_mode(retry_key_mode);
+    let repository_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let compose_file = repository_root.join("spike/reference-app.compose.yaml");
+    let mut command = Command::new("docker");
+    command
+        .args([
+            "--host",
+            "unix:///var/run/docker.sock",
+            "compose",
+            "--project-name",
+            "tiv-reference-app-spike",
+            "--project-directory",
+        ])
+        .arg(&repository_root)
+        .arg("--file")
+        .arg(compose_file)
+        .args([
+            "up",
+            "--detach",
+            "--build",
+            "--no-deps",
+            "--force-recreate",
+            "--wait",
+            "--wait-timeout",
+            "30",
+            "reference-app",
+        ])
+        .env(RETRY_KEY_MODE_ENV, retry_key_mode)
+        .env_remove("DOCKER_HOST")
+        .env_remove("DOCKER_CONTEXT")
+        .env_remove("DOCKER_TLS_VERIFY")
+        .env_remove("DOCKER_CERT_PATH");
+    command
+}
+
+fn require_retry_key_mode(retry_key_mode: &str) {
+    assert!(matches!(
+        retry_key_mode,
+        "faulty_changed_key" | "repaired_same_key"
+    ));
 }
 
 async fn reset_fixture_process() {

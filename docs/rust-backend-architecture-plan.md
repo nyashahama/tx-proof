@@ -928,6 +928,17 @@ One small synthetic checkout application exposes feature flags for these bugs:
 
 Each has a paired corrected mode. Acceptance requires the faulty mode to produce the named invariant and checkpoint, the minimized trace to reproduce at least 2/3, and the corrected mode to pass the same compiled regression.
 
+Current implementation status (2026-08-24): row 3 has an explicit startup-only
+pair, `faulty_changed_key` and `repaired_same_key`. Campaign seed `69` compiles
+one supported checkout script (`commit_then_close`, then `normal`) and is used
+unchanged for both executions. The faulty execution finalizes a verified
+artifact with two provider objects and a `provider-object-unique` violation;
+the repaired execution finalizes a verified artifact with one provider object
+and all five configured invariants held. The runtime preserves the two planned
+attempt outputs while allowing them to alias the same provider object and its
+immutable event in the repaired execution. The other five application variants
+remain unimplemented, so the six-row reference-app release gate is not closed.
+
 ## Implementation sequence
 
 The work is organized as vertical evidence slices, not one large framework build.

@@ -1,6 +1,6 @@
 use std::{env, error::Error, sync::Arc};
 
-use tiv_reference_app::{ReferenceApp, ReferenceAppConfig, serve_http1_connection};
+use tiv_reference_app::{ReferenceApp, ReferenceAppConfig, RetryKeyMode, serve_http1_connection};
 use tokio::net::TcpListener;
 
 #[tokio::main]
@@ -14,6 +14,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let postgres_port = required_env("TIV_POSTGRES_PORT")?
         .parse::<u16>()
         .map_err(|_| "invalid TIV_POSTGRES_PORT")?;
+    let retry_key_mode = retry_key_mode_from_env()?;
     let config = ReferenceAppConfig::new(
         required_env("TIV_FIXTURE_BASE_URL")?,
         required_env("TIV_POSTGRES_HOST")?,
@@ -22,7 +23,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         required_env("TIV_POSTGRES_PASSWORD")?,
         required_env("TIV_WEBHOOK_SECRET")?,
         required_env("TIV_FIXTURE_CONTROL_PROBE")?,
-    )?;
+    )?
+    .with_retry_key_mode(retry_key_mode);
     let app = Arc::new(ReferenceApp::new(config));
     let listener = TcpListener::bind(bind).await?;
 
@@ -32,6 +34,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
         tokio::spawn(async move {
             let _result = serve_http1_connection(stream, app).await;
         });
+    }
+}
+
+fn retry_key_mode_from_env() -> Result<RetryKeyMode, Box<dyn Error>> {
+    match env::var("TIV_REFERENCE_APP_RETRY_KEY_MODE") {
+        Ok(value) => value.parse().map_err(Into::into),
+        Err(env::VarError::NotPresent) => Ok(RetryKeyMode::default()),
+        Err(env::VarError::NotUnicode(_)) => Err("invalid TIV_REFERENCE_APP_RETRY_KEY_MODE".into()),
     }
 }
 

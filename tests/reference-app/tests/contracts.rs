@@ -13,9 +13,9 @@ use tiv_core::{
     },
 };
 use tiv_reference_app::{
-    CheckoutOperation, ReferenceDatabaseName, create_with_changed_retry_key,
-    create_with_changed_retry_key_for_business_request, parse_succeeded_webhook,
-    verify_webhook_signature,
+    CheckoutOperation, ReferenceDatabaseName, RetryKeyMode, create_with_changed_retry_key,
+    create_with_changed_retry_key_for_business_request, create_with_retry_key_mode,
+    parse_succeeded_webhook, verify_webhook_signature,
 };
 use tiv_stripe_pi::{
     CreatePaymentIntent, FaultOutcome, IdempotencyKey, ManagedFixture, OperationId,
@@ -65,6 +65,30 @@ fn generated_case_names_have_one_reversible_operation_identity() {
         assert!(
             ReferenceDatabaseName::from_operation_id(unrelated).is_err(),
             "{unrelated:?} must not select a reference database"
+        );
+    }
+}
+
+#[test]
+fn retry_key_mode_accepts_only_the_two_explicit_contract_values() {
+    assert_eq!(
+        "faulty_changed_key".parse::<RetryKeyMode>(),
+        Ok(RetryKeyMode::FaultyChangedKey)
+    );
+    assert_eq!(
+        "repaired_same_key".parse::<RetryKeyMode>(),
+        Ok(RetryKeyMode::RepairedSameKey)
+    );
+    for invalid in [
+        "",
+        "changed_key",
+        "same_key",
+        "FAULTY_CHANGED_KEY",
+        "repaired_same_key ",
+    ] {
+        assert!(
+            invalid.parse::<RetryKeyMode>().is_err(),
+            "{invalid:?} must not select a retry mode"
         );
     }
 }
@@ -178,6 +202,53 @@ async fn ambiguous_transport_failure_is_retried_with_a_changed_key() {
         snapshot.payment_intents()[0].id(),
         snapshot.payment_intents()[1].id()
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ambiguous_transport_failure_retried_with_the_same_key_reuses_the_committed_object() {
+    let (seed, provider_script) = compiled_changed_key_retry_script();
+    let fixture = Arc::new(Mutex::new(ManagedFixture::new(seed)));
+    fixture
+        .lock()
+        .await
+        .reset(
+            1,
+            seed,
+            provider_script.outcomes().map(fixture_outcome).collect(),
+        )
+        .expect("the fault plan is installed");
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("a loopback port is available");
+    let address = listener.local_addr().expect("the listener has an address");
+    let server_fixture = Arc::clone(&fixture);
+    let server = tokio::spawn(async move {
+        for _ in 0..2 {
+            let (stream, _) = listener.accept().await.expect("the app connects");
+            let _result = serve_managed_http1_connection(stream, Arc::clone(&server_fixture)).await;
+        }
+    });
+    let operation =
+        CheckoutOperation::new("op_1", 2_500, "usd").expect("the checkout operation is valid");
+
+    let observed = create_with_retry_key_mode(
+        &reqwest::Client::new(),
+        &format!("http://{address}"),
+        &operation,
+        RetryKeyMode::RepairedSameKey,
+    )
+    .await
+    .expect("the repaired retry receives the cached provider object");
+
+    assert!(observed.id().starts_with("pi_tiv_"));
+    assert_eq!(observed.operation_id(), "op_1");
+    timeout(Duration::from_secs(2), server)
+        .await
+        .expect("the two-connection fixture stops")
+        .expect("the fixture task does not panic");
+    let snapshot = fixture.lock().await.snapshot();
+    assert_eq!(snapshot.payment_intents().len(), 1);
+    assert_eq!(snapshot.remaining_outcomes(), 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

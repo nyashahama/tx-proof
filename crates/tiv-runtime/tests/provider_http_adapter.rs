@@ -15,7 +15,7 @@ use tiv_core::{
     },
     trace::{CaseCapturedValue, CaseOutputRef, CaseOutputSlot},
 };
-use tiv_reference_app::{CheckoutOperation, create_with_changed_retry_key};
+use tiv_reference_app::{CheckoutOperation, RetryKeyMode, create_with_retry_key_mode};
 use tiv_runtime::{
     campaign::{
         CaseEffectAdapter, CaseEffectFuture, CaseEffectRequest, CaseExecutionCause,
@@ -61,6 +61,15 @@ struct HttpHarness {
 
 impl HttpHarness {
     async fn start(outcomes: Vec<FaultOutcome>, data_connections: usize) -> Self {
+        Self::start_with_retry_key_mode(outcomes, data_connections, RetryKeyMode::FaultyChangedKey)
+            .await
+    }
+
+    async fn start_with_retry_key_mode(
+        outcomes: Vec<FaultOutcome>,
+        data_connections: usize,
+        retry_key_mode: RetryKeyMode,
+    ) -> Self {
         let fixture = Arc::new(Mutex::new(ManagedFixture::new(Seed::new(73))));
         fixture
             .lock()
@@ -70,7 +79,8 @@ impl HttpHarness {
         let (data_address, data_server) =
             start_data_server(Arc::clone(&fixture), data_connections).await;
         let (control_address, control_server) = start_control_server(Arc::clone(&fixture)).await;
-        let (driver_address, driver_server) = start_driver_server(data_address).await;
+        let (driver_address, driver_server) =
+            start_driver_server(data_address, retry_key_mode).await;
         Self {
             fixture,
             driver_address,
@@ -679,6 +689,75 @@ async fn business_outcome_scripts_match_real_http_results_and_fixture_commits() 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn repaired_same_key_retry_aliases_two_attempt_outputs_to_one_provider_object() {
+    let script = ProviderOutcomeScript::with_transport_retry(
+        ProviderOutcome::CommitThenClose,
+        ProviderOutcome::Normal,
+    )
+    .unwrap();
+    let harness = HttpHarness::start_with_retry_key_mode(
+        script.outcomes().map(fixture_outcome).collect(),
+        script.outcomes().count(),
+        RetryKeyMode::RepairedSameKey,
+    )
+    .await;
+    let plan = plan_starting_with(script);
+    let first_action_id = plan.actions()[0].id();
+    let journal_path = journal_path();
+    let config = ProviderHttpConfig::new(
+        format!("http://{}/checkout", harness.driver_address),
+        serde_json::json!({
+            "database": "tiv_case_0123456789abcdef",
+            "operation_id": "op_73",
+            "amount_minor": 2500,
+            "currency": "usd"
+        }),
+        format!("http://{}", harness.data_address),
+        format!("http://{}", harness.control_address),
+        "case-control-token",
+        1,
+        Duration::from_secs(2),
+        Duration::from_millis(2),
+    )
+    .unwrap();
+    let mut adapter = CompletingAdapter {
+        provider_http: ProviderHttpAdapter::new(config).unwrap(),
+        real_business_actions_remaining: 1,
+        real_confirm_actions_remaining: 0,
+        real_retrieves_remaining: 0,
+        real_gate_pending: false,
+    };
+
+    let execution = execute_planned_case("run_73", "case_73", &plan, &journal_path, &mut adapter)
+        .await
+        .expect("the adapter records the idempotent retry as one provider object");
+    let first = execution
+        .trace()
+        .resolve(CaseOutputRef::new(
+            first_action_id,
+            CaseOutputSlot::PaymentIntentId,
+        ))
+        .expect("the first committed attempt is captured");
+    let retry = execution
+        .trace()
+        .resolve(CaseOutputRef::for_occurrence(
+            first_action_id,
+            CaseOutputSlot::PaymentIntentId,
+            1,
+        ))
+        .expect("the retry attempt is captured");
+
+    assert_eq!(first, retry);
+    let snapshot = harness.fixture.lock().await.snapshot();
+    assert_eq!(snapshot.payment_intents().len(), 1);
+    assert_eq!(snapshot.remaining_outcomes(), 0);
+
+    drop(adapter);
+    harness.finish().await;
+    tokio::fs::remove_file(journal_path).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn confirmation_outcomes_match_real_http_status_transport_and_state() {
     for outcome in [
         ProviderOutcome::Normal,
@@ -827,7 +906,10 @@ async fn start_control_server(fixture: Arc<Mutex<ManagedFixture>>) -> (SocketAdd
     (address, server)
 }
 
-async fn start_driver_server(data_address: SocketAddr) -> (SocketAddr, JoinHandle<()>) {
+async fn start_driver_server(
+    data_address: SocketAddr,
+    retry_key_mode: RetryKeyMode,
+) -> (SocketAddr, JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let server = tokio::spawn(async move {
@@ -837,7 +919,9 @@ async fn start_driver_server(data_address: SocketAddr) -> (SocketAddr, JoinHandl
             .keep_alive(false)
             .serve_connection(
                 TokioIo::new(stream),
-                service_fn(move |request| synthetic_checkout(request, fixture_url.clone())),
+                service_fn(move |request| {
+                    synthetic_checkout(request, fixture_url.clone(), retry_key_mode)
+                }),
             )
             .await
             .unwrap();
@@ -978,6 +1062,7 @@ fn journal_path() -> PathBuf {
 async fn synthetic_checkout(
     request: Request<Incoming>,
     fixture_url: String,
+    retry_key_mode: RetryKeyMode,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
     assert_eq!(request.method(), Method::POST);
     assert_eq!(request.uri().path(), "/checkout");
@@ -994,8 +1079,13 @@ async fn synthetic_checkout(
     let command: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(command["operation_id"], "op_73");
     let operation = CheckoutOperation::new("op_73", 2_500, "usd").unwrap();
-    let result =
-        create_with_changed_retry_key(&reqwest::Client::new(), &fixture_url, &operation).await;
+    let result = create_with_retry_key_mode(
+        &reqwest::Client::new(),
+        &fixture_url,
+        &operation,
+        retry_key_mode,
+    )
+    .await;
     let mut response = if let Ok(payment_intent) = result {
         Response::new(Full::new(Bytes::from(
             serde_json::to_vec(&serde_json::json!({

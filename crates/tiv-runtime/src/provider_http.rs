@@ -359,17 +359,13 @@ impl ProviderHttpAdapter {
             .iter()
             .filter(|payment_intent| !known.contains(payment_intent.id.as_str()))
             .collect::<Vec<_>>();
-        if new_payment_intents.len() != usize::from(provider_script.committed_count())
-            || new_payment_intents
-                .iter()
-                .any(|payment_intent| !self.valid_created_payment_intent(payment_intent))
+        if new_payment_intents
+            .iter()
+            .any(|payment_intent| !self.valid_created_payment_intent(payment_intent))
         {
             return Err(ProviderHttpError::UnexpectedFixtureState);
         }
-        let payment_intent_ids = new_payment_intents
-            .iter()
-            .map(|payment_intent| payment_intent.id.clone())
-            .collect::<Vec<_>>();
+        let payment_intent_ids = payment_intent_attempt_ids(provider_script, &new_payment_intents)?;
         if let Some(driver) = driver
             && (payment_intent_ids.last() != Some(&driver.payment_intent_id)
                 || driver.operation_id != self.config.expected_operation_id)
@@ -1221,6 +1217,27 @@ fn require_output_contract(
         return Err(ProviderHttpError::UnexpectedOutputContract);
     }
     Ok(())
+}
+
+fn payment_intent_attempt_ids(
+    provider_script: ProviderOutcomeScript,
+    new_payment_intents: &[&FixturePaymentIntent],
+) -> Result<Vec<String>, ProviderHttpError> {
+    let committed_count = usize::from(provider_script.committed_count());
+    if new_payment_intents.len() == committed_count {
+        return Ok(new_payment_intents
+            .iter()
+            .map(|payment_intent| payment_intent.id.clone())
+            .collect());
+    }
+    if committed_count == 2
+        && new_payment_intents.len() == 1
+        && provider_script.outcomes().next() == Some(ProviderOutcome::CommitThenClose)
+    {
+        let payment_intent_id = new_payment_intents[0].id.clone();
+        return Ok(vec![payment_intent_id.clone(), payment_intent_id]);
+    }
+    Err(ProviderHttpError::UnexpectedFixtureState)
 }
 
 fn require_held_checkout_outputs(
