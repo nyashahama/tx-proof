@@ -1,5 +1,9 @@
 use std::{
-    collections::BTreeMap, fmt::Write as _, fs, os::unix::fs::PermissionsExt, path::Path,
+    collections::{BTreeMap, BTreeSet},
+    fmt::Write as _,
+    fs,
+    os::unix::fs::PermissionsExt,
+    path::{Path, PathBuf},
     process::Command,
 };
 
@@ -377,6 +381,8 @@ async fn configured_shrink_evaluates_one_replayed_candidate_and_finalizes_eviden
     let candidates = summary["candidates"].as_array().unwrap();
     assert_eq!(candidates.len(), 1);
     let candidate = &candidates[0];
+    assert_eq!(candidate["accepted"], true);
+    assert_eq!(shrink_receipt["accepted_candidates"], 1);
     let candidate_id = candidate["candidate_id"].as_str().unwrap();
     assert_eq!(candidate["attempts"].as_array().unwrap().len(), 3);
     assert!(
@@ -418,7 +424,107 @@ async fn configured_shrink_evaluates_one_replayed_candidate_and_finalizes_eviden
                 .is_file()
         );
     }
+
+    let shrink_snapshot = read_artifact_snapshot(shrink_path);
+    let minimized_replay_output = configured_minimized_replay_command(shrink_path)
+        .output()
+        .expect("the authority-bound minimized replay command executes");
+    assert_eq!(
+        minimized_replay_output.status.code(),
+        Some(10),
+        "configured minimized replay failed: {}",
+        String::from_utf8_lossy(&minimized_replay_output.stderr)
+    );
+    let minimized_replay_receipt: serde_json::Value =
+        serde_json::from_slice(&minimized_replay_output.stdout).unwrap();
+    assert_eq!(
+        minimized_replay_receipt["status"],
+        "configured_minimized_replay_complete"
+    );
+    assert_eq!(
+        minimized_replay_receipt["source_shrink_id"],
+        shrink_receipt["shrink_id"]
+    );
+    assert_eq!(
+        minimized_replay_receipt["source_replay_id"],
+        replay_receipt["replay_id"]
+    );
+    assert_eq!(minimized_replay_receipt["case_id"], "case_0001");
+    assert_eq!(minimized_replay_receipt["attempt_count"], 3);
+    assert!(matches!(
+        minimized_replay_receipt["classification"].as_str(),
+        Some("stable" | "reproducible")
+    ));
+    assert!(
+        minimized_replay_receipt["matching_failure_count"]
+            .as_u64()
+            .is_some_and(|count| count >= 2)
+    );
+    let minimized_replay_path =
+        Path::new(minimized_replay_receipt["artifact_path"].as_str().unwrap());
+    assert_eq!(read_artifact_snapshot(shrink_path), shrink_snapshot);
+    verify_complete_run_artifact(minimized_replay_path).unwrap();
+    let minimized_replay_manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(minimized_replay_path.join("manifest.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        minimized_replay_manifest["artifact"]["kind"],
+        "configured_minimized_replay"
+    );
+    assert_eq!(
+        minimized_replay_manifest["artifact"]["result"],
+        "counterexample"
+    );
+    assert_eq!(
+        minimized_replay_manifest["provenance"]["source_artifacts"][0]["run_id"],
+        shrink_receipt["shrink_id"]
+    );
+    assert_eq!(
+        fs::read(minimized_replay_path.join("trace.minimized.json")).unwrap(),
+        fs::read(shrink_path.join("trace.minimized.json")).unwrap()
+    );
+    let minimized_replay_summary: serde_json::Value =
+        serde_json::from_slice(&fs::read(minimized_replay_path.join("summary.json")).unwrap())
+            .unwrap();
+    let minimized_attempts = minimized_replay_summary["attempts"].as_array().unwrap();
+    assert_eq!(minimized_attempts.len(), 3);
+    assert!(minimized_attempts.iter().all(|attempt| {
+        attempt["trace_matches_minimized_authority"] == true
+            && attempt["invariants"]
+                .as_array()
+                .is_some_and(|invariants| invariants.len() == 5)
+            && attempt["before_database_oid"] != attempt["after_database_oid"]
+    }));
+    assert_eq!(
+        minimized_attempts
+            .iter()
+            .map(|attempt| attempt["after_database_oid"].as_u64().unwrap())
+            .collect::<BTreeSet<_>>()
+            .len(),
+        3
+    );
+    assert_eq!(
+        minimized_attempts
+            .iter()
+            .map(|attempt| attempt["after_marker_uuid"].as_str().unwrap())
+            .collect::<BTreeSet<_>>()
+            .len(),
+        3
+    );
+    for attempt in 1..=3 {
+        assert!(
+            minimized_replay_path
+                .join(format!("attempts/attempt_{attempt:04}/trace.json"))
+                .is_file()
+        );
+        assert!(
+            minimized_replay_path
+                .join(format!("attempts/attempt_{attempt:04}/observations.ndjson"))
+                .is_file()
+        );
+    }
     let artifact_bytes = read_artifact_tree(shrink_path);
+    let minimized_replay_bytes = read_artifact_tree(minimized_replay_path);
     for secret in [
         "tiv-local-only-password",
         "tiv-app-local-only-password",
@@ -426,6 +532,7 @@ async fn configured_shrink_evaluates_one_replayed_candidate_and_finalizes_eviden
         "run-scoped-control-token",
     ] {
         assert!(!artifact_bytes.contains(secret));
+        assert!(!minimized_replay_bytes.contains(secret));
     }
     assert_reference_app_healthy();
     verify_complete_run_artifact(source_path).unwrap();
@@ -777,6 +884,26 @@ fn configured_shrink_command(artifact: &Path) -> Command {
         .arg(CONFIG)
         .args(["--max-candidates", "1"])
         .args(["--max-time", "10m"])
+        .env("TIV_POSTGRES_ADMIN_URL", ADMIN_URL)
+        .env("DATABASE_URL", CASE_URL)
+        .env("TIV_STRIPE_WEBHOOK_SECRET", "whsec_test_secret")
+        .env("TIV_FIXTURE_CONTROL_TOKEN", "run-scoped-control-token")
+        .env("DOCKER_HOST", "tcp://127.0.0.1:9")
+        .env("DOCKER_CONTEXT", "intentionally-remote")
+        .env("HTTP_PROXY", "http://127.0.0.1:9")
+        .env("HTTPS_PROXY", "http://127.0.0.1:9")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    command
+}
+
+fn configured_minimized_replay_command(artifact: &Path) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_tiv"));
+    command
+        .args(["replay", "minimized", "--artifact"])
+        .arg(artifact)
+        .arg("--config")
+        .arg(CONFIG)
         .env("TIV_POSTGRES_ADMIN_URL", ADMIN_URL)
         .env("DATABASE_URL", CASE_URL)
         .env("TIV_STRIPE_WEBHOOK_SECRET", "whsec_test_secret")
@@ -1199,4 +1326,28 @@ fn read_artifact_tree(root: &Path) -> String {
         }
     }
     contents
+}
+
+fn read_artifact_snapshot(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+    fn collect(root: &Path, directory: &Path, files: &mut BTreeMap<PathBuf, Vec<u8>>) {
+        let mut paths = fs::read_dir(directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        paths.sort();
+        for path in paths {
+            if path.is_dir() {
+                collect(root, &path, files);
+            } else {
+                files.insert(
+                    path.strip_prefix(root).unwrap().to_owned(),
+                    fs::read(path).unwrap(),
+                );
+            }
+        }
+    }
+
+    let mut files = BTreeMap::new();
+    collect(root, root, &mut files);
+    files
 }

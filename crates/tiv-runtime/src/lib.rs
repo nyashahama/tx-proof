@@ -8,6 +8,7 @@ pub mod compatibility;
 pub mod config;
 pub mod configured_campaign;
 pub(crate) mod configured_database;
+pub mod configured_minimized_replay;
 pub(crate) mod configured_process;
 pub mod configured_replay;
 pub mod configured_shrink;

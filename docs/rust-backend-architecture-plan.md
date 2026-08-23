@@ -575,11 +575,11 @@ The manifest binds tool and adapter versions, trace schema, repository commit an
 
 ### Implemented manifest-v2 provenance contract
 
-New configured campaign, replay, and shrink artifacts emit strict manifest
-schema `2`; the verifier continues to accept existing complete schema-`1`
+New configured campaign, replay, shrink, and minimized-replay artifacts emit
+strict manifest schema `2`; the verifier continues to accept existing complete schema-`1`
 artifacts. A complete v2 manifest records one typed artifact kind, one coherent
 result, and its exact public exit code. Campaigns may be `held` (`0`) or
-`counterexample` (`10`); replays may be `counterexample` (`10`) or
+`counterexample` (`10`); configured and minimized replays may be `counterexample` (`10`) or
 `inconclusive` (`4`); shrinks may additionally be `budget_exhausted` (`11`).
 Partial artifacts have no result or exit code and cannot be inspected as
 complete artifacts.
@@ -605,10 +605,11 @@ only then may safety state be
 `initial_execution_boundary_attested`. An earlier partial run uses
 `not_reached`. Authority roles are fixed to canonical files:
 `campaign-plan.json`, `cases/case_*/trace.json`, `source.json`,
-`trace.original.json`, and optional `trace.minimized.json`. Replay and shrink
-manifests contain exactly one cryptographic source-artifact identity; campaign
-manifests contain none. The verifier rejects incoherent kind/result/exit-code,
-source-count, role/path/schema, safety, or digest combinations.
+`trace.original.json`, and optional or required `trace.minimized.json`, according
+to artifact kind. Replay, shrink, and minimized-replay manifests contain exactly
+one cryptographic source-artifact identity; campaign manifests contain none. The
+verifier rejects incoherent kind/result/exit-code, source-count,
+role/path/schema, safety, or digest combinations.
 
 These checks provide bounded local integrity and provenance for a finalized
 directory. They are not a signature, transparency log, or hostile same-user
@@ -646,6 +647,7 @@ tiv doctor [--config tiv.toml]
 tiv baseline [--config tiv.toml]
 tiv run [--seed U64] [--cases N] [--ci]
 tiv replay configured --artifact PATH [--config tiv.toml] --case N
+tiv replay minimized --artifact SHRINK_PATH [--config tiv.toml]
 tiv shrink configured --artifact REPLAY_PATH [--config tiv.toml] [--max-candidates N] [--max-time 10m]
 tiv inspect PATH
 tiv cleanup --run RUN_ID
@@ -720,6 +722,36 @@ change the source amount, currency, or operation identity, move an action or
 crash cut point, synthesize metadata variants, or remove mandatory business-flow
 actions rejected by replay validation. Those are future transform families, not
 implicit claims of the present search.
+
+### Implemented minimized-replay contract
+
+`tiv replay minimized` accepts only a complete manifest-v2 configured-shrink
+artifact whose result is `counterexample` or `budget_exhausted` and whose
+manifest binds exactly one canonical `trace.minimized.json` authority. Merely
+indexing a file with that name is insufficient. Before configuration or stack
+access, the loader reverifies the artifact and source identity, parses both
+trace authorities, proves the minimized candidate descends from the untouched
+original plan, and checks the shrink source, summary, candidate, evaluation,
+per-attempt result, and per-attempt trace documents for exact coherence.
+
+The selected candidate is then executed exactly three times. Every attempt uses
+a freshly reset disposable baseline; compatibility is attested before the first
+attempt and recaptured exactly before attempts two and three. Each execution
+must match the minimized trace's replay authority and is classified against the
+same invariant/checkpoint identity recorded by shrink. Stable 3/3 and
+reproducible 2/3 conclusions exit `10`; fewer than two matching failures is
+`inconclusive` and exits `4`.
+
+The command writes a new, non-overwriting manifest-v2
+`configured_minimized_replay` artifact. Its source identity binds the shrink
+artifact, its canonical authorities bind `source.json` and the byte-identical
+minimized trace, and its allowlisted evidence retains three journals, traces,
+results, and a summary without secret-bearing configuration. Execution failure,
+divergence, interruption, or compatibility drift after staging retains
+finalized partial evidence under the existing failure-class contract; an
+initial compatibility rejection occurs before staging and emits no artifact.
+This is repeatable bounded counterexample execution, not proof of a global
+minimum or of correctness.
 
 ## Concurrency, cancellation, and resource budgets
 

@@ -36,6 +36,8 @@ pub(crate) enum ArtifactKind {
     Replay,
     #[serde(rename = "configured_shrink")]
     Shrink,
+    #[serde(rename = "configured_minimized_replay")]
+    MinimizedReplay,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -62,7 +64,7 @@ impl ArtifactResult {
             (kind, self),
             (ArtifactKind::Campaign, Self::Held | Self::Counterexample)
                 | (
-                    ArtifactKind::Replay,
+                    ArtifactKind::Replay | ArtifactKind::MinimizedReplay,
                     Self::Counterexample | Self::Inconclusive
                 )
                 | (
@@ -174,12 +176,13 @@ struct VersionTwoFinalization {
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
-enum AuthorityRole {
+pub(crate) enum AuthorityRole {
     CampaignPlan,
     CampaignCaseTrace,
     ReplaySource,
     OriginalTrace,
     ShrinkSource,
+    MinimizedReplaySource,
     MinimizedTrace,
 }
 
@@ -241,6 +244,13 @@ impl ArtifactAuthority {
         Self {
             role: AuthorityRole::MinimizedTrace,
             path: PathBuf::from("trace.minimized.json"),
+        }
+    }
+
+    pub(crate) fn minimized_replay_source() -> Self {
+        Self {
+            role: AuthorityRole::MinimizedReplaySource,
+            path: PathBuf::from("source.json"),
         }
     }
 }
@@ -749,9 +759,9 @@ const fn authority_contract(role: AuthorityRole) -> (AuthorityFormat, u16) {
             AuthorityFormat::CompiledCaseTrace,
             CASE_TRACE_SCHEMA_VERSION,
         ),
-        AuthorityRole::ReplaySource | AuthorityRole::ShrinkSource => {
-            (AuthorityFormat::SourceDocument, 1)
-        }
+        AuthorityRole::ReplaySource
+        | AuthorityRole::ShrinkSource
+        | AuthorityRole::MinimizedReplaySource => (AuthorityFormat::SourceDocument, 1),
         AuthorityRole::MinimizedTrace => (
             AuthorityFormat::CompiledShrinkTrace,
             SHRINK_TRACE_SCHEMA_VERSION,
@@ -778,6 +788,11 @@ fn valid_complete_authorities(kind: ArtifactKind, authorities: &[BoundAuthorityV
                 && count(AuthorityRole::MinimizedTrace) <= 1
                 && authorities.len() == 2 + count(AuthorityRole::MinimizedTrace)
         }
+        ArtifactKind::MinimizedReplay => {
+            count(AuthorityRole::MinimizedReplaySource) == 1
+                && count(AuthorityRole::MinimizedTrace) == 1
+                && authorities.len() == 2
+        }
     }
 }
 
@@ -795,6 +810,9 @@ const fn authority_valid_for_kind(kind: ArtifactKind, role: AuthorityRole) -> bo
             AuthorityRole::ShrinkSource
                 | AuthorityRole::OriginalTrace
                 | AuthorityRole::MinimizedTrace
+        ) | (
+            ArtifactKind::MinimizedReplay,
+            AuthorityRole::MinimizedReplaySource | AuthorityRole::MinimizedTrace
         )
     )
 }
@@ -806,7 +824,9 @@ fn authority_path_valid(role: AuthorityRole, path: &str) -> bool {
             .strip_prefix("cases/")
             .and_then(|path| path.strip_suffix("/trace.json"))
             .is_some_and(valid_case_id),
-        AuthorityRole::ReplaySource | AuthorityRole::ShrinkSource => path == "source.json",
+        AuthorityRole::ReplaySource
+        | AuthorityRole::ShrinkSource
+        | AuthorityRole::MinimizedReplaySource => path == "source.json",
         AuthorityRole::OriginalTrace => path == "trace.original.json",
         AuthorityRole::MinimizedTrace => path == "trace.minimized.json",
     }
@@ -828,6 +848,7 @@ struct VerifiedManifest {
     required_files: BTreeMap<String, String>,
     artifact_kind: Option<ArtifactKind>,
     artifact_result: Option<ArtifactResult>,
+    authorities: Vec<BoundAuthorityV2>,
 }
 
 #[derive(Deserialize)]
@@ -846,6 +867,7 @@ pub struct VerifiedRunArtifact {
     compatibility_digest: String,
     artifact_kind: Option<ArtifactKind>,
     artifact_result: Option<ArtifactResult>,
+    authorities: Vec<BoundAuthorityV2>,
     compatibility: RunCompatibilityV1,
     required_files: BTreeMap<String, String>,
 }
@@ -880,6 +902,24 @@ impl VerifiedRunArtifact {
             checksums_digest: self.checksums_digest.clone(),
             compatibility_digest: self.compatibility_digest.clone(),
         }
+    }
+
+    pub(crate) fn read_unique_authority_bytes(
+        &self,
+        role: AuthorityRole,
+    ) -> Result<Option<Vec<u8>>, ArtifactError> {
+        let mut matches = self
+            .authorities
+            .iter()
+            .filter(|authority| authority.role == role);
+        let Some(authority) = matches.next() else {
+            return Ok(None);
+        };
+        if matches.next().is_some() {
+            return Err(ArtifactError::InvalidManifest);
+        }
+        self.read_indexed_bytes(Path::new(&authority.path))
+            .map(Some)
     }
 
     #[must_use]
@@ -1040,6 +1080,7 @@ pub fn verify_complete_run_artifact(root: &Path) -> Result<VerifiedRunArtifact, 
         compatibility_digest,
         artifact_kind: manifest.artifact_kind,
         artifact_result: manifest.artifact_result,
+        authorities: manifest.authorities,
         compatibility,
         required_files,
     })
@@ -1077,6 +1118,7 @@ fn decode_complete_manifest(
                 required_files: manifest.required_files,
                 artifact_kind: None,
                 artifact_result: None,
+                authorities: Vec::new(),
             })
         }
         2 => {
@@ -1108,6 +1150,7 @@ fn decode_complete_manifest(
                 required_files: manifest.required_files,
                 artifact_kind: Some(manifest.artifact.kind),
                 artifact_result: manifest.artifact.result,
+                authorities: manifest.provenance.authorities,
             })
         }
         _ => Err(ArtifactError::InvalidManifest),
@@ -1182,7 +1225,7 @@ fn v2_complete_provenance_valid(
 const fn valid_source_count(kind: ArtifactKind, count: usize) -> bool {
     match kind {
         ArtifactKind::Campaign => count == 0,
-        ArtifactKind::Replay | ArtifactKind::Shrink => count == 1,
+        ArtifactKind::Replay | ArtifactKind::Shrink | ArtifactKind::MinimizedReplay => count == 1,
     }
 }
 
@@ -1463,9 +1506,9 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        ArtifactAuthority, ArtifactError, ArtifactKind, ArtifactResult, ManifestSeed,
-        PartialRunClass, RepositoryProvenance, RunArtifactStaging, WorktreeState,
-        verify_complete_run_artifact,
+        ArtifactAuthority, ArtifactError, ArtifactKind, ArtifactResult, AuthorityRole,
+        ManifestSeed, PartialRunClass, RepositoryProvenance, RunArtifactStaging,
+        SourceArtifactIdentity, WorktreeState, verify_complete_run_artifact,
     };
 
     #[test]
@@ -1764,6 +1807,129 @@ mod tests {
             source_manifest["required_files"]["compatibility.json"]
         );
         assert!(verify_complete_run_artifact(&replay_path).is_ok());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn minimized_replay_requires_an_authority_bound_minimized_trace() {
+        let root = std::env::temp_dir().join(format!("tiv-artifact-v2-{}", Uuid::new_v4()));
+        fs::create_dir(&root).unwrap();
+        let base = root.join(".tiv/runs");
+        let repository =
+            RepositoryProvenance::captured(&"a".repeat(40), WorktreeState::Clean, &"b".repeat(64))
+                .unwrap();
+        let mut staging = RunArtifactStaging::create_v2(
+            &root,
+            &base,
+            "run_minimized_replay",
+            ManifestSeed::new(
+                ArtifactKind::MinimizedReplay,
+                repository,
+                vec![source_identity_fixture("run_source_shrink")],
+            ),
+        )
+        .unwrap();
+        staging
+            .write_json(
+                "config.redacted.json",
+                &serde_json::json!({"schema_version": 1}),
+            )
+            .unwrap();
+        staging
+            .write_json("compatibility.json", &compatibility_fixture())
+            .unwrap();
+        staging
+            .write_json("source.json", &serde_json::json!({"schema_version": 1}))
+            .unwrap();
+        staging
+            .write_json(
+                "trace.minimized.json",
+                &serde_json::json!({"schema_version": 1}),
+            )
+            .unwrap();
+        staging
+            .write_json(
+                "summary.json",
+                &serde_json::json!({"classification": "stable"}),
+            )
+            .unwrap();
+
+        let finalized = staging
+            .finalize_complete(
+                ArtifactResult::Counterexample,
+                vec![
+                    ArtifactAuthority::minimized_replay_source(),
+                    ArtifactAuthority::minimized_trace(),
+                ],
+            )
+            .unwrap();
+        let verified = verify_complete_run_artifact(&finalized).unwrap();
+
+        assert_eq!(
+            verified.artifact_kind(),
+            Some(ArtifactKind::MinimizedReplay)
+        );
+        assert!(
+            verified
+                .read_unique_authority_bytes(AuthorityRole::MinimizedTrace)
+                .unwrap()
+                .is_some()
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn verified_shrink_does_not_select_an_indexed_but_unbound_minimized_trace() {
+        let root = std::env::temp_dir().join(format!("tiv-artifact-v2-{}", Uuid::new_v4()));
+        fs::create_dir(&root).unwrap();
+        let base = root.join(".tiv/runs");
+        let repository =
+            RepositoryProvenance::captured(&"a".repeat(40), WorktreeState::Clean, &"b".repeat(64))
+                .unwrap();
+        let mut staging = RunArtifactStaging::create_v2(
+            &root,
+            &base,
+            "run_unbound_minimized",
+            ManifestSeed::new(
+                ArtifactKind::Shrink,
+                repository,
+                vec![source_identity_fixture("run_source_replay")],
+            ),
+        )
+        .unwrap();
+        for path in [
+            "config.redacted.json",
+            "source.json",
+            "trace.original.json",
+            "trace.minimized.json",
+            "summary.json",
+        ] {
+            staging
+                .write_json(path, &serde_json::json!({"schema_version": 1}))
+                .unwrap();
+        }
+        staging
+            .write_json("compatibility.json", &compatibility_fixture())
+            .unwrap();
+        let finalized = staging
+            .finalize_complete(
+                ArtifactResult::Counterexample,
+                vec![
+                    ArtifactAuthority::shrink_source(),
+                    ArtifactAuthority::original_trace(),
+                ],
+            )
+            .unwrap();
+        let verified = verify_complete_run_artifact(&finalized).unwrap();
+
+        assert!(
+            verified
+                .read_unique_authority_bytes(AuthorityRole::MinimizedTrace)
+                .unwrap()
+                .is_none()
+        );
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -2084,5 +2250,15 @@ mod tests {
                 ],
             )
             .unwrap()
+    }
+
+    fn source_identity_fixture(run_id: &str) -> SourceArtifactIdentity {
+        SourceArtifactIdentity {
+            manifest_schema_version: 2,
+            run_id: run_id.to_owned(),
+            manifest_digest: "c".repeat(64),
+            checksums_digest: "d".repeat(64),
+            compatibility_digest: "e".repeat(64),
+        }
     }
 }

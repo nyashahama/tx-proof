@@ -11,7 +11,7 @@ async fn main() -> ExitCode {
         &cli.command,
         Command::Run(_)
             | Command::Replay {
-                command: ReplayCommand::Configured(_)
+                command: ReplayCommand::Configured(_) | ReplayCommand::Minimized(_)
             }
             | Command::Shrink { .. }
     ) {

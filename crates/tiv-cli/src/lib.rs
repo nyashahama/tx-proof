@@ -21,6 +21,9 @@ use tiv_runtime::{
         ConfiguredCampaignError, ConfiguredCampaignOptions, ConfiguredCampaignOptionsError,
         ConfiguredCampaignVerdict, RunCancellation, run_configured_campaign_with_cancellation,
     },
+    configured_minimized_replay::{
+        ConfiguredMinimizedReplayError, run_configured_minimized_replay_with_cancellation,
+    },
     configured_replay::{
         ConfiguredReplayError, ConfiguredReplayOptions, ConfiguredReplayOptionsError,
         run_configured_replay_with_cancellation,
@@ -163,6 +166,8 @@ pub enum ReplayCommand {
     Inspect { path: PathBuf },
     /// Replay one violating case from a verified configured-run artifact.
     Configured(ConfiguredReplayArgs),
+    /// Replay the authority-bound minimized trace from a verified shrink artifact.
+    Minimized(MinimizedReplayArgs),
     /// Execute the committed reference-app checkout path against loopback services.
     ReferenceApp(ReferenceAppReplayArgs),
     /// Run three fresh-baseline reference attempts into bounded evidence.
@@ -182,6 +187,16 @@ pub struct ConfiguredReplayArgs {
     /// One-based recorded campaign case to replay exactly three times.
     #[arg(long)]
     pub case: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Args)]
+pub struct MinimizedReplayArgs {
+    /// Complete configured-shrink artifact containing minimized trace authority.
+    #[arg(long)]
+    pub artifact: PathBuf,
+    /// Typed TOML configuration for the same disposable customer stack.
+    #[arg(long, default_value = "tiv.toml")]
+    pub config: PathBuf,
 }
 
 #[derive(Debug, PartialEq, Subcommand)]
@@ -326,7 +341,8 @@ pub fn execute(cli: Cli) -> Result<String, CliError> {
                 ReplayCommand::ReferenceApp(_)
                 | ReplayCommand::ReferenceAppEvidence(_)
                 | ReplayCommand::ReferenceAppCase(_)
-                | ReplayCommand::Configured(_),
+                | ReplayCommand::Configured(_)
+                | ReplayCommand::Minimized(_),
         } => Err(CliError::AsyncCommand),
         Command::Trace {
             command: TraceCommand::Validate { path },
@@ -392,6 +408,20 @@ pub async fn execute_async_with_cancellation(
             let body = output.to_pretty_json().map_err(CliError::Encode)?;
             Ok(CliOutput { body, exit_code })
         }
+        Command::Replay {
+            command: ReplayCommand::Minimized(args),
+        } => {
+            let output = Box::pin(run_configured_minimized_replay_with_cancellation(
+                &args.artifact,
+                &args.config,
+                &ProcessEnvironment,
+                cancellation,
+            ))
+            .await?;
+            let exit_code = output.classification().exit_code();
+            let body = output.to_pretty_json().map_err(CliError::Encode)?;
+            Ok(CliOutput { body, exit_code })
+        }
         Command::Shrink {
             command: ShrinkCommand::Configured(args),
         } => {
@@ -433,7 +463,7 @@ async fn execute_async_text(cli: Cli) -> Result<String, CliError> {
         Command::Run(_)
         | Command::Shrink { .. }
         | Command::Replay {
-            command: ReplayCommand::Configured(_),
+            command: ReplayCommand::Configured(_) | ReplayCommand::Minimized(_),
         } => Err(CliError::AsyncCommand),
         Command::Replay {
             command: ReplayCommand::ReferenceApp(args),
@@ -639,6 +669,8 @@ pub enum CliError {
     ConfiguredReplayOptions(#[from] ConfiguredReplayOptionsError),
     #[error("configured replay failed: {0}")]
     ConfiguredReplay(#[from] ConfiguredReplayError),
+    #[error("configured minimized replay failed: {0}")]
+    ConfiguredMinimizedReplay(#[from] ConfiguredMinimizedReplayError),
     #[error("configured shrink options are invalid: {0}")]
     ConfiguredShrinkOptions(#[from] ConfiguredShrinkOptionsError),
     #[error("configured shrink failed: {0}")]
@@ -669,6 +701,7 @@ impl CliError {
             Self::Baseline(error) if error.is_infrastructure_failure() => 3,
             Self::ConfiguredCampaign(error) => error.exit_code(),
             Self::ConfiguredReplay(error) => error.exit_code(),
+            Self::ConfiguredMinimizedReplay(error) => error.exit_code(),
             Self::ConfiguredShrink(error) => error.exit_code(),
             _ => 2,
         }

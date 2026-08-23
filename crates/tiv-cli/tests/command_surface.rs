@@ -3,8 +3,8 @@ use std::time::Duration;
 use clap::Parser;
 use tiv_cli::{
     BaselineArgs, Cli, Command, ConfiguredReplayArgs, ConfiguredShrinkArgs, DoctorArgs,
-    ReferenceAppCaseArgs, ReferenceAppEvidenceArgs, ReferenceAppReplayArgs, ReplayCommand, RunArgs,
-    ShrinkCommand, TraceCommand,
+    MinimizedReplayArgs, ReferenceAppCaseArgs, ReferenceAppEvidenceArgs, ReferenceAppReplayArgs,
+    ReplayCommand, RunArgs, ShrinkCommand, TraceCommand,
 };
 
 #[test]
@@ -191,6 +191,54 @@ fn the_cli_exposes_exactly_three_attempts_for_one_configured_artifact_case() {
             "7",
             "--attempts",
             "1",
+        ])
+        .is_err()
+    );
+}
+
+#[test]
+fn the_cli_replays_only_the_authority_bound_minimized_trace() {
+    let cli = Cli::try_parse_from([
+        "tiv",
+        "replay",
+        "minimized",
+        "--artifact",
+        ".tiv/runs/run_shrink",
+        "--config",
+        "safe/tiv.toml",
+    ])
+    .expect("the compatibility-gated minimized replay command parses");
+
+    assert_eq!(
+        cli.command,
+        Command::Replay {
+            command: ReplayCommand::Minimized(MinimizedReplayArgs {
+                artifact: ".tiv/runs/run_shrink".into(),
+                config: "safe/tiv.toml".into(),
+            }),
+        }
+    );
+    assert!(
+        Cli::try_parse_from([
+            "tiv",
+            "replay",
+            "minimized",
+            "--artifact",
+            ".tiv/runs/run_shrink",
+            "--case",
+            "1",
+        ])
+        .is_err()
+    );
+    assert!(
+        Cli::try_parse_from([
+            "tiv",
+            "replay",
+            "minimized",
+            "--artifact",
+            ".tiv/runs/run_shrink",
+            "--attempts",
+            "2",
         ])
         .is_err()
     );

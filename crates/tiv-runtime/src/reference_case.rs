@@ -335,10 +335,7 @@ pub(crate) async fn run_configured_shrink_candidate_with_process(
     sql_probe: Option<&mut dyn CaseSqlProbe>,
     quiescence_gate: &mut dyn CaseQuiescenceGate,
 ) -> Result<ReferenceShrinkCaseRunReceipt, ReferenceCaseRunError> {
-    candidate
-        .validate()
-        .map_err(|_| ReferenceCaseRunError::InvalidShrinkCandidate)?;
-    preflight_reference_actions(candidate.actions(), true, sql_probe.is_some())?;
+    preflight_reference_shrink_candidate(candidate, true, sql_probe.is_some())?;
     let client_response_cut_points = client_response_cut_point_actions(candidate.actions())?;
     let webhook_request_cut_points = webhook_request_cut_point_actions(candidate.actions())?;
     let webhook_response_cut_points = webhook_response_cut_point_actions(candidate.actions())?;
@@ -417,6 +414,21 @@ pub(crate) fn preflight_reference_planned_case(
         .map_err(ReferenceCaseRunError::InvalidPlan)?;
     preflight_reference_actions(
         planned_case.actions(),
+        process_control_available,
+        sql_probe_available,
+    )
+}
+
+pub(crate) fn preflight_reference_shrink_candidate(
+    candidate: &ShrinkCandidate,
+    process_control_available: bool,
+    sql_probe_available: bool,
+) -> Result<(), ReferenceCaseRunError> {
+    candidate
+        .validate()
+        .map_err(|_| ReferenceCaseRunError::InvalidShrinkCandidate)?;
+    preflight_reference_actions(
+        candidate.actions(),
         process_control_available,
         sql_probe_available,
     )
