@@ -1,5 +1,6 @@
 use std::{fs, os::unix::fs::PermissionsExt, path::Path, process::Command};
 
+use tiv_runtime::{artifacts::verify_complete_run_artifact, compatibility::RunCompatibilityV1};
 use tokio_postgres::NoTls;
 use uuid::Uuid;
 
@@ -48,6 +49,7 @@ async fn configured_run_executes_a_real_case_and_finalizes_private_evidence() {
 
     let artifact_path = Path::new(receipt["artifact_path"].as_str().unwrap());
     assert!(artifact_path.join("manifest.json").is_file());
+    assert!(artifact_path.join("compatibility.json").is_file());
     assert!(artifact_path.join("campaign-plan.json").is_file());
     assert!(artifact_path.join("cases/case_0001/trace.json").is_file());
     assert!(
@@ -70,6 +72,43 @@ async fn configured_run_executes_a_real_case_and_finalizes_private_evidence() {
     assert_ne!(
         summary["cases"][0]["before_database_oid"],
         summary["cases"][0]["after_database_oid"]
+    );
+    let compatibility_bytes = fs::read(artifact_path.join("compatibility.json")).unwrap();
+    let compatibility = RunCompatibilityV1::from_json(&compatibility_bytes)
+        .expect("the run persists a valid replay compatibility contract");
+    let verified = verify_complete_run_artifact(artifact_path)
+        .expect("the finalized artifact and every indexed digest verify");
+    assert_eq!(verified.run_id(), receipt["run_id"].as_str().unwrap());
+    assert_eq!(verified.compatibility(), &compatibility);
+    let compatibility_json: serde_json::Value =
+        serde_json::from_slice(&compatibility_bytes).unwrap();
+    assert_eq!(
+        compatibility_json["config_digest"]
+            .as_str()
+            .expect("the redacted config digest is recorded")
+            .len(),
+        64
+    );
+    assert_eq!(
+        compatibility_json["services"]
+            .as_array()
+            .expect("service images are recorded")
+            .len(),
+        3
+    );
+    assert!(
+        compatibility_json["services"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|service| {
+                service["image_id"]
+                    .as_str()
+                    .is_some_and(|image| image.starts_with("sha256:") && image.len() == 71)
+                    && service["compose_config_hash"]
+                        .as_str()
+                        .is_some_and(|digest| digest.len() == 64)
+            })
     );
     let artifact_bytes = read_artifact_tree(artifact_path);
     for secret in [

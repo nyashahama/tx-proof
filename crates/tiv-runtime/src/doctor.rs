@@ -1,6 +1,7 @@
 //! Non-mutating configuration and local Docker Compose safety preflight.
 
 use std::{
+    collections::BTreeMap,
     net::IpAddr,
     path::Path,
     process::{ExitStatus, Stdio},
@@ -47,10 +48,10 @@ impl CommandSpec {
     }
 }
 
-/// The two read-only Compose commands used by `doctor`.
+/// The three read-only Compose commands used by `doctor`.
 pub struct ComposeProbePlan {
     project_name: String,
-    commands: [CommandSpec; 2],
+    commands: [CommandSpec; 3],
 }
 
 impl ComposeProbePlan {
@@ -65,7 +66,30 @@ impl ComposeProbePlan {
 pub struct ComposeFacts {
     compose_version: String,
     services: Vec<String>,
+    service_config_hashes: BTreeMap<String, String>,
     resolved_redacted_hash: String,
+}
+
+impl ComposeFacts {
+    #[must_use]
+    pub fn compose_version(&self) -> &str {
+        &self.compose_version
+    }
+
+    #[must_use]
+    pub fn services(&self) -> &[String] {
+        &self.services
+    }
+
+    #[must_use]
+    pub fn service_config_hash(&self, service: &str) -> Option<&str> {
+        self.service_config_hashes.get(service).map(String::as_str)
+    }
+
+    #[must_use]
+    pub fn resolved_redacted_hash(&self) -> &str {
+        &self.resolved_redacted_hash
+    }
 }
 
 /// Machine-readable output of one non-mutating safety preflight.
@@ -115,12 +139,14 @@ pub fn compose_probe_plan(config: &ResolvedConfig) -> Result<ComposeProbePlan, D
     }
     let mut version_args = common.clone();
     version_args.extend(["version".to_owned(), "--short".to_owned()]);
-    let mut config_args = common;
+    let mut config_args = common.clone();
     config_args.extend([
         "config".to_owned(),
         "--format".to_owned(),
         "json".to_owned(),
     ]);
+    let mut hash_args = common;
+    hash_args.extend(["config".to_owned(), "--hash".to_owned(), "*".to_owned()]);
     Ok(ComposeProbePlan {
         project_name,
         commands: [
@@ -131,6 +157,10 @@ pub fn compose_probe_plan(config: &ResolvedConfig) -> Result<ComposeProbePlan, D
             CommandSpec {
                 program: "docker".to_owned(),
                 args: config_args,
+            },
+            CommandSpec {
+                program: "docker".to_owned(),
+                args: hash_args,
             },
         ],
     })
@@ -146,6 +176,7 @@ pub fn evaluate_compose_config(
     config: &ResolvedConfig,
     compose_version: &str,
     document: &str,
+    service_hash_document: &str,
 ) -> Result<ComposeFacts, DoctorError> {
     let version = compose_version.trim();
     if version.is_empty()
@@ -170,12 +201,15 @@ pub fn evaluate_compose_config(
             return Err(DoctorError::MissingComposeService(service.to_owned()));
         }
     }
-    let service_names = services.keys().cloned().collect::<Vec<_>>();
+    let mut service_names = services.keys().cloned().collect::<Vec<_>>();
+    service_names.sort();
+    let service_config_hashes = parse_service_config_hashes(service_hash_document, &service_names)?;
     scan_and_redact(&mut value, config.postgres_service())?;
     let canonical = serde_json::to_vec(&value).map_err(DoctorError::ComposeEncode)?;
     Ok(ComposeFacts {
         compose_version: version.to_owned(),
         services: service_names,
+        service_config_hashes,
         resolved_redacted_hash: blake3::hash(&canonical).to_hex().to_string(),
     })
 }
@@ -192,12 +226,8 @@ pub async fn run_doctor(
     environment: &impl EnvironmentLookup,
 ) -> Result<DoctorReport, DoctorError> {
     let config = load_resolved_config(config_path, environment)?;
+    let compose = collect_compose_facts(&config).await?;
     let plan = compose_probe_plan(&config)?;
-    let version = run_command(&plan.commands[0]).await?;
-    let resolved = run_command(&plan.commands[1]).await?;
-    let version = String::from_utf8(version.stdout).map_err(|_| DoctorError::NonUtf8Output)?;
-    let resolved = String::from_utf8(resolved.stdout).map_err(|_| DoctorError::NonUtf8Output)?;
-    let compose = evaluate_compose_config(&config, &version, &resolved)?;
     Ok(DoctorReport {
         schema_version: DOCTOR_SCHEMA_VERSION,
         status: "ready",
@@ -206,6 +236,55 @@ pub async fn run_doctor(
         config: config.into_redacted(),
         compose,
     })
+}
+
+/// Collects the secret-free resolved Compose compatibility boundary without
+/// loading configuration again or authorizing mutation.
+///
+/// # Errors
+///
+/// Returns [`DoctorError`] for local Docker, Compose, output-bound, or safety
+/// failures.
+pub(crate) async fn collect_compose_facts(
+    config: &ResolvedConfig,
+) -> Result<ComposeFacts, DoctorError> {
+    let plan = compose_probe_plan(config)?;
+    let version = run_command(&plan.commands[0]).await?;
+    let resolved = run_command(&plan.commands[1]).await?;
+    let service_hashes = run_command(&plan.commands[2]).await?;
+    let version = String::from_utf8(version.stdout).map_err(|_| DoctorError::NonUtf8Output)?;
+    let resolved = String::from_utf8(resolved.stdout).map_err(|_| DoctorError::NonUtf8Output)?;
+    let service_hashes =
+        String::from_utf8(service_hashes.stdout).map_err(|_| DoctorError::NonUtf8Output)?;
+    evaluate_compose_config(config, &version, &resolved, &service_hashes)
+}
+
+fn parse_service_config_hashes(
+    document: &str,
+    expected_services: &[String],
+) -> Result<BTreeMap<String, String>, DoctorError> {
+    let mut hashes = BTreeMap::new();
+    for line in document.lines() {
+        let mut fields = line.split_whitespace();
+        let (Some(service), Some(digest), None) = (fields.next(), fields.next(), fields.next())
+        else {
+            return Err(DoctorError::InvalidServiceConfigHashes);
+        };
+        if digest.len() != 64
+            || !digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            || hashes
+                .insert(service.to_owned(), digest.to_owned())
+                .is_some()
+        {
+            return Err(DoctorError::InvalidServiceConfigHashes);
+        }
+    }
+    if hashes.keys().ne(expected_services.iter()) {
+        return Err(DoctorError::InvalidServiceConfigHashes);
+    }
+    Ok(hashes)
 }
 
 fn scan_and_redact(value: &mut Value, postgres_service: &str) -> Result<(), DoctorError> {
@@ -410,6 +489,8 @@ pub enum DoctorError {
     ComposeJson(serde_json::Error),
     #[error("the resolved Compose document did not contain services")]
     InvalidComposeDocument,
+    #[error("the resolved Compose service config hashes were invalid")]
+    InvalidServiceConfigHashes,
     #[error("the resolved Compose graph is missing service {0}")]
     MissingComposeService(String),
     #[error("the resolved Compose graph contains live Stripe material")]
@@ -437,6 +518,7 @@ impl DoctorError {
                 | Self::InvalidComposeVersion
                 | Self::ComposeJson(_)
                 | Self::ComposeEncode(_)
+                | Self::InvalidServiceConfigHashes
         )
     }
 }

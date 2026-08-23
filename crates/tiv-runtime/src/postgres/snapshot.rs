@@ -108,7 +108,7 @@ impl InvariantQuery {
         self.id.as_str()
     }
 
-    fn sql(&self) -> &str {
+    pub(crate) fn sql(&self) -> &str {
         &self.sql
     }
 }
@@ -364,6 +364,10 @@ impl InvariantSuite {
     #[must_use]
     pub fn ids(&self) -> [&str; 5] {
         std::array::from_fn(|index| self.queries[index].id())
+    }
+
+    pub(crate) const fn queries(&self) -> &[InvariantQuery; 5] {
+        &self.queries
     }
 }
 

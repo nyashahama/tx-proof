@@ -12,7 +12,7 @@ fn compose_probe_is_exact_local_argv_and_contains_no_mutating_command() {
     let plan = compose_probe_plan(&config).expect("the Compose probe plan is valid");
     let commands = plan.commands();
 
-    assert_eq!(commands.len(), 2);
+    assert_eq!(commands.len(), 3);
     assert!(commands.iter().all(|command| command.program() == "docker"));
     assert!(commands.iter().all(|command| {
         command.args().starts_with(&[
@@ -25,6 +25,11 @@ fn compose_probe_is_exact_local_argv_and_contains_no_mutating_command() {
         command
             .args()
             .ends_with(&["version".to_owned(), "--short".to_owned()])
+    }));
+    assert!(commands.iter().any(|command| {
+        command
+            .args()
+            .ends_with(&["config".to_owned(), "--hash".to_owned(), "*".to_owned()])
     }));
     assert!(commands.iter().any(|command| {
         command.args().ends_with(&[
@@ -54,8 +59,21 @@ fn compose_evaluation_requires_mapped_services_and_rejects_live_material() {
         "stripe-fixture": {"image": "stripe-fixture"}
       }
     }"#;
-    let facts = evaluate_compose_config(&config, "5.4.0", safe)
+    let service_hashes = concat!(
+        "postgres aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
+        "reference-app bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n",
+        "stripe-fixture cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\n",
+    );
+    let facts = evaluate_compose_config(&config, "5.4.0", safe, service_hashes)
         .expect("the mapped disposable Compose graph is accepted");
+    assert_eq!(
+        facts.services(),
+        ["postgres", "reference-app", "stripe-fixture"]
+    );
+    assert_eq!(
+        facts.service_config_hash("reference-app"),
+        Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+    );
     let encoded = serde_json::to_string(&facts).expect("the facts serialize");
     assert!(encoded.contains("reference-app"));
     assert!(encoded.contains("postgres"));
@@ -65,6 +83,7 @@ fn compose_evaluation_requires_mapped_services_and_rejects_live_material() {
         &config,
         "5.4.0",
         &safe.replace("first-canary", "second-canary"),
+        service_hashes,
     )
     .expect("all Compose environment values are redacted before hashing");
     assert_eq!(
@@ -76,7 +95,8 @@ fn compose_evaluation_requires_mapped_services_and_rejects_live_material() {
         evaluate_compose_config(
             &config,
             "5.4.0",
-            &safe.replace("reference-app", "missing-app")
+            &safe.replace("reference-app", "missing-app"),
+            service_hashes,
         ),
         Err(DoctorError::MissingComposeService(_))
     ));
@@ -87,7 +107,8 @@ fn compose_evaluation_requires_mapped_services_and_rejects_live_material() {
             &safe.replace(
                 "\"stripe-fixture\": {\"image\": \"stripe-fixture\"}",
                 "\"missing-stripe\": {\"image\": \"stripe-fixture\"}"
-            )
+            ),
+            service_hashes,
         ),
         Err(DoctorError::MissingComposeService(_))
     ));
@@ -95,7 +116,8 @@ fn compose_evaluation_requires_mapped_services_and_rejects_live_material() {
         evaluate_compose_config(
             &config,
             "5.4.0",
-            &safe.replace("canary@postgres", "sk_live_secret@postgres")
+            &safe.replace("canary@postgres", "sk_live_secret@postgres"),
+            service_hashes,
         ),
         Err(DoctorError::LiveStripeMaterial)
     ));
@@ -103,9 +125,21 @@ fn compose_evaluation_requires_mapped_services_and_rejects_live_material() {
         evaluate_compose_config(
             &config,
             "5.4.0",
-            &safe.replace("canary@postgres", "canary@db.example.com")
+            &safe.replace("canary@postgres", "canary@db.example.com"),
+            service_hashes,
         ),
         Err(DoctorError::PublicDatabaseTarget)
+    ));
+    assert!(matches!(
+        evaluate_compose_config(
+            &config,
+            "5.4.0",
+            safe,
+            service_hashes
+                .replace("reference-app ", "other-service ")
+                .as_str(),
+        ),
+        Err(DoctorError::InvalidServiceConfigHashes)
     ));
 }
 

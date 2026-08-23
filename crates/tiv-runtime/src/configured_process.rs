@@ -12,6 +12,7 @@ use tokio::{
 
 use crate::{
     config::ResolvedConfig,
+    doctor::ComposeFacts,
     reference_case::{
         ReferenceProcessControl, ReferenceProcessControlError, ReferenceProcessControlFuture,
     },
@@ -23,6 +24,99 @@ const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_OUTPUT_BYTES: u64 = 1024 * 1024;
 const HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// One exact running Compose service and its immutable local image content ID.
+pub(crate) struct ConfiguredServiceImage {
+    service: String,
+    compose_config_hash: String,
+    image_id: String,
+}
+
+impl ConfiguredServiceImage {
+    pub(crate) fn service(&self) -> &str {
+        &self.service
+    }
+
+    pub(crate) fn image_id(&self) -> &str {
+        &self.image_id
+    }
+
+    pub(crate) fn compose_config_hash(&self) -> &str {
+        &self.compose_config_hash
+    }
+}
+
+/// Attests every configured execution service against the local Compose
+/// project and records its immutable Docker image content ID.
+pub(crate) async fn attest_configured_service_images(
+    config: &ResolvedConfig,
+    compose: &ComposeFacts,
+) -> Result<Vec<ConfiguredServiceImage>, ConfiguredProcessError> {
+    let mut services = std::iter::once(config.application_service())
+        .chain(std::iter::once(config.postgres_service()))
+        .chain(std::iter::once(config.stripe_service()))
+        .chain(config.worker_services().iter().map(String::as_str))
+        .collect::<Vec<_>>();
+    services.sort_unstable();
+    services.dedup();
+
+    let mut images = Vec::with_capacity(services.len());
+    for service in services {
+        let config_hash = compose
+            .service_config_hash(service)
+            .ok_or(ConfiguredProcessError::ContainerMismatch)?;
+        images.push(attest_service_image(config.compose_project(), service, config_hash).await?);
+    }
+    Ok(images)
+}
+
+async fn attest_service_image(
+    compose_project: &str,
+    service: &str,
+    expected_config_hash: &str,
+) -> Result<ConfiguredServiceImage, ConfiguredProcessError> {
+    let project_filter = format!("label=com.docker.compose.project={compose_project}");
+    let service_filter = format!("label=com.docker.compose.service={service}");
+    let output = docker_output(&[
+        "ps",
+        "--filter",
+        &project_filter,
+        "--filter",
+        &service_filter,
+        "--format",
+        "{{.ID}}",
+    ])
+    .await?;
+    let ids = output.lines().collect::<Vec<_>>();
+    let [container_id] = ids.as_slice() else {
+        return Err(ConfiguredProcessError::ContainerMismatch);
+    };
+    validate_container_id(container_id)?;
+    let inspection = docker_output(&[
+        "inspect",
+        "--format",
+        concat!(
+            "{{.State.Running}}\n",
+            "{{index .Config.Labels \"com.docker.compose.project\"}}\n",
+            "{{index .Config.Labels \"com.docker.compose.service\"}}\n",
+            "{{index .Config.Labels \"com.docker.compose.config-hash\"}}\n",
+            "{{.Image}}"
+        ),
+        container_id,
+    ])
+    .await?;
+    let image_id = validate_service_image_inspection(
+        &inspection,
+        compose_project,
+        service,
+        expected_config_hash,
+    )?;
+    Ok(ConfiguredServiceImage {
+        service: service.to_owned(),
+        compose_config_hash: expected_config_hash.to_owned(),
+        image_id,
+    })
+}
 
 /// Exact configured application-container authority for process-fault actions.
 pub(crate) struct ConfiguredProcessControl {
@@ -315,6 +409,37 @@ fn validate_recovery_inspection(
     Ok(running)
 }
 
+fn validate_service_image_inspection(
+    inspection: &str,
+    compose_project: &str,
+    service: &str,
+    expected_config_hash: &str,
+) -> Result<String, ConfiguredProcessError> {
+    let mut lines = inspection.lines();
+    if lines.next() != Some("true")
+        || lines.next() != Some(compose_project)
+        || lines.next() != Some(service)
+        || lines.next() != Some(expected_config_hash)
+    {
+        return Err(ConfiguredProcessError::ContainerMismatch);
+    }
+    let image_id = lines
+        .next()
+        .ok_or(ConfiguredProcessError::ContainerMismatch)?;
+    let digest = image_id
+        .strip_prefix("sha256:")
+        .ok_or(ConfiguredProcessError::ContainerMismatch)?;
+    if digest.len() != 64
+        || !digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        || lines.next().is_some()
+    {
+        return Err(ConfiguredProcessError::ContainerMismatch);
+    }
+    Ok(image_id.to_owned())
+}
+
 async fn docker_output(args: &[&str]) -> Result<String, ConfiguredProcessError> {
     let mut command = Command::new("docker");
     command
@@ -397,7 +522,7 @@ async fn finish_readers(
 
 #[derive(Debug, Error)]
 pub(crate) enum ConfiguredProcessError {
-    #[error("configured application container does not match the local Compose boundary")]
+    #[error("configured container does not match the local Compose boundary")]
     ContainerMismatch,
     #[error("configured application Docker inspection failed")]
     Docker,
@@ -418,6 +543,14 @@ mod tests {
         "reference-app\n",
         r#"{"18080/tcp":[{"HostIp":"127.0.0.1","HostPort":"18080"}]}"#,
         "\n",
+    );
+
+    const VALID_SERVICE_IMAGE_INSPECTION: &str = concat!(
+        "true\n",
+        "tiv-reference-app-spike\n",
+        "reference-app\n",
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n",
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
     );
 
     #[test]
@@ -461,5 +594,44 @@ mod tests {
         assert!(state.is_required());
         state.mark_recovered();
         assert!(!state.is_required());
+    }
+
+    #[test]
+    fn configured_service_image_attestation_binds_state_labels_and_content_id() {
+        assert_eq!(
+            validate_service_image_inspection(
+                VALID_SERVICE_IMAGE_INSPECTION,
+                "tiv-reference-app-spike",
+                "reference-app",
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            )
+            .unwrap(),
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+
+        for invalid in [
+            VALID_SERVICE_IMAGE_INSPECTION.replace("true\n", "false\n"),
+            VALID_SERVICE_IMAGE_INSPECTION.replace("tiv-reference-app-spike", "other-project"),
+            VALID_SERVICE_IMAGE_INSPECTION.replace("reference-app\n", "other-service\n"),
+            VALID_SERVICE_IMAGE_INSPECTION.replace(
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            ),
+            VALID_SERVICE_IMAGE_INSPECTION.replace("sha256:", "sha512:"),
+            VALID_SERVICE_IMAGE_INSPECTION.replace(
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "latest",
+            ),
+        ] {
+            assert!(
+                validate_service_image_inspection(
+                    &invalid,
+                    "tiv-reference-app-spike",
+                    "reference-app",
+                    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                )
+                .is_err()
+            );
+        }
     }
 }

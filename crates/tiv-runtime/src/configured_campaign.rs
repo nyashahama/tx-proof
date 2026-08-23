@@ -16,9 +16,13 @@ use tiv_core::{
 use crate::{
     artifacts::{ArtifactError, PartialRunClass, RunArtifactStaging},
     baseline::{BaselineError, ConfiguredBaselineSession},
+    compatibility::{CompatibilityCaptureError, capture_run_compatibility},
     config::{ConfigError, EnvironmentLookup, ResolvedConfig, load_resolved_config},
     configured_database::ConfiguredDatabaseError,
-    configured_process::{ConfiguredProcessControl, ConfiguredProcessError},
+    configured_process::{
+        ConfiguredProcessControl, ConfiguredProcessError, attest_configured_service_images,
+    },
+    doctor::{DoctorError, collect_compose_facts},
     postgres::{
         probe::{ConfiguredSqlProbe, ConfiguredSqlProbeError, load_configured_sql_probe},
         quiescence::{ConfiguredQuiescence, ConfiguredQuiescenceError, load_configured_quiescence},
@@ -298,8 +302,20 @@ async fn execute_staged_campaign(
         return Err(ConfiguredCampaignError::Interrupted { case_id: None });
     }
 
+    let compose = collect_compose_facts(config).await?;
     let mut baseline = ConfiguredBaselineSession::attest(config).await?;
     ConfiguredProcessControl::attest(config).await?;
+    let service_images = attest_configured_service_images(config, &compose).await?;
+    let compatibility = capture_run_compatibility(
+        config,
+        &compose,
+        baseline.baseline_identity(),
+        &service_images,
+        configured_probe,
+        configured_quiescence,
+        configured_snapshot,
+    )?;
+    artifacts.write_json("compatibility.json", &compatibility)?;
     let case_database_name = DatabaseName::parse(config.case_database())
         .map_err(|_| ConfiguredCampaignError::CaseDatabaseName)?;
     let provider_proxy_url = driver_origin(config.driver_url())?;
@@ -647,6 +663,10 @@ pub enum ConfiguredCampaignError {
     Quiescence(#[from] ConfiguredQuiescenceError),
     #[error("configured invariant suite could not be prepared: {0}")]
     Snapshot(#[from] ConfiguredSnapshotError),
+    #[error("configured Compose compatibility preflight failed: {0}")]
+    Compose(#[from] DoctorError),
+    #[error("configured replay compatibility capture failed: {0}")]
+    Compatibility(#[from] CompatibilityCaptureError),
     #[error("configured case preflight failed: {0}")]
     CasePreflight(#[from] ReferenceCaseRunError),
     #[error("configured run artifact failed: {0}")]
@@ -713,6 +733,12 @@ impl ConfiguredCampaignError {
             | Self::CaseDatabaseName
             | Self::DriverOrigin
             | Self::CaseConfig(_) => ConfiguredCampaignFailureClass::Configuration,
+            Self::Compose(error) if !error.is_infrastructure_failure() => {
+                ConfiguredCampaignFailureClass::Configuration
+            }
+            Self::Compatibility(error) if !error.is_infrastructure_failure() => {
+                ConfiguredCampaignFailureClass::Configuration
+            }
             Self::Baseline(error) if !error.is_infrastructure_failure() => {
                 ConfiguredCampaignFailureClass::Configuration
             }
@@ -727,6 +753,8 @@ impl ConfiguredCampaignError {
             | Self::RunFailed { cause, .. }
             | Self::PartialFinalization { cause, .. } => cause.failure_class(),
             Self::Artifact(_)
+            | Self::Compose(_)
+            | Self::Compatibility(_)
             | Self::Baseline(_)
             | Self::Process(_)
             | Self::ProjectLock(_)
@@ -754,6 +782,8 @@ impl ConfiguredCampaignError {
             Self::SqlProbe(_) => "invalid_sql_probe",
             Self::Quiescence(_) => "invalid_quiescence",
             Self::Snapshot(_) => "invalid_snapshot",
+            Self::Compose(_) => "compose_preflight",
+            Self::Compatibility(_) => "compatibility_capture",
             Self::CasePreflight(_) => "case_preflight",
             Self::Artifact(_) => "artifact_failure",
             Self::Baseline(_) => "baseline_failure",
@@ -820,6 +850,8 @@ mod tests {
         ConfiguredCampaignOptionsError,
     };
     use crate::{
+        compatibility::{CompatibilityCaptureError, CompatibilityError},
+        doctor::DoctorError,
         postgres::quiescence::QuiescenceError,
         reference_case::{
             ReferenceCaseError, ReferenceCaseRunError, preflight_reference_planned_case,
@@ -848,6 +880,10 @@ mod tests {
         let interrupted = ConfiguredCampaignError::Interrupted {
             case_id: Some("case_0001".to_owned()),
         };
+        let incompatible = ConfiguredCampaignError::Compatibility(
+            CompatibilityCaptureError::Contract(CompatibilityError::InvalidDocument),
+        );
+        let compose_unavailable = ConfiguredCampaignError::Compose(DoctorError::DockerUnavailable);
 
         assert_eq!(
             configuration.failure_class(),
@@ -857,6 +893,11 @@ mod tests {
         assert_eq!(inconclusive.exit_code(), 4);
         assert_eq!(interrupted.exit_code(), 130);
         assert_eq!(inconclusive.failure_code(), "case_timeout");
+        assert_eq!(
+            incompatible.failure_class(),
+            ConfiguredCampaignFailureClass::Configuration
+        );
+        assert_eq!(compose_unavailable.exit_code(), 3);
     }
 
     #[test]

@@ -1,6 +1,7 @@
 //! Private, collision-safe configured campaign run artifacts.
 
 use std::{
+    collections::BTreeMap,
     fmt::Write as _,
     fs::{self, DirBuilder, File, OpenOptions},
     io::{Read, Write},
@@ -8,13 +9,20 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+use crate::compatibility::{CompatibilityError, RunCompatibilityV1};
 
 const DIRECTORY_MODE: u32 = 0o700;
 const FILE_MODE: u32 = 0o600;
+const MAX_ARTIFACT_COUNT: usize = 2_048;
+const MAX_RUN_BYTES: u64 = 25 * 1024 * 1024;
+const COMPATIBILITY_FILE: &str = "compatibility.json";
+const CHECKSUMS_FILE: &str = "checksums.txt";
+const MANIFEST_FILE: &str = "manifest.json";
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum PartialRunClass {
     Configuration,
@@ -147,19 +155,31 @@ impl RunArtifactStaging {
         let files = collect_regular_files(&self.staging)?;
         if files
             .iter()
-            .any(|path| matches!(path.as_str(), "checksums.txt" | "manifest.json"))
+            .any(|path| matches!(path.as_str(), CHECKSUMS_FILE | MANIFEST_FILE))
         {
             return Err(ArtifactError::ReservedArtifact);
         }
+        if complete && !files.iter().any(|path| path == COMPATIBILITY_FILE) {
+            return Err(ArtifactError::MissingRequiredArtifact(PathBuf::from(
+                COMPATIBILITY_FILE,
+            )));
+        }
+        if files.len().saturating_add(2) > MAX_ARTIFACT_COUNT {
+            return Err(ArtifactError::TooManyArtifacts);
+        }
+        enforce_artifact_budget(&self.staging, &files)?;
         let mut checksums = String::new();
+        let mut required_files = BTreeMap::new();
         for relative in &files {
             let digest = checksum_file(&self.staging.join(relative))?;
             writeln!(checksums, "{digest}  {relative}")
                 .map_err(|_| ArtifactError::ChecksumFormatting)?;
+            required_files.insert(relative.clone(), digest);
         }
-        self.write_bytes("checksums.txt", checksums.as_bytes())?;
+        let checksums_digest = checksum_bytes(checksums.as_bytes());
+        self.write_bytes(CHECKSUMS_FILE, checksums.as_bytes())?;
         self.write_json(
-            "manifest.json",
+            MANIFEST_FILE,
             &RunManifest {
                 schema_version: 1,
                 run_id: self.run_id.clone(),
@@ -170,11 +190,15 @@ impl RunArtifactStaging {
                     RunManifestStatus::Partial
                 },
                 failure_class,
-                failure_code,
-                checksums_file: "checksums.txt",
+                failure_code: failure_code.map(str::to_owned),
+                checksums_file: CHECKSUMS_FILE.to_owned(),
+                checksums_digest,
+                required_files,
                 artifact_count: files.len() + 2,
             },
         )?;
+        let finalized_files = collect_regular_files(&self.staging)?;
+        enforce_artifact_budget(&self.staging, &finalized_files)?;
         sync_directory(&self.staging)?;
         fs::rename(&self.staging, &self.final_path).map_err(|source| ArtifactError::Io {
             path: self.final_path.clone(),
@@ -185,15 +209,16 @@ impl RunArtifactStaging {
     }
 }
 
-#[derive(Clone, Copy, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum RunManifestStatus {
     Complete,
     Partial,
 }
 
-#[derive(Serialize)]
-struct RunManifest<'a> {
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RunManifest {
     schema_version: u16,
     run_id: String,
     complete: bool,
@@ -201,9 +226,166 @@ struct RunManifest<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     failure_class: Option<PartialRunClass>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    failure_code: Option<&'a str>,
-    checksums_file: &'static str,
+    failure_code: Option<String>,
+    checksums_file: String,
+    checksums_digest: String,
+    required_files: BTreeMap<String, String>,
     artifact_count: usize,
+}
+
+/// A complete, private run directory whose manifest and byte digests were
+/// verified without executing customer code.
+pub struct VerifiedRunArtifact {
+    root: PathBuf,
+    run_id: String,
+    compatibility: RunCompatibilityV1,
+}
+
+impl VerifiedRunArtifact {
+    #[must_use]
+    pub fn run_id(&self) -> &str {
+        &self.run_id
+    }
+
+    #[must_use]
+    pub fn compatibility_path(&self) -> PathBuf {
+        self.root.join(COMPATIBILITY_FILE)
+    }
+
+    #[must_use]
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    #[must_use]
+    pub const fn compatibility(&self) -> &RunCompatibilityV1 {
+        &self.compatibility
+    }
+}
+
+/// Verifies a finalized complete run without executing customer code or
+/// mutating the configured stack.
+///
+/// # Errors
+///
+/// Returns [`ArtifactError`] for unsafe paths or permissions, incomplete or
+/// malformed manifests, excessive evidence, missing files, or any digest/index
+/// mismatch.
+pub fn verify_complete_run_artifact(root: &Path) -> Result<VerifiedRunArtifact, ArtifactError> {
+    let root_metadata = fs::symlink_metadata(root).map_err(|source| ArtifactError::Io {
+        path: root.to_owned(),
+        source,
+    })?;
+    if root_metadata.file_type().is_symlink()
+        || !root_metadata.is_dir()
+        || root_metadata.permissions().mode() & 0o777 != DIRECTORY_MODE
+    {
+        return Err(ArtifactError::UnsafePath(root.to_owned()));
+    }
+    let files = collect_regular_files(root)?;
+    enforce_artifact_budget(root, &files)?;
+
+    for required in [MANIFEST_FILE, CHECKSUMS_FILE, COMPATIBILITY_FILE] {
+        if !files.iter().any(|path| path == required) {
+            return Err(ArtifactError::MissingRequiredArtifact(PathBuf::from(
+                required,
+            )));
+        }
+    }
+
+    let manifest_bytes =
+        fs::read(root.join(MANIFEST_FILE)).map_err(|source| ArtifactError::Io {
+            path: root.join(MANIFEST_FILE),
+            source,
+        })?;
+    let manifest: RunManifest =
+        serde_json::from_slice(&manifest_bytes).map_err(ArtifactError::Manifest)?;
+    let directory_run_id = root.file_name().and_then(|name| name.to_str());
+    if manifest.schema_version != 1
+        || !manifest.complete
+        || manifest.status != RunManifestStatus::Complete
+        || manifest.failure_class.is_some()
+        || manifest.failure_code.is_some()
+        || manifest.checksums_file != CHECKSUMS_FILE
+        || manifest.artifact_count != manifest.required_files.len() + 2
+        || directory_run_id != Some(manifest.run_id.as_str())
+        || validate_run_id(&manifest.run_id).is_err()
+        || !manifest.required_files.contains_key(COMPATIBILITY_FILE)
+    {
+        return Err(ArtifactError::InvalidManifest);
+    }
+    let mut expected_files = manifest
+        .required_files
+        .keys()
+        .cloned()
+        .chain([CHECKSUMS_FILE.to_owned(), MANIFEST_FILE.to_owned()])
+        .collect::<Vec<_>>();
+    expected_files.sort();
+    if expected_files != files {
+        return Err(ArtifactError::InvalidManifest);
+    }
+
+    let mut expected_checksums = String::new();
+    for (relative, expected_digest) in &manifest.required_files {
+        validate_relative(Path::new(relative))?;
+        if !valid_digest(expected_digest) {
+            return Err(ArtifactError::InvalidManifest);
+        }
+        let actual = checksum_file(&root.join(relative))?;
+        if actual != *expected_digest {
+            return Err(ArtifactError::DigestMismatch(PathBuf::from(relative)));
+        }
+        writeln!(expected_checksums, "{expected_digest}  {relative}")
+            .map_err(|_| ArtifactError::ChecksumFormatting)?;
+    }
+    if !valid_digest(&manifest.checksums_digest) {
+        return Err(ArtifactError::InvalidManifest);
+    }
+    let checksums = fs::read(root.join(CHECKSUMS_FILE)).map_err(|source| ArtifactError::Io {
+        path: root.join(CHECKSUMS_FILE),
+        source,
+    })?;
+    if checksum_bytes(&checksums) != manifest.checksums_digest {
+        return Err(ArtifactError::ChecksumsDigestMismatch);
+    }
+    if checksums != expected_checksums.as_bytes() {
+        return Err(ArtifactError::ChecksumIndexMismatch);
+    }
+    let compatibility = load_compatibility(root)?;
+
+    Ok(VerifiedRunArtifact {
+        root: root.to_owned(),
+        run_id: manifest.run_id,
+        compatibility,
+    })
+}
+
+fn enforce_artifact_budget(root: &Path, files: &[String]) -> Result<(), ArtifactError> {
+    if files.len() > MAX_ARTIFACT_COUNT {
+        return Err(ArtifactError::TooManyArtifacts);
+    }
+    let mut total_bytes = 0_u64;
+    for relative in files {
+        let size = fs::metadata(root.join(relative))
+            .map_err(|source| ArtifactError::Io {
+                path: root.join(relative),
+                source,
+            })?
+            .len();
+        total_bytes = total_bytes
+            .checked_add(size)
+            .ok_or(ArtifactError::ArtifactTooLarge)?;
+        if total_bytes > MAX_RUN_BYTES {
+            return Err(ArtifactError::ArtifactTooLarge);
+        }
+    }
+    Ok(())
+}
+
+fn load_compatibility(root: &Path) -> Result<RunCompatibilityV1, ArtifactError> {
+    let path = root.join(COMPATIBILITY_FILE);
+    let bytes = fs::read(&path).map_err(|source| ArtifactError::Io { path, source })?;
+    RunCompatibilityV1::from_json(bytes).map_err(ArtifactError::Compatibility)
 }
 
 fn validate_run_id(run_id: &str) -> Result<(), ArtifactError> {
@@ -223,6 +405,13 @@ fn valid_failure_code(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+}
+
+fn valid_digest(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn validate_relative(path: &Path) -> Result<&Path, ArtifactError> {
@@ -343,6 +532,10 @@ fn checksum_file(path: &Path) -> Result<String, ArtifactError> {
     Ok(hasher.finalize().to_hex().to_string())
 }
 
+fn checksum_bytes(bytes: &[u8]) -> String {
+    blake3::hash(bytes).to_hex().to_string()
+}
+
 fn set_mode(path: &Path, mode: u32) -> Result<(), ArtifactError> {
     fs::set_permissions(path, fs::Permissions::from_mode(mode)).map_err(|source| {
         ArtifactError::Io {
@@ -362,7 +555,7 @@ fn sync_directory(path: &Path) -> Result<(), ArtifactError> {
 }
 
 #[derive(Debug, Error)]
-pub(crate) enum ArtifactError {
+pub enum ArtifactError {
     #[error("artifact path is outside the private run boundary: {0}")]
     UnsafePath(PathBuf),
     #[error("artifact path already exists: {0}")]
@@ -375,6 +568,24 @@ pub(crate) enum ArtifactError {
     UnsafePermissions(PathBuf),
     #[error("manifest or checksum artifact was written before finalization")]
     ReservedArtifact,
+    #[error("complete artifact is missing required file {0}")]
+    MissingRequiredArtifact(PathBuf),
+    #[error("complete artifact manifest is invalid")]
+    InvalidManifest,
+    #[error("complete artifact manifest could not be decoded: {0}")]
+    Manifest(#[source] serde_json::Error),
+    #[error("complete artifact contains too many files")]
+    TooManyArtifacts,
+    #[error("complete artifact exceeds the v1 size budget")]
+    ArtifactTooLarge,
+    #[error("artifact digest does not match the manifest: {0}")]
+    DigestMismatch(PathBuf),
+    #[error("checksums.txt digest does not match the manifest")]
+    ChecksumsDigestMismatch,
+    #[error("checksums.txt does not exactly match the manifest file index")]
+    ChecksumIndexMismatch,
+    #[error("compatibility.json is outside the supported replay contract: {0}")]
+    Compatibility(#[source] CompatibilityError),
     #[error("artifact checksum index could not be formatted")]
     ChecksumFormatting,
     #[error("artifact JSON serialization failed: {0}")]
@@ -389,11 +600,16 @@ pub(crate) enum ArtifactError {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, os::unix::fs::PermissionsExt};
+    use std::{
+        fs::{self, OpenOptions},
+        os::unix::fs::{OpenOptionsExt, PermissionsExt},
+        path::Path,
+    };
 
+    use tiv_core::trace::{CASE_TRACE_SCHEMA_VERSION, TRACE_SCHEMA_VERSION};
     use uuid::Uuid;
 
-    use super::{PartialRunClass, RunArtifactStaging};
+    use super::{ArtifactError, PartialRunClass, RunArtifactStaging, verify_complete_run_artifact};
 
     #[test]
     fn finalized_run_is_private_checksummed_and_manifest_complete() {
@@ -403,6 +619,9 @@ mod tests {
         let mut staging = RunArtifactStaging::create(&root, &base, "run_deadbeef").unwrap();
         staging
             .write_json("summary.json", &serde_json::json!({"status": "held"}))
+            .unwrap();
+        staging
+            .write_json("compatibility.json", &compatibility_fixture())
             .unwrap();
 
         let final_path = staging.finalize().unwrap();
@@ -425,9 +644,138 @@ mod tests {
             serde_json::from_slice(&fs::read(final_path.join("manifest.json")).unwrap()).unwrap();
         assert_eq!(manifest["complete"], true);
         assert_eq!(manifest["run_id"], "run_deadbeef");
+        assert_eq!(
+            manifest["required_files"]["compatibility.json"]
+                .as_str()
+                .unwrap()
+                .len(),
+            64
+        );
+        assert_eq!(manifest["checksums_digest"].as_str().unwrap().len(), 64);
         let checksums = fs::read_to_string(final_path.join("checksums.txt")).unwrap();
         assert!(checksums.contains("  summary.json\n"));
         assert!(!checksums.contains("manifest.json"));
+        let verified = verify_complete_run_artifact(&final_path).unwrap();
+        assert_eq!(verified.run_id(), "run_deadbeef");
+        assert_eq!(
+            verified.compatibility_path(),
+            final_path.join("compatibility.json")
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn complete_finalization_requires_compatibility_evidence() {
+        let root = std::env::temp_dir().join(format!("tiv-artifact-{}", Uuid::new_v4()));
+        fs::create_dir(&root).unwrap();
+        let base = root.join(".tiv/runs");
+        let mut staging = RunArtifactStaging::create(&root, &base, "run_missing").unwrap();
+        staging
+            .write_json("summary.json", &serde_json::json!({"status": "held"}))
+            .unwrap();
+
+        let error = staging.finalize().unwrap_err();
+
+        assert!(matches!(
+            error,
+            ArtifactError::MissingRequiredArtifact(ref path)
+                if path == Path::new("compatibility.json")
+        ));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn complete_artifact_verification_detects_file_and_checksum_index_tampering() {
+        let root = std::env::temp_dir().join(format!("tiv-artifact-{}", Uuid::new_v4()));
+        fs::create_dir(&root).unwrap();
+        let base = root.join(".tiv/runs");
+        let mut staging = RunArtifactStaging::create(&root, &base, "run_tamper").unwrap();
+        staging
+            .write_json("summary.json", &serde_json::json!({"status": "held"}))
+            .unwrap();
+        staging
+            .write_json("compatibility.json", &compatibility_fixture())
+            .unwrap();
+        let final_path = staging.finalize().unwrap();
+
+        fs::write(
+            final_path.join("summary.json"),
+            b"{\"status\":\"changed\"}\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            verify_complete_run_artifact(&final_path),
+            Err(ArtifactError::DigestMismatch(ref path)) if path == Path::new("summary.json")
+        ));
+
+        fs::remove_dir_all(&root).unwrap();
+        fs::create_dir(&root).unwrap();
+        let base = root.join(".tiv/runs");
+        let mut staging = RunArtifactStaging::create(&root, &base, "run_index").unwrap();
+        staging
+            .write_json("summary.json", &serde_json::json!({"status": "held"}))
+            .unwrap();
+        staging
+            .write_json("compatibility.json", &compatibility_fixture())
+            .unwrap();
+        let final_path = staging.finalize().unwrap();
+        fs::write(final_path.join("checksums.txt"), b"tampered\n").unwrap();
+        assert!(matches!(
+            verify_complete_run_artifact(&final_path),
+            Err(ArtifactError::ChecksumsDigestMismatch)
+        ));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn complete_artifact_verification_rejects_a_malformed_compatibility_contract() {
+        let root = std::env::temp_dir().join(format!("tiv-artifact-{}", Uuid::new_v4()));
+        fs::create_dir(&root).unwrap();
+        let base = root.join(".tiv/runs");
+        let mut staging = RunArtifactStaging::create(&root, &base, "run_invalid").unwrap();
+        staging
+            .write_json("summary.json", &serde_json::json!({"status": "held"}))
+            .unwrap();
+        staging
+            .write_json(
+                "compatibility.json",
+                &serde_json::json!({"schema_version": 1, "fingerprint": "invalid"}),
+            )
+            .unwrap();
+        let final_path = staging.finalize().unwrap();
+
+        assert!(matches!(
+            verify_complete_run_artifact(&final_path),
+            Err(ArtifactError::Compatibility(_))
+        ));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn finalization_rejects_an_artifact_over_the_v1_size_bound() {
+        let root = std::env::temp_dir().join(format!("tiv-artifact-{}", Uuid::new_v4()));
+        fs::create_dir(&root).unwrap();
+        let base = root.join(".tiv/runs");
+        let mut staging = RunArtifactStaging::create(&root, &base, "run_oversized").unwrap();
+        staging
+            .write_json("compatibility.json", &compatibility_fixture())
+            .unwrap();
+        let oversized = staging.prepare_path("oversized.bin").unwrap();
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(oversized)
+            .unwrap();
+        file.set_len(super::MAX_RUN_BYTES + 1).unwrap();
+
+        assert!(matches!(
+            staging.finalize(),
+            Err(ArtifactError::ArtifactTooLarge)
+        ));
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -462,5 +810,46 @@ mod tests {
         assert!(!checksums.contains("manifest.json"));
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    fn compatibility_fixture() -> serde_json::Value {
+        serde_json::json!({
+            "schema_version": 1,
+            "tool": {
+                "package_version": "0.0.0",
+                "executable_digest": "a".repeat(64),
+                "trace_schema": TRACE_SCHEMA_VERSION,
+                "case_trace_schema": CASE_TRACE_SCHEMA_VERSION,
+                "fixture_control_protocol": 1
+            },
+            "platform_os": "linux",
+            "platform_arch": "x86_64",
+            "config_digest": "a".repeat(64),
+            "compose": {
+                "version": "5.4.0",
+                "services": ["postgres", "reference-app", "stripe-fixture"],
+                "resolved_redacted_hash": "a".repeat(64)
+            },
+            "sources": [{
+                "kind": "invariant",
+                "id": "provider-object-unique",
+                "digest": "a".repeat(64)
+            }],
+            "baseline": {
+                "server_fingerprint": "postgres-system-id:123456789",
+                "endpoint_port": 15432,
+                "database_name": "tiv_base_deadbeef",
+                "database_oid": 16384,
+                "owner_oid": 10,
+                "marker_uuid": "00000000-0000-4000-8000-000000000001",
+                "compose_project": "tiv-reference-app-spike",
+                "application_role": "tiv_app"
+            },
+            "services": [{
+                "service": "reference-app",
+                "compose_config_hash": "a".repeat(64),
+                "image_id": format!("sha256:{}", "a".repeat(64))
+            }]
+        })
     }
 }
