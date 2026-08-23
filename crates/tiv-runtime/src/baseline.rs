@@ -1,7 +1,7 @@
 //! Attested, acknowledgement-bound customer baseline sealing and reset proof.
 
 use std::{
-    path::Path,
+    path::{Path, PathBuf},
     process::{ExitStatus, Stdio},
     time::Duration,
 };
@@ -24,7 +24,7 @@ use crate::{
     postgres::safety::{
         DatabaseEndpoint, DatabaseIdentity, DatabaseMarker, DatabaseName, DatabaseTarget,
         InvalidDatabaseIdentity, InvalidDatabaseName, MarkerKind, MutationPermit,
-        ResetAcknowledgementError, ResetChallenge, Verified,
+        ResetAcknowledgementError, ResetChallenge, SafetyError, Unverified, Verified,
     },
 };
 
@@ -75,6 +75,145 @@ pub struct BaselineReport {
     reset_proof: ResetProofReport,
 }
 
+/// A freshly attested sealed baseline and its current disposable case.
+///
+/// The session deliberately implements neither `Debug` nor `Serialize`: it
+/// retains the secret-bearing connection and exact Compose boundary required
+/// to re-attest and reset one case at a time.
+pub struct ConfiguredBaselineSession {
+    inputs: BaselineInputs,
+    postgres_container_id: String,
+    baseline_identity: DatabaseIdentity,
+    case_target: DatabaseTarget<Unverified>,
+}
+
+impl ConfiguredBaselineSession {
+    /// Re-attests the configured local `PostgreSQL` container, current case
+    /// identity, and immutable sealed-baseline catalog marker without mutation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BaselineError`] unless the complete case and baseline
+    /// identities belong to the same configured disposable boundary.
+    pub async fn attest(config: &ResolvedConfig) -> Result<Self, BaselineError> {
+        let inputs = BaselineInputs::from_config(config)?;
+        let stack = attest_postgres_container(&inputs).await?;
+        let case_identity = observe_case_identity(&inputs).await?;
+        let baseline_identity = observe_sealed_baseline_identity(&inputs).await?;
+        require_compatible_baseline(&case_identity, &baseline_identity)?;
+        Ok(Self {
+            inputs,
+            postgres_container_id: stack.container_id,
+            baseline_identity,
+            case_target: DatabaseTarget::new(case_identity),
+        })
+    }
+
+    #[must_use]
+    pub const fn case_identity(&self) -> &DatabaseIdentity {
+        self.case_target.identity()
+    }
+
+    #[must_use]
+    pub const fn baseline_identity(&self) -> &DatabaseIdentity {
+        &self.baseline_identity
+    }
+
+    /// Stops configured database clients, re-attests both identities, consumes
+    /// one process-local mutation permit, recreates the case from the sealed
+    /// baseline, reapplies database privileges and restores the services.
+    ///
+    /// Consuming `self` prevents a stale pre-reset identity from authorizing a
+    /// second mutation. A successful call returns the freshly attested session.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BaselineError`] for any safety, lifecycle, reset, recovery, or
+    /// post-reset identity failure.
+    pub async fn reset_case(self) -> Result<(Self, ConfiguredCaseResetReport), BaselineError> {
+        let Self {
+            inputs,
+            postgres_container_id,
+            baseline_identity,
+            case_target,
+        } = self;
+        if let Err(stop_error) = stop_customer_services(&inputs).await {
+            return match start_customer_services(&inputs).await {
+                Ok(()) => Err(stop_error),
+                Err(_) => Err(BaselineError::CustomerServicesRecoveryFailed),
+            };
+        }
+        let execution = async {
+            let fresh_stack = attest_postgres_container(&inputs).await?;
+            if fresh_stack.container_id != postgres_container_id {
+                return Err(BaselineError::PostgresContainerChanged);
+            }
+            let fresh_case = observe_case_identity(&inputs).await?;
+            let (verified, permit) = case_target
+                .verify(&fresh_case)
+                .map_err(BaselineError::Safety)?;
+            let fresh_baseline = observe_sealed_baseline_identity(&inputs).await?;
+            if fresh_baseline != baseline_identity {
+                return Err(BaselineError::BaselineIdentityMismatch);
+            }
+            require_compatible_baseline(verified.identity(), &fresh_baseline)?;
+            reset_verified_case(&inputs, verified, permit, &fresh_baseline).await
+        }
+        .await;
+        let restart = start_customer_services(&inputs).await;
+        match (execution, restart) {
+            (Ok((case_identity, report)), Ok(())) => {
+                let final_stack = attest_postgres_container(&inputs).await?;
+                if final_stack.container_id != postgres_container_id {
+                    return Err(BaselineError::PostgresContainerChanged);
+                }
+                Ok((
+                    Self {
+                        inputs,
+                        postgres_container_id,
+                        baseline_identity,
+                        case_target: DatabaseTarget::new(case_identity),
+                    },
+                    report,
+                ))
+            }
+            (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
+            (Err(_), Err(_)) => Err(BaselineError::CustomerServicesRecoveryFailed),
+        }
+    }
+}
+
+/// Allowlisted identity delta proving one configured case was freshly cloned.
+#[derive(Serialize)]
+pub struct ConfiguredCaseResetReport {
+    before_database_oid: u32,
+    after_database_oid: u32,
+    before_marker_uuid: String,
+    after_marker_uuid: String,
+}
+
+impl ConfiguredCaseResetReport {
+    #[must_use]
+    pub const fn before_database_oid(&self) -> u32 {
+        self.before_database_oid
+    }
+
+    #[must_use]
+    pub const fn after_database_oid(&self) -> u32 {
+        self.after_database_oid
+    }
+
+    #[must_use]
+    pub fn before_marker_uuid(&self) -> &str {
+        &self.before_marker_uuid
+    }
+
+    #[must_use]
+    pub fn after_marker_uuid(&self) -> &str {
+        &self.after_marker_uuid
+    }
+}
+
 #[derive(Serialize)]
 struct BaselineDatabaseReport {
     name: String,
@@ -113,7 +252,7 @@ pub async fn run_configured_baseline(
 ) -> Result<BaselineOutput, BaselineError> {
     let config = load_resolved_config(path, environment)?;
     let inputs = BaselineInputs::from_config(&config)?;
-    let initial_stack = attest_postgres_container(&config, inputs.port).await?;
+    let initial_stack = attest_postgres_container(&inputs).await?;
     let initial_identity = observe_case_identity(&inputs).await?;
     require_baseline_absent(&inputs).await?;
     let challenge = ResetChallenge::new(initial_identity.clone())?;
@@ -130,16 +269,16 @@ pub async fn run_configured_baseline(
     };
 
     let authorization = challenge.acknowledge(acknowledgement)?;
-    if let Err(stop_error) = stop_customer_services(&config).await {
+    if let Err(stop_error) = stop_customer_services(&inputs).await {
         // Compose can stop a subset before returning an error. Make one
         // bounded recovery attempt rather than leaving that partial state.
-        return match start_customer_services(&config).await {
+        return match start_customer_services(&inputs).await {
             Ok(()) => Err(stop_error),
             Err(_) => Err(BaselineError::CustomerServicesRecoveryFailed),
         };
     }
     let execution = async {
-        let fresh_stack = attest_postgres_container(&config, inputs.port).await?;
+        let fresh_stack = attest_postgres_container(&inputs).await?;
         if fresh_stack.container_id != initial_stack.container_id {
             return Err(BaselineError::PostgresContainerChanged);
         }
@@ -149,10 +288,10 @@ pub async fn run_configured_baseline(
         seal_and_reset_prove(&inputs, verified, permit).await
     }
     .await;
-    let restart = start_customer_services(&config).await;
+    let restart = start_customer_services(&inputs).await;
     match (execution, restart) {
         (Ok(report), Ok(())) => {
-            let final_stack = attest_postgres_container(&config, inputs.port).await?;
+            let final_stack = attest_postgres_container(&inputs).await?;
             if final_stack.container_id != initial_stack.container_id {
                 return Err(BaselineError::PostgresContainerChanged);
             }
@@ -170,6 +309,12 @@ struct BaselineInputs {
     admin_role: String,
     application_role: String,
     compose_project: String,
+    root: PathBuf,
+    compose_files: Vec<PathBuf>,
+    application_service: String,
+    postgres_service: String,
+    worker_services: Vec<String>,
+    invariant_role: String,
     port: u16,
     max_database_bytes: u64,
 }
@@ -205,6 +350,12 @@ impl BaselineInputs {
             admin_role: config.admin_url().username().to_owned(),
             application_role: case_url.username().to_owned(),
             compose_project: config.compose_project().to_owned(),
+            root: config.root().to_owned(),
+            compose_files: config.compose_files().to_vec(),
+            application_service: config.application_service().to_owned(),
+            postgres_service: config.postgres_service().to_owned(),
+            worker_services: config.worker_services().to_vec(),
+            invariant_role: config.invariant_role().to_owned(),
             port: admin_port,
             max_database_bytes: config.max_database_bytes(),
         })
@@ -239,16 +390,15 @@ struct PostgresContainerAttestation {
 }
 
 async fn attest_postgres_container(
-    config: &ResolvedConfig,
-    host_port: u16,
+    inputs: &BaselineInputs,
 ) -> Result<PostgresContainerAttestation, BaselineError> {
     let project_filter = format!(
         "label=com.docker.compose.project={}",
-        config.compose_project()
+        inputs.compose_project
     );
     let service_filter = format!(
         "label=com.docker.compose.service={}",
-        config.postgres_service()
+        inputs.postgres_service
     );
     let ids = docker_output(&[
         "ps",
@@ -284,7 +434,7 @@ async fn attest_postgres_container(
         container_id,
     ])
     .await?;
-    validate_postgres_inspection(&inspection, config, host_port)?;
+    validate_postgres_inspection(&inspection, inputs)?;
     Ok(PostgresContainerAttestation {
         container_id: (*container_id).to_owned(),
     })
@@ -292,14 +442,13 @@ async fn attest_postgres_container(
 
 fn validate_postgres_inspection(
     inspection: &str,
-    config: &ResolvedConfig,
-    host_port: u16,
+    inputs: &BaselineInputs,
 ) -> Result<(), BaselineError> {
     let mut lines = inspection.lines();
     if lines.next() != Some("true")
         || lines.next() != Some("healthy")
-        || lines.next() != Some(config.compose_project())
-        || lines.next() != Some(config.postgres_service())
+        || lines.next() != Some(inputs.compose_project.as_str())
+        || lines.next() != Some(inputs.postgres_service.as_str())
     {
         return Err(BaselineError::PostgresContainerMismatch);
     }
@@ -324,7 +473,7 @@ fn validate_postgres_inspection(
             .get("HostPort")
             .and_then(Value::as_str)
             .and_then(|port| port.parse::<u16>().ok())
-            != Some(host_port)
+            != Some(inputs.port)
     {
         return Err(BaselineError::PostgresContainerMismatch);
     }
@@ -611,8 +760,14 @@ async fn seal_and_reset_prove(
     {
         return Err(BaselineError::ResetProofFailed);
     }
-    let (baseline_oid, sealed) = observe_sealed_baseline(inputs, &catalog_marker).await?;
-    if !sealed {
+    let baseline_identity = observe_sealed_baseline_identity(inputs).await?;
+    if baseline_identity.marker().marker_uuid() != baseline_marker_uuid
+        || baseline_identity.server_fingerprint() != after.server_fingerprint()
+        || baseline_identity.endpoint() != after.endpoint()
+        || baseline_identity.owner_oid() != after.owner_oid()
+        || baseline_identity.marker().compose_project() != after.marker().compose_project()
+        || baseline_identity.expected_application_role() != after.expected_application_role()
+    {
         return Err(BaselineError::ResetProofFailed);
     }
     Ok(BaselineReport {
@@ -622,7 +777,7 @@ async fn seal_and_reset_prove(
         compose_project: inputs.compose_project.clone(),
         baseline_database: BaselineDatabaseReport {
             name: baseline.to_owned(),
-            database_oid: baseline_oid,
+            database_oid: baseline_identity.database_oid(),
             sealed_template: true,
         },
         case_database: CaseDatabaseReport {
@@ -639,41 +794,204 @@ async fn seal_and_reset_prove(
     })
 }
 
-async fn observe_sealed_baseline(
+async fn observe_sealed_baseline_identity(
     inputs: &BaselineInputs,
-    expected_marker: &str,
-) -> Result<(u32, bool), BaselineError> {
+) -> Result<DatabaseIdentity, BaselineError> {
     let maintenance = PostgresSession::connect(&inputs.admin_url).await?;
     let row = maintenance
         .client
         .query_opt(
-            "SELECT oid::bigint, datistemplate, NOT datallowconn, \
-                    COALESCE(shobj_description(oid, 'pg_database'), '') \
-             FROM pg_database WHERE datname = $1",
+            "SELECT database.oid::bigint, database.datdba::bigint, \
+                    pg_database_size(database.oid)::bigint, \
+                    control.system_identifier::text, current_user, current_database(), \
+                    owner.rolname, database.datistemplate, NOT database.datallowconn, \
+                    COALESCE(shobj_description(database.oid, 'pg_database'), '') \
+             FROM pg_database AS database \
+             JOIN pg_roles AS owner ON owner.oid = database.datdba \
+             CROSS JOIN pg_control_system() AS control \
+             WHERE database.datname = $1",
             &[&inputs.baseline_name.as_str()],
         )
         .await?
-        .ok_or(BaselineError::BaselineMissingAfterSeal)?;
-    let oid = u32::try_from(row.get::<_, i64>(0))
+        .ok_or(BaselineError::BaselineNotReady)?;
+    if row.get::<_, &str>(4) != inputs.admin_role
+        || row.get::<_, &str>(5) != "postgres"
+        || row.get::<_, &str>(6) != inputs.admin_role
+        || !row.get::<_, bool>(7)
+        || !row.get::<_, bool>(8)
+    {
+        return Err(BaselineError::BaselineIdentityMismatch);
+    }
+    let database_oid = u32::try_from(row.get::<_, i64>(0))
         .map_err(|_| BaselineError::UnexpectedDatabaseIdentity)?;
-    let sealed =
-        row.get::<_, bool>(1) && row.get::<_, bool>(2) && row.get::<_, &str>(3) == expected_marker;
+    let owner_oid = u32::try_from(row.get::<_, i64>(1))
+        .map_err(|_| BaselineError::UnexpectedDatabaseIdentity)?;
+    let database_bytes = u64::try_from(row.get::<_, i64>(2))
+        .map_err(|_| BaselineError::UnexpectedDatabaseIdentity)?;
+    if database_bytes > inputs.max_database_bytes {
+        return Err(BaselineError::DatabaseTooLarge);
+    }
+    let marker_uuid = parse_baseline_catalog_marker(
+        row.get(9),
+        &inputs.compose_project,
+        &inputs.application_role,
+    )?;
+    let server_fingerprint = format!("postgres-system-id:{}", row.get::<_, String>(3));
     maintenance.close().await?;
-    Ok((oid, sealed))
+    DatabaseIdentity::new(
+        server_fingerprint,
+        DatabaseEndpoint::loopback(inputs.port),
+        inputs.baseline_name.clone(),
+        database_oid,
+        owner_oid,
+        DatabaseMarker::new(
+            marker_uuid,
+            MarkerKind::Baseline,
+            crate::postgres::safety::ComposeProjectId::new(inputs.compose_project.clone())
+                .map_err(|_| BaselineError::BaselineIdentityMismatch)?,
+        ),
+        inputs.application_role.clone(),
+    )
+    .map_err(BaselineError::InvalidIdentity)
 }
 
-async fn stop_customer_services(config: &ResolvedConfig) -> Result<(), BaselineError> {
-    let services = std::iter::once(config.application_service().to_owned())
-        .chain(config.worker_services().iter().cloned())
+fn parse_baseline_catalog_marker(
+    value: &str,
+    expected_project: &str,
+    expected_application_role: &str,
+) -> Result<Uuid, BaselineError> {
+    let fields = value
+        .strip_prefix("tiv-baseline:v1:")
+        .ok_or(BaselineError::BaselineIdentityMismatch)?
+        .split(':')
+        .collect::<Vec<_>>();
+    let [marker_uuid, project, application_role] = fields.as_slice() else {
+        return Err(BaselineError::BaselineIdentityMismatch);
+    };
+    if *project != expected_project || *application_role != expected_application_role {
+        return Err(BaselineError::BaselineIdentityMismatch);
+    }
+    Uuid::parse_str(marker_uuid).map_err(|_| BaselineError::BaselineIdentityMismatch)
+}
+
+fn require_compatible_baseline(
+    case: &DatabaseIdentity,
+    baseline: &DatabaseIdentity,
+) -> Result<(), BaselineError> {
+    if case.database_name().kind() != crate::postgres::safety::DatabaseKind::Case
+        || baseline.database_name().kind() != crate::postgres::safety::DatabaseKind::Baseline
+        || baseline.marker().kind() != MarkerKind::Baseline
+        || case.server_fingerprint() != baseline.server_fingerprint()
+        || case.endpoint() != baseline.endpoint()
+        || case.owner_oid() != baseline.owner_oid()
+        || case.marker().compose_project() != baseline.marker().compose_project()
+        || case.expected_application_role() != baseline.expected_application_role()
+    {
+        return Err(BaselineError::BaselineIdentityMismatch);
+    }
+    Ok(())
+}
+
+async fn reset_verified_case(
+    inputs: &BaselineInputs,
+    verified: DatabaseTarget<Verified>,
+    _permit: MutationPermit,
+    expected_baseline: &DatabaseIdentity,
+) -> Result<(DatabaseIdentity, ConfiguredCaseResetReport), BaselineError> {
+    let before = verified.identity();
+    let before_database_oid = before.database_oid();
+    let before_marker_uuid = before.marker().marker_uuid();
+    let after_marker_uuid = Uuid::new_v4();
+    let case = inputs.case_name.as_str();
+    let baseline = expected_baseline.database_name().as_str();
+
+    let maintenance = PostgresSession::connect(&inputs.admin_url).await?;
+    maintenance
+        .client
+        .execute(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+             WHERE datid::bigint = $1 AND pid <> pg_backend_pid()",
+            &[&i64::from(before_database_oid)],
+        )
+        .await?;
+    maintenance
+        .client
+        .batch_execute(&format!("DROP DATABASE {case}"))
+        .await?;
+    maintenance
+        .client
+        .batch_execute(&format!(
+            "CREATE DATABASE {case} WITH OWNER = {} TEMPLATE = {baseline}",
+            inputs.admin_role,
+        ))
+        .await?;
+    maintenance
+        .client
+        .batch_execute(&format!(
+            "REVOKE CONNECT ON DATABASE {case} FROM PUBLIC; \
+             REVOKE CONNECT ON DATABASE {case} FROM {}; \
+             REVOKE CONNECT ON DATABASE {case} FROM {}; \
+             GRANT CONNECT ON DATABASE {case} TO {}; \
+             GRANT CONNECT ON DATABASE {case} TO {}",
+            inputs.application_role,
+            inputs.invariant_role,
+            inputs.application_role,
+            inputs.invariant_role,
+        ))
+        .await?;
+    maintenance.close().await?;
+
+    let reset = PostgresSession::connect(&inputs.database_url(&inputs.case_name)).await?;
+    if reset
+        .client
+        .execute(
+            "UPDATE tiv_verifier_marker SET marker_uuid = $1, marker_kind = 'case'",
+            &[&after_marker_uuid],
+        )
+        .await?
+        != 1
+    {
+        return Err(BaselineError::UnexpectedMarker);
+    }
+    reset.close().await?;
+
+    let after = observe_case_identity(inputs).await?;
+    if after.database_oid() == before_database_oid
+        || after.owner_oid() != before.owner_oid()
+        || after.server_fingerprint() != before.server_fingerprint()
+        || after.endpoint() != before.endpoint()
+        || after.database_name() != before.database_name()
+        || after.marker().marker_uuid() != after_marker_uuid
+        || after.marker().compose_project() != before.marker().compose_project()
+        || after.expected_application_role() != before.expected_application_role()
+    {
+        return Err(BaselineError::ResetProofFailed);
+    }
+    let baseline_after = observe_sealed_baseline_identity(inputs).await?;
+    if &baseline_after != expected_baseline {
+        return Err(BaselineError::BaselineIdentityMismatch);
+    }
+    let report = ConfiguredCaseResetReport {
+        before_database_oid,
+        after_database_oid: after.database_oid(),
+        before_marker_uuid: before_marker_uuid.to_string(),
+        after_marker_uuid: after_marker_uuid.to_string(),
+    };
+    Ok((after, report))
+}
+
+async fn stop_customer_services(inputs: &BaselineInputs) -> Result<(), BaselineError> {
+    let services = std::iter::once(inputs.application_service.clone())
+        .chain(inputs.worker_services.iter().cloned())
         .collect::<Vec<_>>();
     let mut tail = vec!["stop".to_owned(), "--timeout".to_owned(), "5".to_owned()];
     tail.extend(services);
-    docker_compose(config, &tail).await
+    docker_compose(inputs, &tail).await
 }
 
-async fn start_customer_services(config: &ResolvedConfig) -> Result<(), BaselineError> {
-    let services = std::iter::once(config.application_service().to_owned())
-        .chain(config.worker_services().iter().cloned())
+async fn start_customer_services(inputs: &BaselineInputs) -> Result<(), BaselineError> {
+    let services = std::iter::once(inputs.application_service.clone())
+        .chain(inputs.worker_services.iter().cloned())
         .collect::<Vec<_>>();
     let mut tail = vec![
         "up".to_owned(),
@@ -683,19 +1001,19 @@ async fn start_customer_services(config: &ResolvedConfig) -> Result<(), Baseline
         "30".to_owned(),
     ];
     tail.extend(services);
-    docker_compose(config, &tail).await
+    docker_compose(inputs, &tail).await
 }
 
-async fn docker_compose(config: &ResolvedConfig, tail: &[String]) -> Result<(), BaselineError> {
-    let root = config.root().to_str().ok_or(BaselineError::NonUtf8Path)?;
+async fn docker_compose(inputs: &BaselineInputs, tail: &[String]) -> Result<(), BaselineError> {
+    let root = inputs.root.to_str().ok_or(BaselineError::NonUtf8Path)?;
     let mut args = vec![
         "compose".to_owned(),
         "--project-name".to_owned(),
-        config.compose_project().to_owned(),
+        inputs.compose_project.clone(),
         "--project-directory".to_owned(),
         root.to_owned(),
     ];
-    for file in config.compose_files() {
+    for file in &inputs.compose_files {
         args.push("--file".to_owned());
         args.push(file.to_str().ok_or(BaselineError::NonUtf8Path)?.to_owned());
     }
@@ -855,7 +1173,7 @@ pub enum BaselineError {
     CustomerServicesRecoveryFailed,
     #[error("the configured PostgreSQL container does not match the local Compose boundary")]
     PostgresContainerMismatch,
-    #[error("the PostgreSQL container changed after reset acknowledgement")]
+    #[error("the PostgreSQL container changed across the attested reset boundary")]
     PostgresContainerChanged,
     #[error("the configured case database does not exist")]
     CaseDatabaseMissing,
@@ -875,14 +1193,18 @@ pub enum BaselineError {
     ResetProbeAlreadyExists,
     #[error("reset acknowledgement failed: {0:?}")]
     ResetAcknowledgement(ResetAcknowledgementError),
+    #[error("the freshly observed case identity no longer matches the reset target: {0:?}")]
+    Safety(SafetyError),
     #[error("the observed database identity is invalid")]
     InvalidIdentity(InvalidDatabaseIdentity),
     #[error("PostgreSQL baseline execution failed: {0}")]
     Database(#[from] tokio_postgres::Error),
     #[error("the PostgreSQL connection task failed")]
     DatabaseConnectionTask,
-    #[error("the sealed baseline was not present after creation")]
-    BaselineMissingAfterSeal,
+    #[error("the configured sealed baseline is not ready")]
+    BaselineNotReady,
+    #[error("the sealed baseline identity no longer matches the configured case boundary")]
+    BaselineIdentityMismatch,
     #[error("the destructive reset proof did not restore the sealed baseline")]
     ResetProofFailed,
     #[error("a configured path is not valid UTF-8")]

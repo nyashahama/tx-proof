@@ -1,5 +1,9 @@
-use std::process::Command;
+use std::{collections::BTreeMap, process::Command};
 
+use tiv_runtime::{
+    baseline::{BaselineError, ConfiguredBaselineSession},
+    config::{EnvironmentLookup, load_resolved_config},
+};
 use tokio_postgres::NoTls;
 use uuid::Uuid;
 
@@ -172,6 +176,112 @@ async fn baseline_restores_case_connections_when_cloning_fails() {
     cleanup_databases().await;
 }
 
+#[tokio::test]
+#[ignore = "requires the isolated reference-app Compose project"]
+async fn sealed_customer_baseline_supports_two_fresh_attested_case_resets() {
+    prepare_case_database().await;
+    let config_path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/golden/doctor-project/tiv.toml"
+    );
+    let challenge = baseline_command(config_path)
+        .output()
+        .expect("the baseline challenge executes");
+    assert!(challenge.status.success());
+    let challenge: serde_json::Value = serde_json::from_slice(&challenge.stdout).unwrap();
+    let completed = baseline_command(config_path)
+        .args([
+            "--acknowledge-reset",
+            challenge["reset_acknowledgement"].as_str().unwrap(),
+        ])
+        .output()
+        .expect("the acknowledged baseline executes");
+    assert!(
+        completed.status.success(),
+        "baseline failed: {}",
+        String::from_utf8_lossy(&completed.stderr)
+    );
+
+    let config = load_resolved_config(config_path.as_ref(), &test_environment())
+        .expect("the live customer config resolves");
+    let session = ConfiguredBaselineSession::attest(&config)
+        .await
+        .expect("the sealed baseline and current case are freshly attested");
+    let sealed_before = database_catalog_with_comment("tiv_base_checkout").await;
+    let first_oid = session.case_identity().database_oid();
+    let first_marker = session.case_identity().marker().marker_uuid().to_string();
+
+    install_dirty_case_state("dirty-before-first-reset").await;
+    let (session, first_reset) = session
+        .reset_case()
+        .await
+        .expect("the first configured case reset succeeds");
+    assert_eq!(first_reset.before_database_oid(), first_oid);
+    assert_ne!(first_reset.after_database_oid(), first_oid);
+    assert_eq!(first_reset.before_marker_uuid(), first_marker);
+    assert_ne!(first_reset.after_marker_uuid(), first_marker);
+    assert_seeded_clean_case().await;
+
+    install_dirty_case_state("dirty-before-second-reset").await;
+    let second_before_oid = session.case_identity().database_oid();
+    let second_before_marker = session.case_identity().marker().marker_uuid().to_string();
+    let (session, second_reset) = session
+        .reset_case()
+        .await
+        .expect("the second configured case reset succeeds");
+    assert_eq!(second_reset.before_database_oid(), second_before_oid);
+    assert_ne!(second_reset.after_database_oid(), second_before_oid);
+    assert_eq!(second_reset.before_marker_uuid(), second_before_marker);
+    assert_ne!(second_reset.after_marker_uuid(), second_before_marker);
+    assert_eq!(
+        session.case_identity().database_oid(),
+        second_reset.after_database_oid()
+    );
+    assert_seeded_clean_case().await;
+
+    assert_eq!(
+        database_catalog_with_comment("tiv_base_checkout").await,
+        sealed_before,
+        "automatic resets must not mutate or replace the sealed baseline"
+    );
+    cleanup_databases().await;
+}
+
+#[tokio::test]
+#[ignore = "requires the isolated reference-app Compose project"]
+async fn tampered_sealed_baseline_is_rejected_before_case_mutation_and_services_recover() {
+    prepare_case_database().await;
+    let config_path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/golden/doctor-project/tiv.toml"
+    );
+    let challenge = baseline_command(config_path).output().unwrap();
+    let challenge: serde_json::Value = serde_json::from_slice(&challenge.stdout).unwrap();
+    let completed = baseline_command(config_path)
+        .args([
+            "--acknowledge-reset",
+            challenge["reset_acknowledgement"].as_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(completed.status.success());
+
+    let config = load_resolved_config(config_path.as_ref(), &test_environment()).unwrap();
+    let session = ConfiguredBaselineSession::attest(&config).await.unwrap();
+    install_dirty_case_state("must-survive-rejected-reset").await;
+    let case_oid = database_oid("tiv_case_checkout").await;
+    set_database_comment("tiv_base_checkout", "tampered-baseline-marker").await;
+
+    assert!(matches!(
+        session.reset_case().await,
+        Err(BaselineError::BaselineIdentityMismatch)
+    ));
+    assert_eq!(database_oid("tiv_case_checkout").await, case_oid);
+    assert!(relation_exists("customer_dirty").await);
+    assert!(application_service_is_healthy());
+    cleanup_databases().await;
+}
+
 fn baseline_command(config: &str) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_tiv"));
     command
@@ -287,6 +397,17 @@ async fn prepare_case_database() {
         .unwrap();
     client
         .batch_execute(
+            "DO $$ BEGIN \
+                 IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'tiv_invariant') THEN \
+                   CREATE ROLE tiv_invariant NOLOGIN NOINHERIT NOSUPERUSER NOCREATEDB \
+                     NOCREATEROLE NOREPLICATION NOBYPASSRLS; \
+                 END IF; \
+             END $$;",
+        )
+        .await
+        .unwrap();
+    client
+        .batch_execute(
             "ALTER ROLE tiv_app WITH LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE \
              NOREPLICATION NOBYPASSRLS PASSWORD 'tiv-app-local-only-password'",
         )
@@ -317,7 +438,8 @@ async fn prepare_case_database() {
              INSERT INTO customer_seed VALUES ('seeded-before-baseline'); \
              REVOKE ALL ON SCHEMA public FROM PUBLIC; \
              GRANT USAGE ON SCHEMA public TO tiv_app; \
-             GRANT SELECT ON customer_seed TO tiv_app;",
+             GRANT USAGE ON SCHEMA public TO tiv_invariant; \
+             GRANT SELECT ON customer_seed TO tiv_app, tiv_invariant;",
         )
         .await
         .unwrap();
@@ -416,4 +538,129 @@ async fn database_catalog_optional(database: &str) -> Option<(i64, bool, bool)> 
     drop(client);
     connection.await.unwrap().unwrap();
     row
+}
+
+async fn database_catalog_with_comment(database: &str) -> (i64, bool, bool, String) {
+    let (client, connection) = tokio_postgres::connect(ADMIN_URL, NoTls).await.unwrap();
+    let connection = tokio::spawn(connection);
+    let row = client
+        .query_one(
+            "SELECT oid::bigint, datistemplate, datallowconn, \
+                    COALESCE(shobj_description(oid, 'pg_database'), '') \
+             FROM pg_database WHERE datname = $1",
+            &[&database],
+        )
+        .await
+        .unwrap();
+    let result = (row.get(0), row.get(1), row.get(2), row.get(3));
+    drop(client);
+    connection.await.unwrap().unwrap();
+    result
+}
+
+async fn install_dirty_case_state(value: &str) {
+    let admin_case_url = ADMIN_URL.replace("/postgres", "/tiv_case_checkout");
+    let (client, connection) = tokio_postgres::connect(&admin_case_url, NoTls)
+        .await
+        .unwrap();
+    let connection = tokio::spawn(connection);
+    client
+        .batch_execute("CREATE TABLE customer_dirty (value text NOT NULL)")
+        .await
+        .unwrap();
+    client
+        .execute("INSERT INTO customer_dirty VALUES ($1)", &[&value])
+        .await
+        .unwrap();
+    drop(client);
+    connection.await.unwrap().unwrap();
+}
+
+async fn assert_seeded_clean_case() {
+    let (client, connection) = tokio_postgres::connect(CASE_URL, NoTls).await.unwrap();
+    let connection = tokio::spawn(connection);
+    assert_eq!(
+        client
+            .query_one("SELECT value FROM customer_seed", &[])
+            .await
+            .unwrap()
+            .get::<_, String>(0),
+        "seeded-before-baseline"
+    );
+    assert!(
+        client
+            .query_one("SELECT to_regclass('public.customer_dirty') IS NULL", &[])
+            .await
+            .unwrap()
+            .get::<_, bool>(0),
+        "dirty case state must not survive a reset"
+    );
+    drop(client);
+    connection.await.unwrap().unwrap();
+}
+
+async fn relation_exists(relation: &str) -> bool {
+    let admin_case_url = ADMIN_URL.replace("/postgres", "/tiv_case_checkout");
+    let (client, connection) = tokio_postgres::connect(&admin_case_url, NoTls)
+        .await
+        .unwrap();
+    let connection = tokio::spawn(connection);
+    let exists = client
+        .query_one("SELECT to_regclass($1) IS NOT NULL", &[&relation])
+        .await
+        .unwrap()
+        .get::<_, bool>(0);
+    drop(client);
+    connection.await.unwrap().unwrap();
+    exists
+}
+
+async fn set_database_comment(database: &str, comment: &str) {
+    let (client, connection) = tokio_postgres::connect(ADMIN_URL, NoTls).await.unwrap();
+    let connection = tokio::spawn(connection);
+    let quoted = client
+        .query_one("SELECT quote_literal($1::text)", &[&comment])
+        .await
+        .unwrap()
+        .get::<_, String>(0);
+    client
+        .batch_execute(&format!("COMMENT ON DATABASE {database} IS {quoted}"))
+        .await
+        .unwrap();
+    drop(client);
+    connection.await.unwrap().unwrap();
+}
+
+fn application_service_is_healthy() -> bool {
+    let output = Command::new("docker")
+        .args([
+            "--host",
+            "unix:///var/run/docker.sock",
+            "inspect",
+            "--format",
+            "{{.State.Running}} {{if .State.Health}}{{.State.Health.Status}}{{end}}",
+            "tiv-reference-app-spike-reference-app-1",
+        ])
+        .output()
+        .unwrap();
+    output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "true healthy"
+}
+
+struct TestEnvironment(BTreeMap<String, String>);
+
+impl EnvironmentLookup for TestEnvironment {
+    fn get(&self, name: &str) -> Option<String> {
+        self.0.get(name).cloned()
+    }
+}
+
+fn test_environment() -> TestEnvironment {
+    TestEnvironment(BTreeMap::from([
+        ("TIV_POSTGRES_ADMIN_URL".to_owned(), ADMIN_URL.to_owned()),
+        ("DATABASE_URL".to_owned(), CASE_URL.to_owned()),
+        (
+            "TIV_STRIPE_WEBHOOK_SECRET".to_owned(),
+            "whsec_test_secret".to_owned(),
+        ),
+    ]))
 }
