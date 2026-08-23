@@ -5,14 +5,20 @@ use std::{future::Future, path::Path, pin::Pin, time::Duration};
 use reqwest::{Client, StatusCode, Url, redirect::Policy};
 use serde::Deserialize;
 use thiserror::Error;
-use tiv_core::plan::{
-    PlanActionKind, PlanValidationError, PlannedCase, ProcessCutPoint, ProviderOutcome,
+use tiv_core::{
+    decision::Seed,
+    plan::{
+        PlanActionKind, PlanValidationError, PlannedAction, PlannedCase, ProcessCutPoint,
+        ProviderOutcome,
+    },
+    shrink::ShrinkCandidate,
 };
 
 use crate::{
     campaign::{
         CaseEffectAdapter, CaseEffectFuture, CaseEffectRequest, CaseExecutionCause,
-        CaseExecutionError, ExecutedCase, execute_planned_case,
+        CaseExecutionError, ExecutedCase, ExecutedShrinkCase, execute_planned_case,
+        execute_shrink_candidate,
     },
     case_http::{CaseHttpAdapter, CaseHttpError, ReferenceCaseHttpCompletion},
     postgres::{
@@ -233,6 +239,17 @@ impl ReferenceCaseRunReceipt {
     }
 }
 
+pub(crate) struct ReferenceShrinkCaseRunReceipt {
+    executed: ExecutedShrinkCase,
+    checkpoint: ReferenceCaseCheckpoint,
+}
+
+impl ReferenceShrinkCaseRunReceipt {
+    pub(crate) fn into_parts(self) -> (ExecutedShrinkCase, ReferenceCaseCheckpoint) {
+        (self.executed, self.checkpoint)
+    }
+}
+
 /// Resets the fixture from a validated compiled plan and executes every action
 /// through the real reference application and fixture control plane.
 ///
@@ -308,6 +325,49 @@ pub(crate) async fn run_configured_planned_case_with_process(
 }
 
 #[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_configured_shrink_candidate_with_process(
+    run_id: impl Into<String>,
+    case_id: impl Into<String>,
+    candidate: &ShrinkCandidate,
+    journal_path: impl AsRef<Path>,
+    config: ReferenceCaseRunConfig,
+    process: &mut dyn ReferenceProcessControl,
+    sql_probe: Option<&mut dyn CaseSqlProbe>,
+    quiescence_gate: &mut dyn CaseQuiescenceGate,
+) -> Result<ReferenceShrinkCaseRunReceipt, ReferenceCaseRunError> {
+    candidate
+        .validate()
+        .map_err(|_| ReferenceCaseRunError::InvalidShrinkCandidate)?;
+    preflight_reference_actions(candidate.actions(), true, sql_probe.is_some())?;
+    let client_response_cut_points = client_response_cut_point_actions(candidate.actions())?;
+    let webhook_request_cut_points = webhook_request_cut_point_actions(candidate.actions())?;
+    let webhook_response_cut_points = webhook_response_cut_point_actions(candidate.actions())?;
+    let sql_probe_cut_points = sql_probe_cut_point_actions(candidate.actions())?;
+    let outcomes = provider_outcomes(candidate.actions());
+    reset_fixture(&config, candidate.source().seed(), &outcomes).await?;
+    let mut adapter = ReferenceCaseAdapter::new(
+        CaseHttpAdapter::new(
+            ProviderHttpAdapter::new(config.provider)?
+                .with_client_response_cut_points(client_response_cut_points),
+            WebhookHttpAdapter::new(config.webhook)?
+                .with_webhook_request_cut_points(webhook_request_cut_points)
+                .with_webhook_response_cut_points(webhook_response_cut_points),
+        ),
+        Some(process),
+        sql_probe,
+        sql_probe_cut_points,
+        Some(quiescence_gate),
+    );
+    let executed =
+        execute_shrink_candidate(run_id, case_id, candidate, journal_path, &mut adapter).await?;
+    let checkpoint = adapter.finish()?;
+    Ok(ReferenceShrinkCaseRunReceipt {
+        executed,
+        checkpoint,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn run_reference_planned_case_inner(
     run_id: impl Into<String>,
     case_id: impl Into<String>,
@@ -319,12 +379,12 @@ async fn run_reference_planned_case_inner(
     quiescence_gate: Option<&mut dyn CaseQuiescenceGate>,
 ) -> Result<ReferenceCaseRunReceipt, ReferenceCaseRunError> {
     preflight_reference_planned_case(planned_case, process.is_some(), sql_probe.is_some())?;
-    let client_response_cut_points = client_response_cut_point_actions(planned_case)?;
-    let webhook_request_cut_points = webhook_request_cut_point_actions(planned_case)?;
-    let webhook_response_cut_points = webhook_response_cut_point_actions(planned_case)?;
-    let sql_probe_cut_points = sql_probe_cut_point_actions(planned_case)?;
-    let outcomes = provider_outcomes(planned_case);
-    reset_fixture(&config, planned_case, &outcomes).await?;
+    let client_response_cut_points = client_response_cut_point_actions(planned_case.actions())?;
+    let webhook_request_cut_points = webhook_request_cut_point_actions(planned_case.actions())?;
+    let webhook_response_cut_points = webhook_response_cut_point_actions(planned_case.actions())?;
+    let sql_probe_cut_points = sql_probe_cut_point_actions(planned_case.actions())?;
+    let outcomes = provider_outcomes(planned_case.actions());
+    reset_fixture(&config, planned_case.seed(), &outcomes).await?;
     let mut adapter = ReferenceCaseAdapter::new(
         CaseHttpAdapter::new(
             ProviderHttpAdapter::new(config.provider)?
@@ -355,16 +415,27 @@ pub(crate) fn preflight_reference_planned_case(
     planned_case
         .validate()
         .map_err(ReferenceCaseRunError::InvalidPlan)?;
-    let contains_process_fault = planned_case
-        .actions()
+    preflight_reference_actions(
+        planned_case.actions(),
+        process_control_available,
+        sql_probe_available,
+    )
+}
+
+fn preflight_reference_actions(
+    actions: &[PlannedAction],
+    process_control_available: bool,
+    sql_probe_available: bool,
+) -> Result<(), ReferenceCaseRunError> {
+    let contains_process_fault = actions
         .iter()
         .any(|action| matches!(action.kind(), PlanActionKind::KillApplication { .. }));
-    if client_request_cut_point_actions(planned_case).is_err()
-        || client_response_cut_point_actions(planned_case).is_err()
-        || webhook_request_cut_point_actions(planned_case).is_err()
-        || webhook_response_cut_point_actions(planned_case).is_err()
-        || sql_probe_cut_point_actions(planned_case).is_err()
-        || planned_case.actions().iter().any(|action| {
+    if client_request_cut_point_actions(actions).is_err()
+        || client_response_cut_point_actions(actions).is_err()
+        || webhook_request_cut_point_actions(actions).is_err()
+        || webhook_response_cut_point_actions(actions).is_err()
+        || sql_probe_cut_point_actions(actions).is_err()
+        || actions.iter().any(|action| {
             matches!(
                 action.kind(),
                 PlanActionKind::KillApplication { cut_point }
@@ -379,7 +450,7 @@ pub(crate) fn preflight_reference_planned_case(
             )
         })
         || (contains_process_fault && !process_control_available)
-        || (planned_case.actions().iter().any(|action| {
+        || (actions.iter().any(|action| {
             matches!(
                 action.kind(),
                 PlanActionKind::KillApplication {
@@ -390,7 +461,7 @@ pub(crate) fn preflight_reference_planned_case(
     {
         return Err(ReferenceCaseRunError::UnsupportedProcessFault);
     }
-    let outcomes = provider_outcomes(planned_case);
+    let outcomes = provider_outcomes(actions);
     if outcomes.is_empty() {
         return Err(ReferenceCaseRunError::MissingProviderOutcomes);
     }
@@ -398,10 +469,10 @@ pub(crate) fn preflight_reference_planned_case(
 }
 
 fn client_request_cut_point_actions(
-    planned_case: &PlannedCase,
+    planned_actions: &[PlannedAction],
 ) -> Result<std::collections::BTreeSet<tiv_core::trace::ActionId>, ReferenceCaseRunError> {
     let mut action_ids = std::collections::BTreeSet::new();
-    for actions in planned_case.actions().windows(2) {
+    for actions in planned_actions.windows(2) {
         if !matches!(
             actions[1].kind(),
             PlanActionKind::KillApplication {
@@ -420,8 +491,7 @@ fn client_request_cut_point_actions(
             _ => return Err(ReferenceCaseRunError::UnsupportedProcessFault),
         }
     }
-    let expected = planned_case
-        .actions()
+    let expected = planned_actions
         .iter()
         .filter(|action| {
             matches!(
@@ -439,10 +509,10 @@ fn client_request_cut_point_actions(
 }
 
 fn client_response_cut_point_actions(
-    planned_case: &PlannedCase,
+    planned_actions: &[PlannedAction],
 ) -> Result<std::collections::BTreeSet<tiv_core::trace::ActionId>, ReferenceCaseRunError> {
     let mut action_ids = std::collections::BTreeSet::new();
-    for actions in planned_case.actions().windows(2) {
+    for actions in planned_actions.windows(2) {
         if !matches!(
             actions[1].kind(),
             PlanActionKind::KillApplication {
@@ -461,8 +531,7 @@ fn client_response_cut_point_actions(
             _ => return Err(ReferenceCaseRunError::UnsupportedProcessFault),
         }
     }
-    let expected = planned_case
-        .actions()
+    let expected = planned_actions
         .iter()
         .filter(|action| {
             matches!(
@@ -480,10 +549,10 @@ fn client_response_cut_point_actions(
 }
 
 fn webhook_response_cut_point_actions(
-    planned_case: &PlannedCase,
+    planned_actions: &[PlannedAction],
 ) -> Result<std::collections::BTreeSet<tiv_core::trace::ActionId>, ReferenceCaseRunError> {
     let mut action_ids = std::collections::BTreeSet::new();
-    for actions in planned_case.actions().windows(2) {
+    for actions in planned_actions.windows(2) {
         if !matches!(
             actions[1].kind(),
             PlanActionKind::KillApplication {
@@ -501,8 +570,7 @@ fn webhook_response_cut_point_actions(
             return Err(ReferenceCaseRunError::UnsupportedProcessFault);
         }
     }
-    let expected = planned_case
-        .actions()
+    let expected = planned_actions
         .iter()
         .filter(|action| {
             matches!(
@@ -520,10 +588,10 @@ fn webhook_response_cut_point_actions(
 }
 
 fn webhook_request_cut_point_actions(
-    planned_case: &PlannedCase,
+    planned_actions: &[PlannedAction],
 ) -> Result<std::collections::BTreeSet<tiv_core::trace::ActionId>, ReferenceCaseRunError> {
     let mut action_ids = std::collections::BTreeSet::new();
-    for actions in planned_case.actions().windows(2) {
+    for actions in planned_actions.windows(2) {
         if !matches!(
             actions[1].kind(),
             PlanActionKind::KillApplication {
@@ -541,8 +609,7 @@ fn webhook_request_cut_point_actions(
             return Err(ReferenceCaseRunError::UnsupportedProcessFault);
         }
     }
-    let expected = planned_case
-        .actions()
+    let expected = planned_actions
         .iter()
         .filter(|action| {
             matches!(
@@ -560,10 +627,10 @@ fn webhook_request_cut_point_actions(
 }
 
 fn sql_probe_cut_point_actions(
-    planned_case: &PlannedCase,
+    planned_actions: &[PlannedAction],
 ) -> Result<std::collections::BTreeSet<tiv_core::trace::ActionId>, ReferenceCaseRunError> {
     let mut action_ids = std::collections::BTreeSet::new();
-    for actions in planned_case.actions().windows(2) {
+    for actions in planned_actions.windows(2) {
         if !matches!(
             actions[1].kind(),
             PlanActionKind::KillApplication {
@@ -578,8 +645,7 @@ fn sql_probe_cut_point_actions(
             return Err(ReferenceCaseRunError::UnsupportedProcessFault);
         }
     }
-    let expected = planned_case
-        .actions()
+    let expected = planned_actions
         .iter()
         .filter(|action| {
             matches!(
@@ -596,9 +662,8 @@ fn sql_probe_cut_point_actions(
     Ok(action_ids)
 }
 
-fn provider_outcomes(planned_case: &PlannedCase) -> Vec<ProviderOutcome> {
-    planned_case
-        .actions()
+fn provider_outcomes(planned_actions: &[PlannedAction]) -> Vec<ProviderOutcome> {
+    planned_actions
         .iter()
         .filter_map(|action| match action.kind() {
             PlanActionKind::DriveCheckout { provider_script }
@@ -613,7 +678,7 @@ fn provider_outcomes(planned_case: &PlannedCase) -> Vec<ProviderOutcome> {
 
 async fn reset_fixture(
     config: &ReferenceCaseRunConfig,
-    planned_case: &PlannedCase,
+    seed: Seed,
     outcomes: &[ProviderOutcome],
 ) -> Result<(), ReferenceCaseRunError> {
     let mut endpoint = config.fixture_control_url.clone();
@@ -624,7 +689,7 @@ async fn reset_fixture(
         .header("X-Tiv-Control-Token", &config.fixture_control_token)
         .json(&serde_json::json!({
             "command_sequence": config.reset_sequence,
-            "seed": planned_case.seed().value(),
+            "seed": seed.value(),
             "outcomes": outcomes,
         }))
         .send()
@@ -1010,6 +1075,8 @@ pub enum ReferenceCaseRunConfigError {
 pub enum ReferenceCaseRunError {
     #[error("reference planned case failed pure validation")]
     InvalidPlan(PlanValidationError),
+    #[error("reference shrink candidate failed pure validation")]
+    InvalidShrinkCandidate,
     #[error("reference planned-case process cut point is not supported")]
     UnsupportedProcessFault,
     #[error("reference planned case did not contain a provider fault script")]
@@ -1044,6 +1111,7 @@ impl ReferenceCaseRunError {
             }
             Self::Lifecycle(error) => error.is_inconclusive(),
             Self::InvalidPlan(_)
+            | Self::InvalidShrinkCandidate
             | Self::UnsupportedProcessFault
             | Self::MissingProviderOutcomes
             | Self::ResetRequest(_)

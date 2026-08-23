@@ -2,7 +2,7 @@
 
 use std::{
     path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use reqwest::{StatusCode, redirect::Policy};
@@ -12,7 +12,8 @@ use tiv_core::{
     decision::Seed,
     plan::{CampaignCompileError, CampaignPlan, CampaignPlanner, CaseCount, PlannedCase},
     result::FailureIdentity,
-    trace::CompiledCaseTrace,
+    shrink::ShrinkCandidate,
+    trace::{CompiledCaseTrace, CompiledShrinkTrace},
 };
 
 use crate::{
@@ -35,7 +36,8 @@ use crate::{
     },
     reference_case::{
         CaseSqlProbe, ReferenceCaseRunConfig, ReferenceCaseRunConfigError, ReferenceCaseRunError,
-        preflight_reference_planned_case, run_configured_planned_case_with_process,
+        ReferenceCaseRunReceipt, ReferenceShrinkCaseRunReceipt, preflight_reference_planned_case,
+        run_configured_planned_case_with_process, run_configured_shrink_candidate_with_process,
     },
     run_supervisor::{
         ComposeProjectLock, SupervisedCaseOutcome, complete_supervision, supervise_execution,
@@ -131,21 +133,24 @@ pub struct ConfiguredCampaignOutput {
 /// One fully recovered configured execution attempt and its bounded oracle
 /// result. Replay reuses this exact path so campaign and replay cannot drift in
 /// reset, process supervision, quiescence, or snapshot semantics.
-pub(crate) struct ConfiguredCaseExecution {
+pub(crate) struct ConfiguredAttemptExecution<T> {
     reset: ConfiguredCaseResetReport,
-    trace: CompiledCaseTrace,
+    trace: T,
     journal_record_count: usize,
     journal_last_record_hash: Option<String>,
     provider_object_count: usize,
     invariants: Vec<ConfiguredInvariantOutcome>,
 }
 
-impl ConfiguredCaseExecution {
+pub(crate) type ConfiguredCaseExecution = ConfiguredAttemptExecution<CompiledCaseTrace>;
+pub(crate) type ConfiguredShrinkExecution = ConfiguredAttemptExecution<CompiledShrinkTrace>;
+
+impl<T> ConfiguredAttemptExecution<T> {
     pub(crate) const fn reset(&self) -> &ConfiguredCaseResetReport {
         &self.reset
     }
 
-    pub(crate) const fn trace(&self) -> &CompiledCaseTrace {
+    pub(crate) const fn trace(&self) -> &T {
         &self.trace
     }
 
@@ -345,7 +350,7 @@ pub async fn run_configured_campaign_with_cancellation(
     })
 }
 
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn execute_configured_case_attempt(
     config: &ResolvedConfig,
     configured_probe: &ConfiguredSqlProbe,
@@ -358,6 +363,152 @@ pub(crate) async fn execute_configured_case_attempt(
     journal_path: PathBuf,
     cancellation: &RunCancellation,
 ) -> Result<(ConfiguredBaselineSession, ConfiguredCaseExecution), ConfiguredCampaignError> {
+    Box::pin(execute_configured_case_attempt_with_timeout(
+        config,
+        configured_probe,
+        configured_quiescence,
+        configured_snapshot,
+        baseline,
+        planned_case,
+        run_id,
+        case_id,
+        journal_path,
+        config.case_timeout(),
+        cancellation,
+    ))
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn execute_configured_case_attempt_with_timeout(
+    config: &ResolvedConfig,
+    configured_probe: &ConfiguredSqlProbe,
+    configured_quiescence: &ConfiguredQuiescence,
+    configured_snapshot: &ConfiguredSnapshot,
+    baseline: ConfiguredBaselineSession,
+    planned_case: &PlannedCase,
+    run_id: &str,
+    case_id: &str,
+    journal_path: PathBuf,
+    case_timeout: Duration,
+    cancellation: &RunCancellation,
+) -> Result<(ConfiguredBaselineSession, ConfiguredCaseExecution), ConfiguredCampaignError> {
+    let (baseline, execution) = Box::pin(execute_configured_attempt(
+        config,
+        configured_probe,
+        configured_quiescence,
+        configured_snapshot,
+        baseline,
+        ConfiguredAttemptAuthority::Planned(planned_case),
+        run_id,
+        case_id,
+        journal_path,
+        case_timeout,
+        cancellation,
+    ))
+    .await?;
+    Ok((baseline, execution.into_planned()?))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn execute_configured_shrink_attempt_with_timeout(
+    config: &ResolvedConfig,
+    configured_probe: &ConfiguredSqlProbe,
+    configured_quiescence: &ConfiguredQuiescence,
+    configured_snapshot: &ConfiguredSnapshot,
+    baseline: ConfiguredBaselineSession,
+    candidate: &ShrinkCandidate,
+    run_id: &str,
+    case_id: &str,
+    journal_path: PathBuf,
+    case_timeout: Duration,
+    cancellation: &RunCancellation,
+) -> Result<(ConfiguredBaselineSession, ConfiguredShrinkExecution), ConfiguredCampaignError> {
+    let (baseline, execution) = Box::pin(execute_configured_attempt(
+        config,
+        configured_probe,
+        configured_quiescence,
+        configured_snapshot,
+        baseline,
+        ConfiguredAttemptAuthority::Shrink(candidate),
+        run_id,
+        case_id,
+        journal_path,
+        case_timeout,
+        cancellation,
+    ))
+    .await?;
+    Ok((baseline, execution.into_shrink()?))
+}
+
+enum ConfiguredAttemptAuthority<'a> {
+    Planned(&'a PlannedCase),
+    Shrink(&'a ShrinkCandidate),
+}
+
+enum ConfiguredAttemptReceipt {
+    Planned(ReferenceCaseRunReceipt),
+    Shrink(ReferenceShrinkCaseRunReceipt),
+}
+
+enum ConfiguredAttemptTrace {
+    Planned(CompiledCaseTrace),
+    Shrink(CompiledShrinkTrace),
+}
+
+struct ConfiguredAttemptParts {
+    reset: ConfiguredCaseResetReport,
+    trace: ConfiguredAttemptTrace,
+    journal_record_count: usize,
+    journal_last_record_hash: Option<String>,
+    provider_object_count: usize,
+    invariants: Vec<ConfiguredInvariantOutcome>,
+}
+
+impl ConfiguredAttemptParts {
+    fn into_planned(self) -> Result<ConfiguredCaseExecution, ConfiguredCampaignError> {
+        let ConfiguredAttemptTrace::Planned(trace) = self.trace else {
+            return Err(ConfiguredCampaignError::AttemptTraceMismatch);
+        };
+        Ok(ConfiguredAttemptExecution {
+            reset: self.reset,
+            trace,
+            journal_record_count: self.journal_record_count,
+            journal_last_record_hash: self.journal_last_record_hash,
+            provider_object_count: self.provider_object_count,
+            invariants: self.invariants,
+        })
+    }
+
+    fn into_shrink(self) -> Result<ConfiguredShrinkExecution, ConfiguredCampaignError> {
+        let ConfiguredAttemptTrace::Shrink(trace) = self.trace else {
+            return Err(ConfiguredCampaignError::AttemptTraceMismatch);
+        };
+        Ok(ConfiguredAttemptExecution {
+            reset: self.reset,
+            trace,
+            journal_record_count: self.journal_record_count,
+            journal_last_record_hash: self.journal_last_record_hash,
+            provider_object_count: self.provider_object_count,
+            invariants: self.invariants,
+        })
+    }
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+async fn execute_configured_attempt(
+    config: &ResolvedConfig,
+    configured_probe: &ConfiguredSqlProbe,
+    configured_quiescence: &ConfiguredQuiescence,
+    configured_snapshot: &ConfiguredSnapshot,
+    baseline: ConfiguredBaselineSession,
+    authority: ConfiguredAttemptAuthority<'_>,
+    run_id: &str,
+    case_id: &str,
+    journal_path: PathBuf,
+    case_timeout: Duration,
+    cancellation: &RunCancellation,
+) -> Result<(ConfiguredBaselineSession, ConfiguredAttemptParts), ConfiguredCampaignError> {
     if cancellation.is_cancelled() {
         return Err(ConfiguredCampaignError::Interrupted {
             case_id: Some(case_id.to_owned()),
@@ -398,21 +549,39 @@ pub(crate) async fn execute_configured_case_attempt(
             config.fixture_poll_interval(),
         )
         .await?;
-    let outcome = supervise_execution(
-        config.case_timeout(),
-        cancellation,
-        run_configured_planned_case_with_process(
-            run_id.to_owned(),
-            case_id.to_owned(),
-            planned_case,
-            journal_path,
-            run_config,
-            &mut process,
-            Some(&mut sql_probe as &mut dyn CaseSqlProbe),
-            &mut quiescence,
-        ),
-    )
-    .await;
+    let execution = async {
+        match authority {
+            ConfiguredAttemptAuthority::Planned(planned_case) => {
+                run_configured_planned_case_with_process(
+                    run_id.to_owned(),
+                    case_id.to_owned(),
+                    planned_case,
+                    journal_path,
+                    run_config,
+                    &mut process,
+                    Some(&mut sql_probe as &mut dyn CaseSqlProbe),
+                    &mut quiescence,
+                )
+                .await
+                .map(ConfiguredAttemptReceipt::Planned)
+            }
+            ConfiguredAttemptAuthority::Shrink(candidate) => {
+                run_configured_shrink_candidate_with_process(
+                    run_id.to_owned(),
+                    case_id.to_owned(),
+                    candidate,
+                    journal_path,
+                    run_config,
+                    &mut process,
+                    Some(&mut sql_probe as &mut dyn CaseSqlProbe),
+                    &mut quiescence,
+                )
+                .await
+                .map(ConfiguredAttemptReceipt::Shrink)
+            }
+        }
+    };
+    let outcome = supervise_execution(case_timeout, cancellation, execution).await;
     let supervised = complete_supervision(&mut process, outcome).await;
     let probe_close = sql_probe.close().await;
     let quiescence_close = quiescence.close().await;
@@ -450,12 +619,32 @@ pub(crate) async fn execute_configured_case_attempt(
             case_id: Some(case_id.to_owned()),
         });
     }
-    let (executed, checkpoint) = receipt.into_parts();
-    let journal_record_count = executed.journal_summary().record_count();
-    let journal_last_record_hash = executed
-        .journal_summary()
-        .last_record_hash()
-        .map(str::to_owned);
+    let (trace, journal_record_count, journal_last_record_hash, checkpoint) = match receipt {
+        ConfiguredAttemptReceipt::Planned(receipt) => {
+            let (executed, checkpoint) = receipt.into_parts();
+            (
+                ConfiguredAttemptTrace::Planned(executed.trace().clone()),
+                executed.journal_summary().record_count(),
+                executed
+                    .journal_summary()
+                    .last_record_hash()
+                    .map(str::to_owned),
+                checkpoint,
+            )
+        }
+        ConfiguredAttemptReceipt::Shrink(receipt) => {
+            let (executed, checkpoint) = receipt.into_parts();
+            (
+                ConfiguredAttemptTrace::Shrink(executed.trace().clone()),
+                executed.journal_summary().record_count(),
+                executed
+                    .journal_summary()
+                    .last_record_hash()
+                    .map(str::to_owned),
+                checkpoint,
+            )
+        }
+    };
     let (provider_objects, quiescence_permit) = checkpoint.into_oracle_parts();
     let provider_object_count = provider_objects.len();
     let snapshot = database
@@ -476,9 +665,9 @@ pub(crate) async fn execute_configured_case_attempt(
         .collect();
     Ok((
         baseline,
-        ConfiguredCaseExecution {
+        ConfiguredAttemptParts {
             reset,
-            trace: executed.trace().clone(),
+            trace,
             journal_record_count,
             journal_last_record_hash,
             provider_object_count,
@@ -528,7 +717,7 @@ async fn execute_staged_campaign(
         }
         let journal_path =
             artifacts.prepare_path(format!("cases/{case_id}/observations.ndjson"))?;
-        let (fresh_baseline, execution) = execute_configured_case_attempt(
+        let (fresh_baseline, execution) = Box::pin(execute_configured_case_attempt(
             config,
             configured_probe,
             configured_quiescence,
@@ -539,7 +728,7 @@ async fn execute_staged_campaign(
             &case_id,
             journal_path,
             cancellation,
-        )
+        ))
         .await?;
         baseline = fresh_baseline;
         artifacts.write_json(format!("cases/{case_id}/trace.json"), execution.trace())?;
@@ -803,6 +992,8 @@ pub enum ConfiguredCampaignError {
     CaseConfig(#[from] ReferenceCaseRunConfigError),
     #[error("configured case execution failed: {0}")]
     CaseRun(ReferenceCaseRunError),
+    #[error("configured attempt returned the wrong validated trace authority")]
+    AttemptTraceMismatch,
     #[error("configured case {case_id} exceeded its total timeout")]
     CaseTimedOut { case_id: String },
     #[error("configured campaign was interrupted")]
@@ -874,6 +1065,7 @@ impl ConfiguredCampaignError {
             | Self::FixtureRequest(_)
             | Self::FixtureState
             | Self::CaseRun(_)
+            | Self::AttemptTraceMismatch
             | Self::RecoveryFailed { cause: None, .. }
             | Self::Database(_)
             | Self::Clock => ConfiguredCampaignFailureClass::Infrastructure,
@@ -908,6 +1100,7 @@ impl ConfiguredCampaignError {
             Self::FixtureState => "fixture_state",
             Self::CaseConfig(_) => "invalid_case_http_contract",
             Self::CaseRun(_) => "case_execution",
+            Self::AttemptTraceMismatch => "attempt_trace_mismatch",
             Self::CaseTimedOut { .. } => "case_timeout",
             Self::Interrupted { .. } => "interrupted",
             Self::RecoveryFailed { .. } => "recovery_failed",

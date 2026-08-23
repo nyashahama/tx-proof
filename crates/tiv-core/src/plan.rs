@@ -454,6 +454,27 @@ impl PlannedAction {
     pub const fn kind(&self) -> &PlanActionKind {
         &self.kind
     }
+
+    pub(crate) fn replay(
+        logical_sequence: u32,
+        decision_number: u64,
+        eligible_count: usize,
+        kind: PlanActionKind,
+    ) -> Self {
+        let dependencies = if logical_sequence > 1 {
+            BTreeSet::from([ActionId::new(logical_sequence - 1)])
+        } else {
+            BTreeSet::new()
+        };
+        Self {
+            id: ActionId::new(logical_sequence),
+            logical_sequence,
+            dependencies,
+            decision_number,
+            eligible_count,
+            kind,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -504,6 +525,10 @@ impl PlannedCase {
     #[must_use]
     pub fn actions(&self) -> &[PlannedAction] {
         &self.actions
+    }
+
+    pub(crate) const fn spec(&self) -> &PlanSpec {
+        &self.spec
     }
 
     /// Replays the pure compiler and compares the complete plan artifact.
@@ -918,6 +943,49 @@ fn apply_action(mut state: ModelState, action: PlanActionKind) -> Option<ModelSt
         }
         _ => None,
     }
+}
+
+pub(crate) fn validate_replay_action_kinds(
+    spec: &PlanSpec,
+    actions: &[PlanActionKind],
+) -> Result<Vec<usize>, PlanValidationError> {
+    spec.validate()?;
+    if actions.len() > usize::try_from(MAX_ACTIONS_PER_CASE).expect("the v1 bound fits usize") {
+        return Err(PlanValidationError::CapabilityOutsideV1Bounds);
+    }
+
+    let mut state = ModelState::default();
+    let mut eligible_counts = Vec::with_capacity(actions.len());
+    for action in actions {
+        let eligible = eligible_actions(state, spec);
+        if !eligible.contains(action) {
+            return Err(PlanValidationError::PlanIsNotFeasible);
+        }
+        eligible_counts.push(eligible.len());
+        state = apply_action(state, *action).ok_or(PlanValidationError::PlanIsNotFeasible)?;
+    }
+    if !state.is_complete() {
+        return Err(PlanValidationError::PlanIsNotFeasible);
+    }
+    Ok(eligible_counts)
+}
+
+pub(crate) fn normalize_replay_action_kinds(
+    spec: &PlanSpec,
+    actions: &[PlanActionKind],
+) -> Option<Vec<usize>> {
+    spec.validate().ok()?;
+    let mut state = ModelState::default();
+    let mut retained = Vec::with_capacity(actions.len());
+    for (index, action) in actions.iter().enumerate() {
+        let eligible = eligible_actions(state, spec);
+        if !eligible.contains(action) {
+            continue;
+        }
+        state = apply_action(state, *action)?;
+        retained.push(index);
+    }
+    state.is_complete().then_some(retained)
 }
 
 fn apply_provider_action(phase: Phase, action: PlanActionKind) -> Option<Phase> {

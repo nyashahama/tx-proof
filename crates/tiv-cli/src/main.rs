@@ -13,6 +13,7 @@ async fn main() -> ExitCode {
             | Command::Replay {
                 command: ReplayCommand::Configured(_)
             }
+            | Command::Shrink { .. }
     ) {
         let cancellation = RunCancellation::new();
         let signal_cancellation = cancellation.clone();

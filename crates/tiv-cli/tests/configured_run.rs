@@ -217,6 +217,167 @@ async fn configured_replay_reproduces_one_verified_failure_three_times() {
 
 #[tokio::test]
 #[ignore = "requires the isolated reference-app Compose project"]
+#[allow(clippy::too_many_lines)]
+async fn configured_shrink_evaluates_one_replayed_candidate_and_finalizes_evidence() {
+    let _guard = E2E_LOCK.lock().await;
+    prepare_reference_baseline().await;
+    reset_fixture_process().await;
+    let _ = fs::remove_dir_all(ARTIFACT_ROOT);
+
+    let source_output = run_configured_command(8);
+    assert_eq!(
+        source_output.status.code(),
+        Some(10),
+        "seed 8 must record a violating source case: {}",
+        String::from_utf8_lossy(&source_output.stderr)
+    );
+    let source_receipt: serde_json::Value = serde_json::from_slice(&source_output.stdout).unwrap();
+    let source_path = Path::new(source_receipt["artifact_path"].as_str().unwrap());
+    verify_complete_run_artifact(source_path).unwrap();
+
+    let replay_output = configured_replay_command(source_path)
+        .output()
+        .expect("the configured replay command executes");
+    assert_eq!(
+        replay_output.status.code(),
+        Some(10),
+        "configured replay failed before shrink: {}",
+        String::from_utf8_lossy(&replay_output.stderr)
+    );
+    let replay_receipt: serde_json::Value = serde_json::from_slice(&replay_output.stdout).unwrap();
+    assert_eq!(replay_receipt["classification"], "stable");
+    assert_eq!(replay_receipt["matching_failure_count"], 3);
+    let replay_path = Path::new(replay_receipt["artifact_path"].as_str().unwrap());
+    verify_complete_run_artifact(replay_path).unwrap();
+
+    let shrink_output = configured_shrink_command(replay_path)
+        .output()
+        .expect("the configured shrink command executes");
+    assert!(
+        matches!(shrink_output.status.code(), Some(10 | 11)),
+        "configured shrink failed: {}",
+        String::from_utf8_lossy(&shrink_output.stderr)
+    );
+    let shrink_receipt: serde_json::Value = serde_json::from_slice(&shrink_output.stdout).unwrap();
+    assert_eq!(shrink_receipt["status"], "configured_shrink_complete");
+    assert_eq!(
+        shrink_receipt["source_replay_id"],
+        replay_receipt["replay_id"]
+    );
+    assert_eq!(shrink_receipt["case_id"], "case_0001");
+    assert_eq!(shrink_receipt["evaluated_candidates"], 1);
+    assert!(shrink_receipt["accepted_candidates"].as_u64().unwrap() <= 1);
+    assert!(
+        shrink_receipt["best_action_count"].as_u64().unwrap()
+            <= shrink_receipt["original_action_count"].as_u64().unwrap()
+    );
+    assert_eq!(
+        shrink_output.status.code(),
+        Some(if shrink_receipt["completion"] == "budget_exhausted" {
+            11
+        } else {
+            10
+        })
+    );
+
+    let shrink_path = Path::new(shrink_receipt["artifact_path"].as_str().unwrap());
+    verify_complete_run_artifact(shrink_path).unwrap();
+    assert_eq!(
+        fs::read(shrink_path.join("trace.original.json")).unwrap(),
+        fs::read(replay_path.join("trace.original.json")).unwrap()
+    );
+    let summary: serde_json::Value =
+        serde_json::from_slice(&fs::read(shrink_path.join("summary.json")).unwrap()).unwrap();
+    assert_eq!(summary["candidate_limit"], 1);
+    assert_eq!(summary["max_time_milliseconds"], 600_000);
+    assert_eq!(summary["original_attempt_count"], 3);
+    assert_eq!(summary["original_matching_failure_count"], 3);
+    assert_eq!(summary["evaluated_candidates"], 1);
+    assert!(matches!(
+        summary["completion"].as_str(),
+        Some("complete" | "budget_exhausted")
+    ));
+    assert_eq!(
+        shrink_path.join("trace.minimized.json").is_file(),
+        summary["minimized_trace_written"].as_bool().unwrap()
+    );
+    assert!(
+        summary["original_attempts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|attempt| {
+                attempt["trace_matches_authority"] == true
+                    && attempt["verdict"] == "expected_violation"
+                    && attempt["invariants"]
+                        .as_array()
+                        .is_some_and(|items| items.len() == 5)
+                    && attempt["before_database_oid"] != attempt["after_database_oid"]
+            })
+    );
+    let candidates = summary["candidates"].as_array().unwrap();
+    assert_eq!(candidates.len(), 1);
+    let candidate = &candidates[0];
+    let candidate_id = candidate["candidate_id"].as_str().unwrap();
+    assert_eq!(candidate["attempts"].as_array().unwrap().len(), 3);
+    assert!(
+        candidate["attempts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|attempt| {
+                attempt["trace_matches_authority"] == true
+                    && attempt["invariants"]
+                        .as_array()
+                        .is_some_and(|items| items.len() == 5)
+                    && attempt["before_database_oid"] != attempt["after_database_oid"]
+            })
+    );
+    assert!(
+        shrink_path
+            .join(format!("candidates/{candidate_id}/candidate.json"))
+            .is_file()
+    );
+    assert!(
+        shrink_path
+            .join(format!("candidates/{candidate_id}/evaluation.json"))
+            .is_file()
+    );
+    for attempt in 1..=3 {
+        assert!(
+            shrink_path
+                .join(format!(
+                    "candidates/{candidate_id}/attempts/attempt_{attempt:04}/trace.json"
+                ))
+                .is_file()
+        );
+        assert!(
+            shrink_path
+                .join(format!(
+                    "candidates/{candidate_id}/attempts/attempt_{attempt:04}/observations.ndjson"
+                ))
+                .is_file()
+        );
+    }
+    let artifact_bytes = read_artifact_tree(shrink_path);
+    for secret in [
+        "tiv-local-only-password",
+        "tiv-app-local-only-password",
+        "whsec_test_secret",
+        "run-scoped-control-token",
+    ] {
+        assert!(!artifact_bytes.contains(secret));
+    }
+    assert_reference_app_healthy();
+    verify_complete_run_artifact(source_path).unwrap();
+    verify_complete_run_artifact(replay_path).unwrap();
+
+    cleanup_reference_databases().await;
+    fs::remove_dir_all(ARTIFACT_ROOT).unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires the isolated reference-app Compose project"]
 async fn configured_replay_rejects_compatibility_drift_before_case_reset() {
     let _guard = E2E_LOCK.lock().await;
     prepare_reference_baseline().await;
@@ -546,6 +707,28 @@ fn configured_command_with_config(seed: u64, cases: u32, config: &Path) -> Comma
 
 fn configured_replay_command(artifact: &Path) -> Command {
     configured_replay_command_with_config(artifact, Path::new(CONFIG))
+}
+
+fn configured_shrink_command(artifact: &Path) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_tiv"));
+    command
+        .args(["shrink", "configured", "--artifact"])
+        .arg(artifact)
+        .arg("--config")
+        .arg(CONFIG)
+        .args(["--max-candidates", "1"])
+        .args(["--max-time", "10m"])
+        .env("TIV_POSTGRES_ADMIN_URL", ADMIN_URL)
+        .env("DATABASE_URL", CASE_URL)
+        .env("TIV_STRIPE_WEBHOOK_SECRET", "whsec_test_secret")
+        .env("TIV_FIXTURE_CONTROL_TOKEN", "run-scoped-control-token")
+        .env("DOCKER_HOST", "tcp://127.0.0.1:9")
+        .env("DOCKER_CONTEXT", "intentionally-remote")
+        .env("HTTP_PROXY", "http://127.0.0.1:9")
+        .env("HTTPS_PROXY", "http://127.0.0.1:9")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    command
 }
 
 fn configured_replay_command_with_config(artifact: &Path, config: &Path) -> Command {

@@ -1,7 +1,10 @@
+use std::time::Duration;
+
 use clap::Parser;
 use tiv_cli::{
-    BaselineArgs, Cli, Command, ConfiguredReplayArgs, DoctorArgs, ReferenceAppCaseArgs,
-    ReferenceAppEvidenceArgs, ReferenceAppReplayArgs, ReplayCommand, RunArgs, TraceCommand,
+    BaselineArgs, Cli, Command, ConfiguredReplayArgs, ConfiguredShrinkArgs, DoctorArgs,
+    ReferenceAppCaseArgs, ReferenceAppEvidenceArgs, ReferenceAppReplayArgs, ReplayCommand, RunArgs,
+    ShrinkCommand, TraceCommand,
 };
 
 #[test]
@@ -178,6 +181,70 @@ fn the_cli_exposes_exactly_three_attempts_for_one_configured_artifact_case() {
         ])
         .is_err()
     );
+}
+
+#[test]
+fn the_cli_exposes_bounded_configured_shrink_with_safe_defaults() {
+    let default = Cli::try_parse_from([
+        "tiv",
+        "shrink",
+        "configured",
+        "--artifact",
+        ".tiv/runs/run_replay",
+    ])
+    .expect("the configured shrink command parses");
+    assert_eq!(
+        default.command,
+        Command::Shrink {
+            command: ShrinkCommand::Configured(ConfiguredShrinkArgs {
+                artifact: ".tiv/runs/run_replay".into(),
+                config: "tiv.toml".into(),
+                max_candidates: 60,
+                max_time: Duration::from_secs(600),
+            }),
+        }
+    );
+
+    let explicit = Cli::try_parse_from([
+        "tiv",
+        "shrink",
+        "configured",
+        "--artifact",
+        ".tiv/runs/run_replay",
+        "--config",
+        "safe/tiv.toml",
+        "--max-candidates",
+        "7",
+        "--max-time",
+        "90s",
+    ])
+    .unwrap();
+    assert_eq!(
+        explicit.command,
+        Command::Shrink {
+            command: ShrinkCommand::Configured(ConfiguredShrinkArgs {
+                artifact: ".tiv/runs/run_replay".into(),
+                config: "safe/tiv.toml".into(),
+                max_candidates: 7,
+                max_time: Duration::from_secs(90),
+            }),
+        }
+    );
+
+    for invalid in ["0s", "11m", "forever", "1h"] {
+        assert!(
+            Cli::try_parse_from([
+                "tiv",
+                "shrink",
+                "configured",
+                "--artifact",
+                ".tiv/runs/run_replay",
+                "--max-time",
+                invalid,
+            ])
+            .is_err()
+        );
+    }
 }
 
 #[test]

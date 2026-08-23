@@ -602,13 +602,66 @@ tiv init
 tiv doctor [--config tiv.toml]
 tiv baseline [--config tiv.toml]
 tiv run [--seed U64] [--cases N] [--ci]
-tiv replay PATH [--attempts N]
-tiv shrink PATH [--max-candidates N] [--max-time 10m]
+tiv replay configured --artifact PATH [--config tiv.toml] --case N
+tiv shrink configured --artifact REPLAY_PATH [--config tiv.toml] [--max-candidates N] [--max-time 10m]
 tiv inspect PATH
 tiv cleanup --run RUN_ID
 ```
 
 `replay` fails before mutation if the compatibility fingerprint is missing or incompatible. `inspect` never executes customer code.
+
+### Implemented configured-shrink contract
+
+`tiv shrink configured` accepts only a complete, checksum-valid configured-replay
+artifact. It loads and validates that source before configuration or stack access,
+then repeats the compatibility and disposable-database safety boundary before any
+mutation. The source trace bytes are copied unchanged into the shrink artifact;
+shrinking never overwrites its input.
+
+The runtime first re-executes the original trace three times from fresh baselines.
+Fewer than two matching failures produces `source_inconclusive` and exit `4`, with
+no candidate accepted. Once the source is reproducible, each deterministic,
+dependency-valid candidate also receives three fresh-baseline attempts and is
+accepted only when the same invariant fails at the same checkpoint in at least
+two attempts. `complete` means the representable frontier finished within the
+configured bounds; it is a bounded counterexample reduction, not proof of a
+global minimum.
+
+Both limits are fixed v1 safety bounds: `--max-candidates` accepts `1..=60`, and
+`--max-time` accepts `1ms..=10m`. One time budget starts immediately before the
+original three-attempt recheck and is shared by all candidate attempts. No new
+attempt starts after that deadline, and supervised case execution is capped by
+the lesser of the configured case timeout and the remaining shrink time. An
+already-started database safety operation or mandatory process recovery is
+allowed to finish after the deadline rather than being abandoned mid-mutation.
+Preflight, compatibility attestation, and initial evidence staging occur before
+the shrink timer starts.
+
+Completed outcomes are intentionally distinct:
+
+- exit `10`, `complete`: the source remained reproducible and the bounded
+  representable frontier was exhausted, whether or not a smaller candidate was
+  accepted;
+- exit `11`, `budget_exhausted`: the reproducible source is retained, but the
+  candidate count, time budget, or internal 60-candidate frontier cap stopped
+  the search;
+- exit `4`, `source_inconclusive`: the original trace did not reproduce the same
+  failure in at least two fresh attempts before evaluation completed.
+
+The finalized bundle records the original attempts, every fully evaluated
+candidate and its three attempts, cache and acceptance counts, the exact failure
+identity, both budgets, the untouched original trace, and an optional minimized
+trace. It uses the normal manifest/checksum verifier and allowlisted evidence
+projections.
+
+The current v1 transform vocabulary can delete dependency-valid action chunks;
+remove optional retries, retrievals, gates, webhook duplication/reordering, and
+crash/restart pairs; reduce or remove webhook delay; turn a dropped webhook into
+delivery; and simplify two-call or faulting provider scripts. It does not yet
+change the source amount, currency, or operation identity, move an action or
+crash cut point, synthesize metadata variants, or remove mandatory business-flow
+actions rejected by replay validation. Those are future transform families, not
+implicit claims of the present search.
 
 ## Concurrency, cancellation, and resource budgets
 

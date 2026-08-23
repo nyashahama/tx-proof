@@ -3,11 +3,12 @@ use std::path::PathBuf;
 use tiv_core::{
     decision::Seed,
     plan::{ActionBudget, CasePlanCompiler, PlanActionKind, PlanSpec},
+    shrink::{CandidateGenerator, CandidateLimit, ShrinkCandidate},
     trace::{CaseCapturedValue, CaseInputSlot, CaseOutputSlot},
 };
 use tiv_runtime::campaign::{
     CaseCaptureError, CaseEffectAdapter, CaseEffectFuture, CaseEffectRequest, CaseExecutionCause,
-    CaseExecutionError, execute_planned_case,
+    CaseExecutionError, execute_planned_case, execute_shrink_candidate,
 };
 use uuid::Uuid;
 
@@ -102,6 +103,17 @@ fn golden_case() -> tiv_core::plan::PlannedCase {
     .expect("the pinned case is feasible")
 }
 
+fn shrink_candidate() -> ShrinkCandidate {
+    let plan = golden_case();
+    CandidateGenerator::new(&plan)
+        .unwrap()
+        .candidates(None, CandidateLimit::default())
+        .unwrap()
+        .into_iter()
+        .next()
+        .expect("the pinned case has a valid simplification")
+}
+
 fn journal_path(label: &str) -> PathBuf {
     std::env::temp_dir().join(format!("tiv-{label}-{}.ndjson", Uuid::new_v4()))
 }
@@ -132,6 +144,33 @@ async fn actions_run_serially_after_durable_intent_and_materialize_one_trace() {
         };
         assert_eq!(record["observation_kind"], serde_json::json!(expected));
     }
+
+    tokio::fs::remove_file(path).await.unwrap();
+}
+
+#[tokio::test]
+async fn shrink_candidates_use_the_same_serial_journaled_execution_boundary() {
+    let path = journal_path("serial-shrink-case");
+    let candidate = shrink_candidate();
+    let mut adapter = RecordingAdapter::success(path.clone());
+
+    let execution = execute_shrink_candidate(
+        "run_shrink_1",
+        "candidate_1_attempt_1",
+        &candidate,
+        &path,
+        &mut adapter,
+    )
+    .await
+    .expect("the validated candidate executes");
+
+    assert_eq!(adapter.calls, candidate.actions().len());
+    assert_eq!(execution.trace().candidate(), &candidate);
+    assert_eq!(execution.trace().action_count(), candidate.actions().len());
+    assert_eq!(
+        execution.journal_summary().record_count(),
+        candidate.actions().len() * 2
+    );
 
     tokio::fs::remove_file(path).await.unwrap();
 }

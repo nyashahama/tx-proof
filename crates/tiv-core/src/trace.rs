@@ -5,11 +5,13 @@ use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 use crate::{
     decision::Seed,
     ids::{EventId, InvalidProviderId, PaymentIntentId},
-    plan::{PlanActionKind, PlannedCase, ProviderOutcome},
+    plan::{PlanActionKind, PlannedAction as CasePlannedAction, PlannedCase, ProviderOutcome},
+    shrink::ShrinkCandidate,
 };
 
 pub const TRACE_SCHEMA_VERSION: u16 = 1;
 pub const CASE_TRACE_SCHEMA_VERSION: u16 = 3;
+pub const SHRINK_TRACE_SCHEMA_VERSION: u16 = 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(transparent)]
@@ -784,6 +786,114 @@ impl CompiledCaseTrace {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct CompiledShrinkTrace {
+    schema_version: u16,
+    candidate: ShrinkCandidate,
+    actions: Vec<CompiledCaseAction>,
+    captured: Vec<CaseCapturedOutput>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CompiledShrinkTraceWire {
+    schema_version: u16,
+    candidate: ShrinkCandidate,
+    actions: Vec<CompiledCaseAction>,
+    captured: Vec<CaseCapturedOutput>,
+}
+
+impl<'de> Deserialize<'de> for CompiledShrinkTrace {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = CompiledShrinkTraceWire::deserialize(deserializer)?;
+        if wire.schema_version != SHRINK_TRACE_SCHEMA_VERSION {
+            return Err(D::Error::custom(format_args!(
+                "unsupported shrink trace schema version {}; expected {SHRINK_TRACE_SCHEMA_VERSION}",
+                wire.schema_version
+            )));
+        }
+        let expected = ShrinkTraceMaterializer::materialize(
+            &wire.candidate,
+            wire.captured
+                .iter()
+                .map(|captured| (captured.output_ref, captured.value.clone())),
+        )
+        .map_err(|error| {
+            D::Error::custom(format_args!("invalid materialized shrink trace: {error:?}"))
+        })?;
+        let received = Self {
+            schema_version: wire.schema_version,
+            candidate: wire.candidate,
+            actions: wire.actions,
+            captured: wire.captured,
+        };
+        if received != expected {
+            return Err(D::Error::custom(
+                "materialized shrink actions do not match the validated candidate",
+            ));
+        }
+        Ok(received)
+    }
+}
+
+impl CompiledShrinkTrace {
+    #[must_use]
+    pub const fn schema_version(&self) -> u16 {
+        self.schema_version
+    }
+
+    #[must_use]
+    pub const fn candidate(&self) -> &ShrinkCandidate {
+        &self.candidate
+    }
+
+    #[must_use]
+    pub const fn action_count(&self) -> usize {
+        self.actions.len()
+    }
+
+    #[must_use]
+    pub fn replay_action(&self, action_id: ActionId) -> Option<ReplayCaseAction<'_>> {
+        self.actions
+            .iter()
+            .find(|action| action.id == action_id)
+            .map(|action| ReplayCaseAction {
+                action,
+                captured: &self.captured,
+            })
+    }
+
+    pub fn replay_actions(&self) -> impl Iterator<Item = ReplayCaseAction<'_>> {
+        self.actions.iter().map(|action| ReplayCaseAction {
+            action,
+            captured: &self.captured,
+        })
+    }
+
+    #[must_use]
+    pub fn resolve(&self, output_ref: CaseOutputRef) -> Option<&CaseCapturedValue> {
+        self.captured
+            .iter()
+            .find(|captured| captured.output_ref == output_ref)
+            .map(|captured| &captured.value)
+    }
+
+    /// Checks that a fresh execution followed this shrink candidate authority.
+    ///
+    /// Durable provider and event identifiers must match. Single-use provider
+    /// gates are deliberately rebound after every fresh baseline reset.
+    #[must_use]
+    pub fn matches_replay_authority(&self, executed: &Self) -> bool {
+        self.schema_version == executed.schema_version
+            && self.candidate == executed.candidate
+            && self.actions == executed.actions
+            && durable_captures(&self.captured).eq(durable_captures(&executed.captured))
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct ReplayCaseAction<'a> {
     action: &'a CompiledCaseAction,
@@ -851,7 +961,7 @@ impl CaseTraceMaterializer {
         planned_case
             .validate()
             .map_err(|_| CaseTraceMaterializationError::InvalidPlannedCase)?;
-        Ok(materialize_case_actions(planned_case)?
+        Ok(materialize_case_actions(planned_case.actions())?
             .iter()
             .flat_map(|action| action.declared_outputs.iter().copied())
             .collect())
@@ -869,7 +979,7 @@ impl CaseTraceMaterializer {
         planned_case
             .validate()
             .map_err(|_| CaseTraceMaterializationError::InvalidPlannedCase)?;
-        Ok(materialize_case_actions(planned_case)?
+        Ok(materialize_case_actions(planned_case.actions())?
             .iter()
             .flat_map(|action| {
                 action.inputs.iter().map(|input| CaseInputBinding {
@@ -898,56 +1008,145 @@ impl CaseTraceMaterializer {
         planned_case
             .validate()
             .map_err(|_| CaseTraceMaterializationError::InvalidPlannedCase)?;
-        let actions = materialize_case_actions(planned_case)?;
-        let declared_outputs = actions
-            .iter()
-            .flat_map(|action| action.declared_outputs.iter().copied())
-            .collect::<BTreeSet<_>>();
-        let mut captured_outputs = BTreeMap::new();
-        for (output_ref, value) in captured {
-            if captured_outputs.insert(output_ref, value).is_some() {
-                return Err(CaseTraceMaterializationError::DuplicateOutput(output_ref));
-            }
-        }
-        if let Some(&unexpected) = captured_outputs
-            .keys()
-            .find(|output_ref| !declared_outputs.contains(output_ref))
-        {
-            return Err(CaseTraceMaterializationError::UnexpectedOutput(unexpected));
-        }
-        for output_ref in declared_outputs {
-            let value = captured_outputs
-                .get(&output_ref)
-                .ok_or(CaseTraceMaterializationError::MissingOutput(output_ref))?;
-            if value.kind() != output_ref.slot {
-                return Err(CaseTraceMaterializationError::OutputTypeMismatch {
-                    output_ref,
-                    actual: value.kind(),
-                });
-            }
-        }
+        let actions = materialize_case_actions(planned_case.actions())?;
+        let captured = bind_case_captures(&actions, captured)?;
         Ok(CompiledCaseTrace {
             schema_version: CASE_TRACE_SCHEMA_VERSION,
             planned_case: planned_case.clone(),
             actions,
-            captured: captured_outputs
-                .into_iter()
-                .map(|(output_ref, value)| CaseCapturedOutput { output_ref, value })
-                .collect(),
+            captured,
         })
     }
 }
 
+pub struct ShrinkTraceMaterializer;
+
+impl ShrinkTraceMaterializer {
+    /// Returns the exact dynamic values a candidate execution must capture.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CaseTraceMaterializationError`] when the candidate does not
+    /// revalidate or its dynamic bindings cannot be materialized.
+    pub fn required_outputs(
+        candidate: &ShrinkCandidate,
+    ) -> Result<Vec<CaseOutputRef>, CaseTraceMaterializationError> {
+        candidate
+            .validate()
+            .map_err(|_| CaseTraceMaterializationError::InvalidShrinkCandidate)?;
+        Ok(materialize_case_actions(candidate.actions())?
+            .iter()
+            .flat_map(|action| action.declared_outputs.iter().copied())
+            .collect())
+    }
+
+    /// Returns the exact earlier outputs each candidate action consumes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CaseTraceMaterializationError`] when the candidate does not
+    /// revalidate or its dynamic bindings cannot be materialized.
+    pub fn required_inputs(
+        candidate: &ShrinkCandidate,
+    ) -> Result<Vec<CaseInputBinding>, CaseTraceMaterializationError> {
+        candidate
+            .validate()
+            .map_err(|_| CaseTraceMaterializationError::InvalidShrinkCandidate)?;
+        Ok(materialize_case_actions(candidate.actions())?
+            .iter()
+            .flat_map(|action| {
+                action.inputs.iter().map(|input| CaseInputBinding {
+                    action_id: action.id,
+                    slot: input.slot,
+                    source: input.source,
+                })
+            })
+            .collect())
+    }
+
+    /// Binds every captured value to a complete, validated shrink candidate.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CaseTraceMaterializationError`] for an invalid candidate or
+    /// missing, duplicated, unexpected, or wrongly typed captured output.
+    pub fn materialize<I>(
+        candidate: &ShrinkCandidate,
+        captured: I,
+    ) -> Result<CompiledShrinkTrace, CaseTraceMaterializationError>
+    where
+        I: IntoIterator<Item = (CaseOutputRef, CaseCapturedValue)>,
+    {
+        candidate
+            .validate()
+            .map_err(|_| CaseTraceMaterializationError::InvalidShrinkCandidate)?;
+        let actions = materialize_case_actions(candidate.actions())?;
+        let captured = bind_case_captures(&actions, captured)?;
+        Ok(CompiledShrinkTrace {
+            schema_version: SHRINK_TRACE_SCHEMA_VERSION,
+            candidate: candidate.clone(),
+            actions,
+            captured,
+        })
+    }
+}
+
+fn bind_case_captures<I>(
+    actions: &[CompiledCaseAction],
+    captured: I,
+) -> Result<Vec<CaseCapturedOutput>, CaseTraceMaterializationError>
+where
+    I: IntoIterator<Item = (CaseOutputRef, CaseCapturedValue)>,
+{
+    let declared_outputs = actions
+        .iter()
+        .flat_map(|action| action.declared_outputs.iter().copied())
+        .collect::<BTreeSet<_>>();
+    let mut captured_outputs = BTreeMap::new();
+    for (output_ref, value) in captured {
+        if captured_outputs.insert(output_ref, value).is_some() {
+            return Err(CaseTraceMaterializationError::DuplicateOutput(output_ref));
+        }
+    }
+    if let Some(&unexpected) = captured_outputs
+        .keys()
+        .find(|output_ref| !declared_outputs.contains(output_ref))
+    {
+        return Err(CaseTraceMaterializationError::UnexpectedOutput(unexpected));
+    }
+    for output_ref in declared_outputs {
+        let value = captured_outputs
+            .get(&output_ref)
+            .ok_or(CaseTraceMaterializationError::MissingOutput(output_ref))?;
+        if value.kind() != output_ref.slot {
+            return Err(CaseTraceMaterializationError::OutputTypeMismatch {
+                output_ref,
+                actual: value.kind(),
+            });
+        }
+    }
+    Ok(captured_outputs
+        .into_iter()
+        .map(|(output_ref, value)| CaseCapturedOutput { output_ref, value })
+        .collect())
+}
+
+fn durable_captures(captured: &[CaseCapturedOutput]) -> impl Iterator<Item = &CaseCapturedOutput> {
+    captured
+        .iter()
+        .filter(|captured| !matches!(captured.value, CaseCapturedValue::ProviderGateId(_)))
+}
+
 fn materialize_case_actions(
-    planned_case: &PlannedCase,
+    planned_actions: &[CasePlannedAction],
 ) -> Result<Vec<CompiledCaseAction>, CaseTraceMaterializationError> {
     let mut active_payment_intent = None;
     let mut provider_objects = Vec::new();
     let mut generated_provider_events = 0_usize;
     let mut held_provider_gate = None;
-    let mut actions = Vec::with_capacity(planned_case.actions().len());
+    let mut actions = Vec::with_capacity(planned_actions.len());
 
-    for planned in planned_case.actions() {
+    for planned in planned_actions {
         let mut inputs = Vec::new();
         let mut declared_outputs = BTreeSet::new();
         match *planned.kind() {
@@ -1075,6 +1274,7 @@ const fn provider_create_commits(outcome: ProviderOutcome) -> bool {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CaseTraceMaterializationError {
     InvalidPlannedCase,
+    InvalidShrinkCandidate,
     DuplicateOutput(CaseOutputRef),
     MissingOutput(CaseOutputRef),
     UnexpectedOutput(CaseOutputRef),

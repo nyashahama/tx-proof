@@ -3,7 +3,7 @@
 use std::{
     fs,
     path::PathBuf,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use clap::{Args, Parser, Subcommand};
@@ -23,6 +23,10 @@ use tiv_runtime::{
     configured_replay::{
         ConfiguredReplayError, ConfiguredReplayOptions, ConfiguredReplayOptionsError,
         run_configured_replay_with_cancellation,
+    },
+    configured_shrink::{
+        ConfiguredShrinkError, ConfiguredShrinkOptions, ConfiguredShrinkOptionsError,
+        run_configured_shrink_with_cancellation,
     },
     doctor::{DoctorError, run_doctor},
     init::{InitError, initialize_project},
@@ -94,6 +98,11 @@ pub enum Command {
         #[command(subcommand)]
         command: ReplayCommand,
     },
+    /// Minimize one reproducible configured replay under fixed v1 budgets.
+    Shrink {
+        #[command(subcommand)]
+        command: ShrinkCommand,
+    },
     /// Inspect and validate compiled replay traces.
     Trace {
         #[command(subcommand)]
@@ -159,6 +168,30 @@ pub struct ConfiguredReplayArgs {
     /// One-based recorded campaign case to replay exactly three times.
     #[arg(long)]
     pub case: u32,
+}
+
+#[derive(Debug, PartialEq, Subcommand)]
+pub enum ShrinkCommand {
+    /// Minimize one verified configured replay without changing failure identity.
+    Configured(ConfiguredShrinkArgs),
+}
+
+#[derive(Clone, Debug, PartialEq, Args)]
+pub struct ConfiguredShrinkArgs {
+    /// Complete configured-replay artifact containing reproducible source evidence.
+    #[arg(long)]
+    pub artifact: PathBuf,
+    /// Typed TOML configuration for the same disposable customer stack.
+    #[arg(long, default_value = "tiv.toml")]
+    pub config: PathBuf,
+    /// Maximum unique candidates evaluated, capped at the v1 limit of 60.
+    #[arg(long, default_value_t = 60)]
+    pub max_candidates: u8,
+    /// Shared source-recheck and candidate-search budget (`ms`, `s`, or `m`; maximum 10m).
+    ///
+    /// A safety recovery already in progress may finish after this deadline.
+    #[arg(long, default_value = "10m", value_parser = parse_shrink_duration)]
+    pub max_time: Duration,
 }
 
 #[derive(Clone, Debug, PartialEq, Args)]
@@ -260,6 +293,7 @@ pub fn execute(cli: Cli) -> Result<String, CliError> {
         Command::Doctor(_)
         | Command::Baseline(_)
         | Command::Run(_)
+        | Command::Shrink { .. }
         | Command::Replay {
             command:
                 ReplayCommand::ReferenceApp(_)
@@ -331,6 +365,22 @@ pub async fn execute_async_with_cancellation(
             let body = output.to_pretty_json().map_err(CliError::Encode)?;
             Ok(CliOutput { body, exit_code })
         }
+        Command::Shrink {
+            command: ShrinkCommand::Configured(args),
+        } => {
+            let options = ConfiguredShrinkOptions::new(args.max_candidates, args.max_time)?;
+            let output = Box::pin(run_configured_shrink_with_cancellation(
+                &args.artifact,
+                &args.config,
+                &ProcessEnvironment,
+                options,
+                cancellation,
+            ))
+            .await?;
+            let exit_code = output.completion().exit_code();
+            let body = output.to_pretty_json().map_err(CliError::Encode)?;
+            Ok(CliOutput { body, exit_code })
+        }
         command => execute_async_text(Cli { command })
             .await
             .map(CliOutput::success),
@@ -354,6 +404,7 @@ async fn execute_async_text(cli: Cli) -> Result<String, CliError> {
             output.to_pretty_json().map_err(CliError::Encode)
         }
         Command::Run(_)
+        | Command::Shrink { .. }
         | Command::Replay {
             command: ReplayCommand::Configured(_),
         } => Err(CliError::AsyncCommand),
@@ -495,6 +546,31 @@ fn current_unix_timestamp() -> Result<i64, CliError> {
     i64::try_from(seconds).map_err(|_| CliError::InvalidSystemTime)
 }
 
+fn parse_shrink_duration(value: &str) -> Result<Duration, String> {
+    let (digits, multiplier) = if let Some(digits) = value.strip_suffix("ms") {
+        (digits, 1_u64)
+    } else if let Some(digits) = value.strip_suffix('s') {
+        (digits, 1_000)
+    } else if let Some(digits) = value.strip_suffix('m') {
+        (digits, 60_000)
+    } else {
+        return Err("duration must end in ms, s, or m".to_owned());
+    };
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err("duration must contain an unsigned integer".to_owned());
+    }
+    let value = digits
+        .parse::<u64>()
+        .map_err(|_| "duration is outside the supported range".to_owned())?;
+    let milliseconds = value
+        .checked_mul(multiplier)
+        .ok_or_else(|| "duration is outside the supported range".to_owned())?;
+    let duration = Duration::from_millis(milliseconds);
+    ConfiguredShrinkOptions::new(1, duration)
+        .map(|_| duration)
+        .map_err(|error| error.to_string())
+}
+
 #[derive(Debug, Error)]
 pub enum CliError {
     #[error("could not read trace {path}: {source}")]
@@ -536,6 +612,10 @@ pub enum CliError {
     ConfiguredReplayOptions(#[from] ConfiguredReplayOptionsError),
     #[error("configured replay failed: {0}")]
     ConfiguredReplay(#[from] ConfiguredReplayError),
+    #[error("configured shrink options are invalid: {0}")]
+    ConfiguredShrinkOptions(#[from] ConfiguredShrinkOptionsError),
+    #[error("configured shrink failed: {0}")]
+    ConfiguredShrink(#[from] ConfiguredShrinkError),
     #[error("the system clock could not produce a valid webhook timestamp")]
     InvalidSystemTime,
     #[error("reference app replay configuration is invalid: {0}")]
@@ -560,6 +640,7 @@ impl CliError {
             Self::Baseline(error) if error.is_infrastructure_failure() => 3,
             Self::ConfiguredCampaign(error) => error.exit_code(),
             Self::ConfiguredReplay(error) => error.exit_code(),
+            Self::ConfiguredShrink(error) => error.exit_code(),
             _ => 2,
         }
     }

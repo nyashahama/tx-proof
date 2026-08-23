@@ -10,9 +10,11 @@ use std::{
 
 use tiv_core::{
     plan::{PlannedAction, PlannedCase},
+    shrink::ShrinkCandidate,
     trace::{
         ActionId, CaseCapturedValue, CaseInputBinding, CaseInputSlot, CaseOutputRef,
         CaseOutputSlot, CaseTraceMaterializationError, CaseTraceMaterializer, CompiledCaseTrace,
+        CompiledShrinkTrace, ShrinkTraceMaterializer,
     },
 };
 
@@ -115,6 +117,24 @@ impl ExecutedCase {
     }
 }
 
+#[derive(Debug)]
+pub struct ExecutedShrinkCase {
+    trace: CompiledShrinkTrace,
+    journal_summary: JournalSummary,
+}
+
+impl ExecutedShrinkCase {
+    #[must_use]
+    pub const fn trace(&self) -> &CompiledShrinkTrace {
+        &self.trace
+    }
+
+    #[must_use]
+    pub const fn journal_summary(&self) -> &JournalSummary {
+        &self.journal_summary
+    }
+}
+
 /// Executes one plan in exact action order and finalizes its journal.
 ///
 /// Every action intent is flushed and synchronized before the adapter future
@@ -140,16 +160,83 @@ where
         .map_err(CaseExecutionError::InvalidPlan)?;
     let required_inputs = CaseTraceMaterializer::required_inputs(planned_case)
         .map_err(CaseExecutionError::InvalidPlan)?;
-    let run_id = run_id.into();
-    let case_id = case_id.into();
-    let contexts = planned_case
-        .actions()
+    let (trace, journal_summary) = execute_case_actions(
+        run_id.into(),
+        case_id.into(),
+        planned_case.actions(),
+        journal_path.as_ref(),
+        &required_inputs,
+        &required_outputs,
+        adapter,
+        |captured| CaseTraceMaterializer::materialize(planned_case, captured),
+    )
+    .await?;
+    Ok(ExecutedCase {
+        trace,
+        journal_summary,
+    })
+}
+
+/// Executes one validated shrink candidate through the same serial,
+/// journal-first effect boundary as a seeded plan.
+///
+/// # Errors
+///
+/// Returns [`CaseExecutionError`] before journal creation for an invalid
+/// candidate or context, or after finalizing the journal for an execution or
+/// materialization failure.
+pub async fn execute_shrink_candidate<A>(
+    run_id: impl Into<String>,
+    case_id: impl Into<String>,
+    candidate: &ShrinkCandidate,
+    journal_path: impl AsRef<Path>,
+    adapter: &mut A,
+) -> Result<ExecutedShrinkCase, CaseExecutionError<A::Error>>
+where
+    A: CaseEffectAdapter,
+{
+    let required_outputs = ShrinkTraceMaterializer::required_outputs(candidate)
+        .map_err(CaseExecutionError::InvalidPlan)?;
+    let required_inputs = ShrinkTraceMaterializer::required_inputs(candidate)
+        .map_err(CaseExecutionError::InvalidPlan)?;
+    let (trace, journal_summary) = execute_case_actions(
+        run_id.into(),
+        case_id.into(),
+        candidate.actions(),
+        journal_path.as_ref(),
+        &required_inputs,
+        &required_outputs,
+        adapter,
+        |captured| ShrinkTraceMaterializer::materialize(candidate, captured),
+    )
+    .await?;
+    Ok(ExecutedShrinkCase {
+        trace,
+        journal_summary,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_case_actions<A, T, F>(
+    run_id: String,
+    case_id: String,
+    actions: &[PlannedAction],
+    journal_path: &Path,
+    required_inputs: &[CaseInputBinding],
+    required_outputs: &[CaseOutputRef],
+    adapter: &mut A,
+    materialize: F,
+) -> Result<(T, JournalSummary), CaseExecutionError<A::Error>>
+where
+    A: CaseEffectAdapter,
+    F: FnOnce(CaseEffectOutput) -> Result<T, CaseTraceMaterializationError>,
+{
+    let contexts = actions
         .iter()
         .map(|action| JournalContext::new(&run_id, &case_id, action.id()))
         .collect::<Result<Vec<_>, _>>()
         .map_err(CaseExecutionError::InvalidContext)?;
-    let max_records = planned_case
-        .actions()
+    let max_records = actions
         .len()
         .checked_mul(4)
         .ok_or(CaseExecutionError::InvalidJournalBounds)?;
@@ -160,22 +247,21 @@ where
         .map_err(CaseExecutionError::JournalCreate)?;
 
     let execution = run_actions(
-        planned_case,
+        actions,
         &contexts,
-        &required_inputs,
-        &required_outputs,
+        required_inputs,
+        required_outputs,
         &journal,
         adapter,
     )
     .await;
     let journal_result = journal.finish().await;
 
-    match execution {
+    match execution
+        .and_then(|captured| materialize(captured).map_err(CaseExecutionCause::Materialization))
+    {
         Ok(trace) => match journal_result {
-            Ok(journal_summary) => Ok(ExecutedCase {
-                trace,
-                journal_summary,
-            }),
+            Ok(journal_summary) => Ok((trace, journal_summary)),
             Err(error) => Err(CaseExecutionError::Failed(CaseExecutionFailure {
                 cause: CaseExecutionCause::Finalization,
                 journal_result: Err(error),
@@ -189,20 +275,20 @@ where
 }
 
 async fn run_actions<A>(
-    planned_case: &PlannedCase,
+    actions: &[PlannedAction],
     contexts: &[JournalContext],
     required_inputs: &[CaseInputBinding],
     required_outputs: &[CaseOutputRef],
     journal: &ObservationJournal,
     adapter: &mut A,
-) -> Result<CompiledCaseTrace, CaseExecutionCause<A::Error>>
+) -> Result<CaseEffectOutput, CaseExecutionCause<A::Error>>
 where
     A: CaseEffectAdapter,
 {
     let start = Instant::now();
     let mut captured = Vec::new();
 
-    for (index, (action, context)) in planned_case.actions().iter().zip(contexts).enumerate() {
+    for (index, (action, context)) in actions.iter().zip(contexts).enumerate() {
         let inputs = resolve_inputs(action.id(), required_inputs, &captured)?;
         let intent_sequence = observation_sequence(index, 1)?;
         journal
@@ -249,8 +335,7 @@ where
             .map_err(CaseExecutionCause::JournalAppend)?;
     }
 
-    CaseTraceMaterializer::materialize(planned_case, captured)
-        .map_err(CaseExecutionCause::Materialization)
+    Ok(captured)
 }
 
 fn resolve_inputs<E>(

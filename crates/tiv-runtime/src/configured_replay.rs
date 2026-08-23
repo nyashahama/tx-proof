@@ -44,7 +44,7 @@ use crate::{
     run_supervisor::ComposeProjectLock,
 };
 
-const ATTEMPT_COUNT: usize = 3;
+pub(crate) const ATTEMPT_COUNT: usize = 3;
 
 /// Fixed version-one configured replay selection.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -88,7 +88,7 @@ pub enum ConfiguredReplayOptionsError {
 }
 
 /// Three-attempt same-identity reproduction classification.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConfiguredReplayClassification {
     Stable,
@@ -226,7 +226,8 @@ struct ReplaySourceArtifact<'a> {
     expected_failure: FailureIdentityArtifact,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 struct FailureIdentityArtifact {
     invariant_id: String,
     checkpoint_id: String,
@@ -241,7 +242,18 @@ impl From<&FailureIdentity> for FailureIdentityArtifact {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+impl FailureIdentityArtifact {
+    fn to_identity(&self) -> Result<FailureIdentity, ConfiguredReplayArtifactError> {
+        Ok(FailureIdentity::new(
+            InvariantId::new(&self.invariant_id)
+                .map_err(|_| ConfiguredReplayArtifactError::InvalidReplaySummary)?,
+            CheckpointId::new(&self.checkpoint_id)
+                .map_err(|_| ConfiguredReplayArtifactError::InvalidReplaySummary)?,
+        ))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum ReplayAttemptVerdict {
     Held,
@@ -249,7 +261,8 @@ enum ReplayAttemptVerdict {
     OtherViolation,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 struct ReplayAttemptArtifact {
     schema_version: u16,
     attempt: usize,
@@ -268,7 +281,8 @@ struct ReplayAttemptArtifact {
     invariants: Vec<ReplayInvariantArtifact>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 struct ReplayInvariantArtifact {
     invariant_id: String,
     checkpoint_id: String,
@@ -288,6 +302,65 @@ struct ReplaySummary<'a> {
     matching_failure_count: usize,
     classification: ConfiguredReplayClassification,
     attempts: &'a [ReplayAttemptArtifact],
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReplaySourceDocument {
+    schema_version: u16,
+    source_run_id: String,
+    case_id: String,
+    expected_failure: FailureIdentityArtifact,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReplaySummaryDocument {
+    schema_version: u16,
+    status: String,
+    replay_id: String,
+    source_run_id: String,
+    case_id: String,
+    expected_failure: FailureIdentityArtifact,
+    attempt_count: usize,
+    matching_failure_count: usize,
+    classification: ConfiguredReplayClassification,
+    attempts: Vec<ReplayAttemptArtifact>,
+}
+
+pub(crate) struct VerifiedConfiguredReplaySource {
+    replay_id: String,
+    source_run_id: String,
+    case_id: String,
+    expected_failure: FailureIdentity,
+    original_trace: CompiledCaseTrace,
+    original_trace_bytes: Vec<u8>,
+}
+
+impl VerifiedConfiguredReplaySource {
+    pub(crate) fn replay_id(&self) -> &str {
+        &self.replay_id
+    }
+
+    pub(crate) fn source_run_id(&self) -> &str {
+        &self.source_run_id
+    }
+
+    pub(crate) fn case_id(&self) -> &str {
+        &self.case_id
+    }
+
+    pub(crate) const fn expected_failure(&self) -> &FailureIdentity {
+        &self.expected_failure
+    }
+
+    pub(crate) const fn original_trace(&self) -> &CompiledCaseTrace {
+        &self.original_trace
+    }
+
+    pub(crate) fn original_trace_bytes(&self) -> &[u8] {
+        &self.original_trace_bytes
+    }
 }
 
 #[derive(Serialize)]
@@ -507,7 +580,7 @@ async fn execute_replay_attempts(
             expected_compatibility.require_exact_match(&current_compatibility)?;
             fresh_baseline
         };
-        let (_fresh_baseline, execution) = execute_configured_case_attempt(
+        let (_fresh_baseline, execution) = Box::pin(execute_configured_case_attempt(
             config,
             configured_probe,
             configured_quiescence,
@@ -518,7 +591,7 @@ async fn execute_replay_attempts(
             &format!("{}_{}", recorded.case_id(), attempt_id),
             journal_path,
             cancellation,
-        )
+        ))
         .await
         .map_err(ConfiguredReplayError::Case)?;
         let trace_matches_source = recorded.trace().matches_replay_authority(execution.trace());
@@ -558,7 +631,7 @@ async fn execute_replay_attempts(
     Ok(())
 }
 
-async fn attest_replay_boundary(
+pub(crate) async fn attest_replay_boundary(
     config: &ResolvedConfig,
     configured_probe: &crate::postgres::probe::ConfiguredSqlProbe,
     configured_quiescence: &crate::postgres::quiescence::ConfiguredQuiescence,
@@ -760,6 +833,219 @@ fn load_recorded_case(
     })
 }
 
+pub(crate) fn load_verified_configured_replay_source(
+    artifact: &VerifiedRunArtifact,
+) -> Result<VerifiedConfiguredReplaySource, ConfiguredReplayArtifactError> {
+    let source_path = PathBuf::from("source.json");
+    let source: ReplaySourceDocument = decode_indexed(artifact, &source_path)?;
+    let summary_path = PathBuf::from("summary.json");
+    let summary: ReplaySummaryDocument = decode_indexed(artifact, &summary_path)?;
+    let original_path = PathBuf::from("trace.original.json");
+    let original_trace_bytes = artifact.read_indexed_bytes(&original_path)?;
+    let original_trace: CompiledCaseTrace =
+        serde_json::from_slice(&original_trace_bytes).map_err(|source| {
+            ConfiguredReplayArtifactError::Decode {
+                path: original_path,
+                source,
+            }
+        })?;
+    let expected_failure = source.expected_failure.to_identity()?;
+
+    if source.schema_version != 1
+        || !valid_run_label(&source.source_run_id)
+        || !valid_case_label(&source.case_id)
+        || summary.schema_version != 1
+        || summary.status != "configured_replay_complete"
+        || summary.replay_id != artifact.run_id()
+        || summary.source_run_id != source.source_run_id
+        || summary.case_id != source.case_id
+        || summary.expected_failure != source.expected_failure
+        || summary.attempt_count != ATTEMPT_COUNT
+        || summary.attempts.len() != ATTEMPT_COUNT
+    {
+        return Err(ConfiguredReplayArtifactError::InvalidReplaySummary);
+    }
+
+    let mut results = Vec::with_capacity(ATTEMPT_COUNT);
+    for (index, attempt) in summary.attempts.iter().enumerate() {
+        let attempt_number = index + 1;
+        let attempt_id = format!("attempt_{attempt_number:04}");
+        let result_path = PathBuf::from(format!("attempts/{attempt_id}/result.json"));
+        let indexed_result: ReplayAttemptArtifact = decode_indexed(artifact, &result_path)?;
+        if &indexed_result != attempt {
+            return Err(ConfiguredReplayArtifactError::InvalidReplayAttempt {
+                attempt: attempt_number,
+            });
+        }
+        let trace_path = PathBuf::from(format!("attempts/{attempt_id}/trace.json"));
+        let replay_trace: CompiledCaseTrace = decode_indexed(artifact, &trace_path)?;
+        if !original_trace.matches_replay_authority(&replay_trace) {
+            return Err(ConfiguredReplayArtifactError::InvalidReplayAttempt {
+                attempt: attempt_number,
+            });
+        }
+        results.push(validate_replay_attempt(
+            attempt,
+            attempt_number,
+            &source.case_id,
+            &expected_failure,
+            original_trace.action_count(),
+        )?);
+    }
+    let attempts: [AttemptResult; ATTEMPT_COUNT] = results
+        .try_into()
+        .map_err(|_| ConfiguredReplayArtifactError::InvalidReplaySummary)?;
+    let classification: ConfiguredReplayClassification =
+        classify_reproduction(&expected_failure, &attempts).into();
+    let matching_failure_count = attempts
+        .iter()
+        .filter(|attempt| {
+            matches!(attempt, AttemptResult::Violation(identity) if identity == &expected_failure)
+        })
+        .count();
+    if summary.classification != classification
+        || summary.matching_failure_count != matching_failure_count
+        || matching_failure_count < 2
+    {
+        return Err(ConfiguredReplayArtifactError::ReplayIsNotReproducible);
+    }
+
+    Ok(VerifiedConfiguredReplaySource {
+        replay_id: artifact.run_id().to_owned(),
+        source_run_id: source.source_run_id,
+        case_id: source.case_id,
+        expected_failure,
+        original_trace,
+        original_trace_bytes,
+    })
+}
+
+fn decode_indexed<T: for<'de> Deserialize<'de>>(
+    artifact: &VerifiedRunArtifact,
+    path: &Path,
+) -> Result<T, ConfiguredReplayArtifactError> {
+    serde_json::from_slice(&artifact.read_indexed_bytes(path)?).map_err(|source| {
+        ConfiguredReplayArtifactError::Decode {
+            path: path.to_owned(),
+            source,
+        }
+    })
+}
+
+fn validate_replay_attempt(
+    attempt: &ReplayAttemptArtifact,
+    attempt_number: usize,
+    case_id: &str,
+    expected_failure: &FailureIdentity,
+    action_count: usize,
+) -> Result<AttemptResult, ConfiguredReplayArtifactError> {
+    if attempt.schema_version != 1
+        || attempt.attempt != attempt_number
+        || attempt.case_id != case_id
+        || !attempt.trace_matches_source
+        || attempt.before_database_oid == 0
+        || attempt.after_database_oid == 0
+        || attempt.before_database_oid == attempt.after_database_oid
+        || attempt.before_marker_uuid == attempt.after_marker_uuid
+        || uuid::Uuid::parse_str(&attempt.before_marker_uuid).is_err()
+        || uuid::Uuid::parse_str(&attempt.after_marker_uuid).is_err()
+        || attempt.executed_action_count != action_count
+        || attempt.journal_record_count == 0
+        || !attempt
+            .journal_last_record_hash
+            .as_deref()
+            .is_some_and(valid_digest)
+    {
+        return Err(ConfiguredReplayArtifactError::InvalidReplayAttempt {
+            attempt: attempt_number,
+        });
+    }
+    validate_replay_invariants(&attempt.invariants, attempt_number)?;
+    let outcomes = attempt
+        .invariants
+        .iter()
+        .map(|invariant| {
+            (
+                FailureIdentity::new(
+                    InvariantId::new(&invariant.invariant_id)
+                        .expect("replay invariants were validated"),
+                    CheckpointId::new(&invariant.checkpoint_id)
+                        .expect("replay invariants were validated"),
+                ),
+                invariant.verdict == RecordedVerdict::Violated,
+            )
+        })
+        .collect::<Vec<_>>();
+    let result = attempt_result(
+        expected_failure,
+        outcomes
+            .iter()
+            .map(|(identity, violated)| (identity, *violated)),
+    );
+    let declared_identity = attempt
+        .failure_identity
+        .as_ref()
+        .map(FailureIdentityArtifact::to_identity)
+        .transpose()?;
+    let coherent = match (&attempt.verdict, &declared_identity, &result) {
+        (ReplayAttemptVerdict::Held, None, AttemptResult::Held) => true,
+        (
+            ReplayAttemptVerdict::ExpectedViolation,
+            Some(declared),
+            AttemptResult::Violation(actual),
+        ) => declared == expected_failure && actual == expected_failure,
+        (
+            ReplayAttemptVerdict::OtherViolation,
+            Some(declared),
+            AttemptResult::Violation(actual),
+        ) => declared == actual && actual != expected_failure,
+        _ => false,
+    };
+    if !coherent {
+        return Err(ConfiguredReplayArtifactError::InvalidReplayAttempt {
+            attempt: attempt_number,
+        });
+    }
+    Ok(result)
+}
+
+fn validate_replay_invariants(
+    invariants: &[ReplayInvariantArtifact],
+    attempt: usize,
+) -> Result<(), ConfiguredReplayArtifactError> {
+    if invariants.len() != 5 {
+        return Err(ConfiguredReplayArtifactError::InvalidReplayAttempt { attempt });
+    }
+    let mut identities = BTreeSet::new();
+    for invariant in invariants {
+        if InvariantId::new(&invariant.invariant_id).is_err()
+            || CheckpointId::new(&invariant.checkpoint_id).is_err()
+            || !identities.insert((
+                invariant.invariant_id.as_str(),
+                invariant.checkpoint_id.as_str(),
+            ))
+            || matches!(invariant.verdict, RecordedVerdict::Held) != (invariant.witness_count == 0)
+        {
+            return Err(ConfiguredReplayArtifactError::InvalidReplayAttempt { attempt });
+        }
+    }
+    Ok(())
+}
+
+fn valid_run_label(value: &str) -> bool {
+    value.starts_with("run_")
+        && (5..=80).contains(&value.len())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+}
+
+fn valid_case_label(value: &str) -> bool {
+    value.len() == 9
+        && value.starts_with("case_")
+        && value.as_bytes()[5..].iter().all(u8::is_ascii_digit)
+}
+
 fn validate_summary(
     artifact: &VerifiedRunArtifact,
     campaign: &CampaignPlan,
@@ -896,7 +1182,7 @@ fn select_expected_failure(
         .ok_or(ConfiguredReplayArtifactError::CaseDidNotViolate)
 }
 
-fn attempt_result<'a>(
+pub(crate) fn attempt_result<'a>(
     expected: &FailureIdentity,
     outcomes: impl IntoIterator<Item = (&'a FailureIdentity, bool)>,
 ) -> AttemptResult {
@@ -935,6 +1221,12 @@ pub enum ConfiguredReplayArtifactError {
     InvalidCaseResult,
     #[error("configured replay requires a recorded invariant violation")]
     CaseDidNotViolate,
+    #[error("configured replay summary is invalid or incoherent")]
+    InvalidReplaySummary,
+    #[error("configured replay attempt {attempt} is invalid or incoherent")]
+    InvalidReplayAttempt { attempt: usize },
+    #[error("configured replay source is not reproducible at the expected identity")]
+    ReplayIsNotReproducible,
 }
 
 /// Failure to prepare, execute, recover, or persist configured replay.
@@ -1089,8 +1381,11 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        ConfiguredReplayArtifactError, ConfiguredReplayOptions, RecordedInvariant, RecordedVerdict,
-        attempt_result, load_recorded_case, select_expected_failure,
+        ConfiguredReplayArtifactError, ConfiguredReplayClassification, ConfiguredReplayOptions,
+        FailureIdentityArtifact, RecordedInvariant, RecordedVerdict, ReplayAttemptArtifact,
+        ReplayAttemptVerdict, ReplayInvariantArtifact, ReplaySourceArtifact, ReplaySummary,
+        attempt_result, load_recorded_case, load_verified_configured_replay_source,
+        select_expected_failure,
     };
     use crate::{
         artifacts::{RunArtifactStaging, verify_complete_run_artifact},
@@ -1285,6 +1580,195 @@ mod tests {
         ));
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn shrink_source_loader_requires_a_coherent_reproducible_replay() {
+        let (root, final_path, trace) = replay_artifact(2);
+        let verified = verify_complete_run_artifact(&final_path).unwrap();
+
+        let source = load_verified_configured_replay_source(&verified).unwrap();
+
+        assert_eq!(source.replay_id(), "run_replay_source");
+        assert_eq!(source.source_run_id(), "run_campaign_source");
+        assert_eq!(source.case_id(), "case_0001");
+        assert_eq!(source.original_trace(), &trace);
+        assert_eq!(
+            source.expected_failure(),
+            &identity("provider-object-unique")
+        );
+        assert_eq!(
+            source.original_trace_bytes(),
+            fs::read(final_path.join("trace.original.json")).unwrap()
+        );
+        fs::remove_dir_all(root).unwrap();
+
+        let (root, final_path, _) = replay_artifact(1);
+        let verified = verify_complete_run_artifact(&final_path).unwrap();
+        assert!(matches!(
+            load_verified_configured_replay_source(&verified),
+            Err(ConfiguredReplayArtifactError::ReplayIsNotReproducible)
+        ));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn replay_artifact(
+        matching_failure_count: usize,
+    ) -> (
+        std::path::PathBuf,
+        std::path::PathBuf,
+        tiv_core::trace::CompiledCaseTrace,
+    ) {
+        let root = std::env::temp_dir().join(format!("tiv-shrink-source-{}", Uuid::new_v4()));
+        fs::create_dir(&root).unwrap();
+        let campaign = CampaignPlanner::compile(&CampaignSpec::payment_intent_v1(
+            Seed::new(4),
+            CaseCount::new(1).unwrap(),
+            ActionBudget::new(40).unwrap(),
+        ))
+        .unwrap();
+        let plan = campaign.cases()[0].plan();
+        let mut ordinal = 0_u64;
+        let captures = CaseTraceMaterializer::required_outputs(plan)
+            .unwrap()
+            .into_iter()
+            .map(|output| {
+                ordinal += 1;
+                let value = match output.slot() {
+                    CaseOutputSlot::PaymentIntentId => {
+                        CaseCapturedValue::payment_intent_id(format!("pi_replay_{ordinal}"))
+                            .unwrap()
+                    }
+                    CaseOutputSlot::EventId => {
+                        CaseCapturedValue::event_id(format!("evt_replay_{ordinal}")).unwrap()
+                    }
+                    CaseOutputSlot::ProviderGateId => {
+                        CaseCapturedValue::provider_gate_id(ordinal).unwrap()
+                    }
+                };
+                (output, value)
+            });
+        let trace = CaseTraceMaterializer::materialize(plan, captures).unwrap();
+        let expected = identity("provider-object-unique");
+        let mut attempts = Vec::new();
+        for attempt in 1..=3 {
+            let matches = attempt <= matching_failure_count;
+            let invariants = vec![
+                ReplayInvariantArtifact {
+                    invariant_id: "provider-object-unique".to_owned(),
+                    checkpoint_id: "checkout-quiescent".to_owned(),
+                    verdict: if matches {
+                        RecordedVerdict::Violated
+                    } else {
+                        RecordedVerdict::Held
+                    },
+                    witness_count: usize::from(matches),
+                },
+                ReplayInvariantArtifact {
+                    invariant_id: "event-process-at-most-once".to_owned(),
+                    checkpoint_id: "checkout-quiescent".to_owned(),
+                    verdict: RecordedVerdict::Held,
+                    witness_count: 0,
+                },
+                ReplayInvariantArtifact {
+                    invariant_id: "paid-order-amount-conservation".to_owned(),
+                    checkpoint_id: "checkout-quiescent".to_owned(),
+                    verdict: RecordedVerdict::Held,
+                    witness_count: 0,
+                },
+                ReplayInvariantArtifact {
+                    invariant_id: "terminal-success-monotonic".to_owned(),
+                    checkpoint_id: "checkout-quiescent".to_owned(),
+                    verdict: RecordedVerdict::Held,
+                    witness_count: 0,
+                },
+                ReplayInvariantArtifact {
+                    invariant_id: "balanced-ledger".to_owned(),
+                    checkpoint_id: "checkout-quiescent".to_owned(),
+                    verdict: RecordedVerdict::Held,
+                    witness_count: 0,
+                },
+            ];
+            attempts.push(ReplayAttemptArtifact {
+                schema_version: 1,
+                attempt,
+                case_id: "case_0001".to_owned(),
+                trace_matches_source: true,
+                before_database_oid: u32::try_from(100 + attempt * 2).unwrap(),
+                after_database_oid: u32::try_from(101 + attempt * 2).unwrap(),
+                before_marker_uuid: format!("00000000-0000-4000-8000-{attempt:012}"),
+                after_marker_uuid: format!("10000000-0000-4000-8000-{attempt:012}"),
+                executed_action_count: trace.action_count(),
+                journal_record_count: trace.action_count() * 2,
+                journal_last_record_hash: Some("a".repeat(64)),
+                provider_object_count: 1,
+                verdict: if matches {
+                    ReplayAttemptVerdict::ExpectedViolation
+                } else {
+                    ReplayAttemptVerdict::Held
+                },
+                failure_identity: matches.then(|| (&expected).into()),
+                invariants,
+            });
+        }
+        let classification = match matching_failure_count {
+            3 => ConfiguredReplayClassification::Stable,
+            2 => ConfiguredReplayClassification::Reproducible,
+            _ => ConfiguredReplayClassification::Inconclusive,
+        };
+        let mut staging =
+            RunArtifactStaging::create(&root, &root.join(".tiv/runs"), "run_replay_source")
+                .unwrap();
+        staging
+            .write_json("compatibility.json", &compatibility_fixture())
+            .unwrap();
+        staging.write_json("trace.original.json", &trace).unwrap();
+        staging
+            .write_json(
+                "source.json",
+                &ReplaySourceArtifact {
+                    schema_version: 1,
+                    source_run_id: "run_campaign_source",
+                    case_id: "case_0001",
+                    expected_failure: (&expected).into(),
+                },
+            )
+            .unwrap();
+        for (index, attempt) in attempts.iter().enumerate() {
+            let attempt_id = format!("attempt_{:04}", index + 1);
+            staging
+                .write_json(format!("attempts/{attempt_id}/trace.json"), &trace)
+                .unwrap();
+            staging
+                .write_json(format!("attempts/{attempt_id}/result.json"), attempt)
+                .unwrap();
+            staging
+                .write_bytes(
+                    format!("attempts/{attempt_id}/observations.ndjson"),
+                    b"{}\n",
+                )
+                .unwrap();
+        }
+        staging
+            .write_json(
+                "summary.json",
+                &ReplaySummary {
+                    schema_version: 1,
+                    status: "configured_replay_complete",
+                    replay_id: "run_replay_source",
+                    source_run_id: "run_campaign_source",
+                    case_id: "case_0001",
+                    expected_failure: FailureIdentityArtifact::from(&expected),
+                    attempt_count: 3,
+                    matching_failure_count,
+                    classification,
+                    attempts: &attempts,
+                },
+            )
+            .unwrap();
+        let final_path = staging.finalize().unwrap();
+        (root, final_path, trace)
     }
 
     fn compatibility_fixture() -> RunCompatibilityV1 {
