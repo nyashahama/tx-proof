@@ -246,6 +246,7 @@ enum InvariantExpectation {
 /// `Serialize`, because it owns validated secret-bearing URLs.
 pub struct ResolvedConfig {
     root: PathBuf,
+    source_path: PathBuf,
     compose_project: String,
     compose_files: Vec<PathBuf>,
     application_service: String,
@@ -270,6 +271,10 @@ impl ResolvedConfig {
 
     pub(crate) fn root(&self) -> &Path {
         &self.root
+    }
+
+    pub(crate) fn source_path(&self) -> &Path {
+        &self.source_path
     }
 
     pub(crate) fn compose_files(&self) -> &[PathBuf] {
@@ -559,7 +564,9 @@ pub fn load_resolved_config(
     let root = canonical_path
         .parent()
         .ok_or(ConfigError::ConfigHasNoParent)?;
-    resolve_config_document(&document, root, environment)
+    let mut resolved = resolve_config_document(&document, root, environment)?;
+    resolved.source_path = canonical_path;
+    Ok(resolved)
 }
 
 /// Resolves an in-memory config document against one repository directory.
@@ -885,7 +892,8 @@ fn resolve_raw_config(
     };
 
     Ok(ResolvedConfig {
-        root: canonical_root,
+        root: canonical_root.clone(),
+        source_path: canonical_root.join("tiv.toml"),
         compose_project: raw.compose.project_name,
         compose_files,
         application_service: raw.compose.application_service,

@@ -36,6 +36,11 @@ use crate::{
         snapshot::{ConfiguredSnapshot, ConfiguredSnapshotError, load_configured_snapshot},
     },
     reference_case::{ReferenceCaseRunError, preflight_reference_shrink_candidate},
+    reports::{
+        ArtifactReport, ReplayCommand, ReportArtifactKind, ReportCheck, ReportCheckOutcome,
+        ReportConclusion, ReportFact, ReportFailure, partial_artifact_report,
+        validate_replay_command_paths, write_report_bundle,
+    },
     repository::capture_repository_provenance,
     run_supervisor::ComposeProjectLock,
 };
@@ -788,6 +793,8 @@ pub async fn run_configured_minimized_replay_with_cancellation(
     let configured_probe = load_configured_sql_probe(&config)?;
     let configured_quiescence = load_configured_quiescence(&config)?;
     let configured_snapshot = load_configured_snapshot(&config)?;
+    validate_replay_command_paths(artifact.root(), config.source_path())
+        .map_err(ConfiguredMinimizedReplayError::ReportPath)?;
     if cancellation.is_cancelled() {
         return Err(ConfiguredMinimizedReplayError::Interrupted);
     }
@@ -875,23 +882,23 @@ pub async fn run_configured_minimized_replay_with_cancellation(
             matches!(attempt, AttemptResult::Violation(identity) if identity == source.expected_failure())
         })
         .count();
-    artifacts.write_json(
-        SUMMARY_FILE,
-        &MinimizedReplaySummary {
-            schema_version: 1,
-            status: "configured_minimized_replay_complete",
-            minimized_replay_id: &replay_id,
-            source_shrink_id: source.shrink_id(),
-            source_replay_id: source.source_replay_id(),
-            source_run_id: source.source_run_id(),
-            case_id: source.case_id(),
-            expected_failure: source.expected_failure().into(),
-            attempt_count: ATTEMPT_COUNT,
-            matching_failure_count,
-            classification,
-            attempts: &attempt_artifacts,
-        },
-    )?;
+    let summary = MinimizedReplaySummary {
+        schema_version: 1,
+        status: "configured_minimized_replay_complete",
+        minimized_replay_id: &replay_id,
+        source_shrink_id: source.shrink_id(),
+        source_replay_id: source.source_replay_id(),
+        source_run_id: source.source_run_id(),
+        case_id: source.case_id(),
+        expected_failure: source.expected_failure().into(),
+        attempt_count: ATTEMPT_COUNT,
+        matching_failure_count,
+        classification,
+        attempts: &attempt_artifacts,
+    };
+    artifacts.write_json(SUMMARY_FILE, &summary)?;
+    let report = completed_minimized_replay_report(&summary, artifact.root(), config.source_path());
+    write_report_bundle(&mut artifacts, &report)?;
     let result = match classification {
         ConfiguredReplayClassification::Stable | ConfiguredReplayClassification::Reproducible => {
             ArtifactResult::Counterexample
@@ -1078,6 +1085,81 @@ fn minimized_replay_attempt_artifact(
     }
 }
 
+fn completed_minimized_replay_report(
+    summary: &MinimizedReplaySummary<'_>,
+    source_shrink_artifact_path: &Path,
+    config_path: &Path,
+) -> ArtifactReport {
+    let (conclusion, outcome, stability, message) = match summary.classification {
+        ConfiguredReplayClassification::Stable => (
+            ReportConclusion::Counterexample,
+            ReportCheckOutcome::Failed,
+            format!(
+                "Stable: the minimized failure identity reproduced {}/{} times.",
+                summary.matching_failure_count, summary.attempt_count
+            ),
+            "authority-bound minimized counterexample reproduced on all fresh baselines",
+        ),
+        ConfiguredReplayClassification::Reproducible => (
+            ReportConclusion::Counterexample,
+            ReportCheckOutcome::Failed,
+            format!(
+                "Reproducible: the minimized failure identity reproduced {}/{} times.",
+                summary.matching_failure_count, summary.attempt_count
+            ),
+            "authority-bound minimized counterexample matched on two fresh baselines",
+        ),
+        ConfiguredReplayClassification::Inconclusive => (
+            ReportConclusion::Inconclusive,
+            ReportCheckOutcome::Skipped,
+            format!(
+                "Inconclusive: the minimized failure identity reproduced {}/{} times.",
+                summary.matching_failure_count, summary.attempt_count
+            ),
+            "fewer than two minimized replay attempts matched the expected failure",
+        ),
+    };
+    let mut report = ArtifactReport::new(
+        summary.minimized_replay_id,
+        ReportArtifactKind::MinimizedReplay,
+        conclusion,
+        format!(
+            "Exactly {} fresh-baseline attempts; compatibility is recaptured before attempts two and three.",
+            summary.attempt_count
+        ),
+        stability,
+    );
+    report.add_failure(ReportFailure::new(
+        &summary.expected_failure.invariant_id,
+        &summary.expected_failure.checkpoint_id,
+        None,
+    ));
+    report.add_check(ReportCheck::new(
+        format!(
+            "{} at {}",
+            summary.expected_failure.invariant_id, summary.expected_failure.checkpoint_id
+        ),
+        outcome,
+        message,
+    ));
+    report.add_fact(ReportFact::new("Source shrink", summary.source_shrink_id));
+    report.add_fact(ReportFact::new("Source replay", summary.source_replay_id));
+    report.add_fact(ReportFact::new("Source run", summary.source_run_id));
+    report.add_fact(ReportFact::new("Case", summary.case_id));
+    report.add_fact(ReportFact::new(
+        "Matching attempts",
+        format!(
+            "{}/{}",
+            summary.matching_failure_count, summary.attempt_count
+        ),
+    ));
+    report.add_replay_command(ReplayCommand::minimized(
+        source_shrink_artifact_path,
+        config_path,
+    ));
+    report
+}
+
 fn finalize_failed_minimized_replay(
     mut artifacts: RunArtifactStaging,
     cause: ConfiguredMinimizedReplayError,
@@ -1107,6 +1189,21 @@ fn finalize_failed_minimized_replay(
             artifact,
         });
     }
+    let report = partial_minimized_replay_report(
+        replay_id,
+        failure_class,
+        failure_code,
+        source.shrink_id(),
+        source.source_replay_id(),
+        source.case_id(),
+        attempts.len(),
+    );
+    if let Err(artifact) = write_report_bundle(&mut artifacts, &report) {
+        return Err(ConfiguredMinimizedReplayError::PartialFinalization {
+            cause: Box::new(cause),
+            artifact,
+        });
+    }
     let artifact_path = match artifacts.finalize_partial_v2(
         partial_artifact_class(failure_class),
         failure_code,
@@ -1127,6 +1224,31 @@ fn finalize_failed_minimized_replay(
         cause: Box::new(cause),
         artifact_path,
     })
+}
+
+fn partial_minimized_replay_report(
+    replay_id: &str,
+    failure_class: ConfiguredCampaignFailureClass,
+    failure_code: &'static str,
+    source_shrink_id: &str,
+    source_replay_id: &str,
+    case_id: &str,
+    completed_attempts: usize,
+) -> ArtifactReport {
+    let mut report = partial_artifact_report(
+        replay_id,
+        ReportArtifactKind::MinimizedReplay,
+        failure_class.into(),
+        failure_code,
+    );
+    report.add_fact(ReportFact::new("Source shrink", source_shrink_id));
+    report.add_fact(ReportFact::new("Source replay", source_replay_id));
+    report.add_fact(ReportFact::new("Case", case_id));
+    report.add_fact(ReportFact::new(
+        "Completed attempts",
+        completed_attempts.to_string(),
+    ));
+    report
 }
 
 const fn partial_status(class: ConfiguredCampaignFailureClass) -> &'static str {
@@ -1192,6 +1314,8 @@ pub enum ConfiguredMinimizedReplayError {
     Snapshot(#[from] ConfiguredSnapshotError),
     #[error("configured minimized replay candidate preflight failed: {0}")]
     CandidatePreflight(#[from] ReferenceCaseRunError),
+    #[error("configured minimized replay report path preflight failed: {0}")]
+    ReportPath(#[source] ArtifactError),
     #[error("configured minimized replay compatibility boundary failed: {0}")]
     Boundary(#[source] ConfiguredReplayError),
     #[error("configured minimized replay compatibility gate failed: {0}")]
@@ -1239,6 +1363,7 @@ impl ConfiguredMinimizedReplayError {
             | Self::Quiescence(_)
             | Self::Snapshot(_)
             | Self::CandidatePreflight(_)
+            | Self::ReportPath(_)
             | Self::Compatibility(_) => ConfiguredCampaignFailureClass::Configuration,
             Self::Boundary(error) => error.failure_class(),
             Self::Case(error) => error.failure_class(),
@@ -1272,6 +1397,7 @@ impl ConfiguredMinimizedReplayError {
             Self::Quiescence(_) => "invalid_quiescence",
             Self::Snapshot(_) => "invalid_snapshot",
             Self::CandidatePreflight(_) => "candidate_preflight",
+            Self::ReportPath(_) => "invalid_report_path",
             Self::Boundary(error) => error.failure_code(),
             Self::Compatibility(_) => "compatibility_mismatch",
             Self::ProjectLock(_) => "project_locked",
@@ -1297,7 +1423,7 @@ impl ConfiguredMinimizedReplayError {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, os::unix::fs::symlink};
+    use std::{fs, os::unix::fs::symlink, path::Path};
 
     use tiv_core::{
         decision::Seed,
@@ -1311,14 +1437,91 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        ConfiguredMinimizedReplayArtifactError, ShrinkAttemptDocument,
-        has_distinct_fresh_baselines, load_verified_minimized_shrink_source,
-        output_base_is_disjoint,
+        ConfiguredMinimizedReplayArtifactError, FailureIdentityDocument, MinimizedReplaySummary,
+        ShrinkAttemptDocument, completed_minimized_replay_report, has_distinct_fresh_baselines,
+        load_verified_minimized_shrink_source, output_base_is_disjoint,
+        partial_minimized_replay_report,
     };
-    use crate::artifacts::{
-        ArtifactAuthority, ArtifactKind, ArtifactResult, ManifestSeed, RepositoryProvenance,
-        RunArtifactStaging, WorktreeState, verify_complete_run_artifact,
+    use crate::{
+        artifacts::{
+            ArtifactAuthority, ArtifactKind, ArtifactResult, ManifestSeed, RepositoryProvenance,
+            RunArtifactStaging, WorktreeState, verify_complete_run_artifact,
+        },
+        configured_campaign::ConfiguredCampaignFailureClass,
+        configured_replay::ConfiguredReplayClassification,
+        reports::{ReportCheckOutcome, ReportConclusion},
     };
+
+    #[test]
+    fn minimized_replay_report_maps_every_real_producer_classification() {
+        let fixtures = [
+            (
+                ConfiguredReplayClassification::Stable,
+                3,
+                ReportConclusion::Counterexample,
+                ReportCheckOutcome::Failed,
+            ),
+            (
+                ConfiguredReplayClassification::Reproducible,
+                2,
+                ReportConclusion::Counterexample,
+                ReportCheckOutcome::Failed,
+            ),
+            (
+                ConfiguredReplayClassification::Inconclusive,
+                1,
+                ReportConclusion::Inconclusive,
+                ReportCheckOutcome::Skipped,
+            ),
+        ];
+
+        for (classification, matching_failure_count, conclusion, outcome) in fixtures {
+            let summary = MinimizedReplaySummary {
+                schema_version: 1,
+                status: "configured_minimized_replay_complete",
+                minimized_replay_id: "run_minimized_report",
+                source_shrink_id: "run_shrink",
+                source_replay_id: "run_replay",
+                source_run_id: "run_source",
+                case_id: "case_0001",
+                expected_failure: FailureIdentityDocument {
+                    invariant_id: "provider_object_uniqueness".to_owned(),
+                    checkpoint_id: "checkout_complete".to_owned(),
+                },
+                attempt_count: 3,
+                matching_failure_count,
+                classification,
+                attempts: &[],
+            };
+
+            let report = completed_minimized_replay_report(
+                &summary,
+                Path::new("/tmp/shrink"),
+                Path::new("/tmp/tiv.toml"),
+            );
+
+            assert_eq!(report.conclusion(), conclusion);
+            assert_eq!(report.check_outcomes(), vec![outcome]);
+            assert_eq!(report.replay_command_count(), 1);
+        }
+    }
+
+    #[test]
+    fn minimized_replay_partial_report_maps_failure_class_without_a_replay_command() {
+        let report = partial_minimized_replay_report(
+            "run_partial_minimized",
+            ConfiguredCampaignFailureClass::Infrastructure,
+            "process_failure",
+            "run_shrink",
+            "run_replay",
+            "case_0001",
+            1,
+        );
+
+        assert_eq!(report.conclusion(), ReportConclusion::InfrastructureFailure);
+        assert_eq!(report.check_outcomes(), vec![ReportCheckOutcome::Error]);
+        assert_eq!(report.replay_command_count(), 0);
+    }
 
     #[test]
     fn source_attempts_must_bind_three_distinct_fresh_baselines() {

@@ -33,6 +33,7 @@ hyper = { version = "1.11", features = ["http1", "server"] }
 hyper-util = { version = "0.1.20", features = ["tokio"] }
 rand = "=0.10.2"
 rand_chacha = "=0.10.0"
+quick-xml = "0.41.0"
 reqwest = { version = "0.13.4", default-features = false, features = ["form", "json"] }
 schemars = "1.2.2"
 serde = { version = "1.0", features = ["derive"] }

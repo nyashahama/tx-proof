@@ -41,6 +41,11 @@ use crate::{
         snapshot::{ConfiguredSnapshotError, load_configured_snapshot},
     },
     reference_case::{ReferenceCaseRunError, preflight_reference_planned_case},
+    reports::{
+        ArtifactReport, ReplayCommand, ReportArtifactKind, ReportCheck, ReportCheckOutcome,
+        ReportConclusion, ReportFact, ReportFailure, partial_artifact_report,
+        validate_replay_command_paths, write_report_bundle,
+    },
     repository::capture_repository_provenance,
     run_supervisor::ComposeProjectLock,
 };
@@ -426,6 +431,8 @@ pub async fn run_configured_replay_with_cancellation(
     let configured_quiescence = load_configured_quiescence(&config)?;
     let configured_snapshot = load_configured_snapshot(&config)?;
     preflight_reference_planned_case(recorded.trace().planned_case(), true, true)?;
+    validate_replay_command_paths(source.root(), config.source_path())
+        .map_err(ConfiguredReplayError::ReportPath)?;
     if cancellation.is_cancelled() {
         return Err(ConfiguredReplayError::Interrupted);
     }
@@ -520,22 +527,28 @@ pub async fn run_configured_replay_with_cancellation(
             matches!(attempt, AttemptResult::Violation(identity) if identity == recorded.expected_failure())
         })
         .count();
+    let summary = ReplaySummary {
+        schema_version: 1,
+        status: "configured_replay_complete",
+        replay_id: &replay_id,
+        source_run_id: source.run_id(),
+        case_id: recorded.case_id(),
+        expected_failure: recorded.expected_failure().into(),
+        attempt_count: ATTEMPT_COUNT,
+        matching_failure_count,
+        classification,
+        attempts: &attempt_artifacts,
+    };
     artifacts
-        .write_json(
-            "summary.json",
-            &ReplaySummary {
-                schema_version: 1,
-                status: "configured_replay_complete",
-                replay_id: &replay_id,
-                source_run_id: source.run_id(),
-                case_id: recorded.case_id(),
-                expected_failure: recorded.expected_failure().into(),
-                attempt_count: ATTEMPT_COUNT,
-                matching_failure_count,
-                classification,
-                attempts: &attempt_artifacts,
-            },
-        )
+        .write_json("summary.json", &summary)
+        .map_err(ConfiguredReplayError::EvidenceArtifact)?;
+    let report = completed_replay_report(
+        &summary,
+        source.root(),
+        config.source_path(),
+        options.case_number(),
+    );
+    write_report_bundle(&mut artifacts, &report)
         .map_err(ConfiguredReplayError::EvidenceArtifact)?;
     let result = match classification {
         ConfiguredReplayClassification::Stable | ConfiguredReplayClassification::Reproducible => {
@@ -732,6 +745,81 @@ fn replay_invariant_artifact(outcome: &ConfiguredInvariantOutcome) -> ReplayInva
     }
 }
 
+fn completed_replay_report(
+    summary: &ReplaySummary<'_>,
+    source_artifact_path: &Path,
+    config_path: &Path,
+    case_number: u32,
+) -> ArtifactReport {
+    let (conclusion, outcome, stability, message) = match summary.classification {
+        ConfiguredReplayClassification::Stable => (
+            ReportConclusion::Counterexample,
+            ReportCheckOutcome::Failed,
+            format!(
+                "Stable: the same failure identity reproduced {}/{} times.",
+                summary.matching_failure_count, summary.attempt_count
+            ),
+            "stable counterexample reproduced on all three fresh baselines",
+        ),
+        ConfiguredReplayClassification::Reproducible => (
+            ReportConclusion::Counterexample,
+            ReportCheckOutcome::Failed,
+            format!(
+                "Reproducible: the same failure identity reproduced {}/{} times.",
+                summary.matching_failure_count, summary.attempt_count
+            ),
+            "reproducible counterexample matched on two of three fresh baselines",
+        ),
+        ConfiguredReplayClassification::Inconclusive => (
+            ReportConclusion::Inconclusive,
+            ReportCheckOutcome::Skipped,
+            format!(
+                "Inconclusive: the same failure identity reproduced {}/{} times.",
+                summary.matching_failure_count, summary.attempt_count
+            ),
+            "fewer than two fresh-baseline attempts matched the expected failure",
+        ),
+    };
+    let mut report = ArtifactReport::new(
+        summary.replay_id,
+        ReportArtifactKind::Replay,
+        conclusion,
+        format!(
+            "Exactly {} fresh-baseline attempts; no retry-count override.",
+            summary.attempt_count
+        ),
+        stability,
+    );
+    report.add_failure(ReportFailure::new(
+        &summary.expected_failure.invariant_id,
+        &summary.expected_failure.checkpoint_id,
+        None,
+    ));
+    report.add_check(ReportCheck::new(
+        format!(
+            "{} at {}",
+            summary.expected_failure.invariant_id, summary.expected_failure.checkpoint_id
+        ),
+        outcome,
+        message,
+    ));
+    report.add_fact(ReportFact::new("Source run", summary.source_run_id));
+    report.add_fact(ReportFact::new("Case", summary.case_id));
+    report.add_fact(ReportFact::new(
+        "Matching attempts",
+        format!(
+            "{}/{}",
+            summary.matching_failure_count, summary.attempt_count
+        ),
+    ));
+    report.add_replay_command(ReplayCommand::configured(
+        source_artifact_path,
+        config_path,
+        case_number,
+    ));
+    report
+}
+
 fn finalize_failed_replay(
     mut artifacts: RunArtifactStaging,
     cause: ConfiguredReplayError,
@@ -756,6 +844,24 @@ fn finalize_failed_replay(
             attempts,
         },
     ) {
+        return Err(ConfiguredReplayError::PartialFinalization {
+            cause: Box::new(cause),
+            artifact,
+        });
+    }
+    let mut report = partial_artifact_report(
+        replay_id,
+        ReportArtifactKind::Replay,
+        failure_class.into(),
+        failure_code,
+    );
+    report.add_fact(ReportFact::new("Source run", source_run_id));
+    report.add_fact(ReportFact::new("Case", case_id));
+    report.add_fact(ReportFact::new(
+        "Completed attempts",
+        attempts.len().to_string(),
+    ));
+    if let Err(artifact) = write_report_bundle(&mut artifacts, &report) {
         return Err(ConfiguredReplayError::PartialFinalization {
             cause: Box::new(cause),
             artifact,
@@ -1296,6 +1402,8 @@ pub enum ConfiguredReplayError {
     Snapshot(#[from] ConfiguredSnapshotError),
     #[error("configured replay case preflight failed: {0}")]
     CasePreflight(#[from] ReferenceCaseRunError),
+    #[error("configured replay report path preflight failed: {0}")]
+    ReportPath(#[source] ArtifactError),
     #[error("configured replay Compose preflight failed: {0}")]
     Compose(#[from] DoctorError),
     #[error("configured replay baseline attestation failed: {0}")]
@@ -1344,6 +1452,7 @@ impl ConfiguredReplayError {
             | Self::Quiescence(_)
             | Self::Snapshot(_)
             | Self::CasePreflight(_)
+            | Self::ReportPath(_)
             | Self::Compatibility(_) => ConfiguredCampaignFailureClass::Configuration,
             Self::Compose(error) if !error.is_infrastructure_failure() => {
                 ConfiguredCampaignFailureClass::Configuration
@@ -1387,6 +1496,7 @@ impl ConfiguredReplayError {
             Self::Quiescence(_) => "invalid_quiescence",
             Self::Snapshot(_) => "invalid_snapshot",
             Self::CasePreflight(_) => "case_preflight",
+            Self::ReportPath(_) => "invalid_report_path",
             Self::Compose(_) => "compose_preflight",
             Self::Baseline(_) => "baseline_failure",
             Self::CompatibilityCapture(_) => "compatibility_capture",
@@ -1420,7 +1530,7 @@ impl From<ConfiguredProcessError> for ConfiguredReplayError {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::{fs, path::Path};
 
     use tiv_core::result::{
         AttemptResult, CheckpointId, FailureIdentity, InvariantId, ReproductionClass,
@@ -1436,12 +1546,13 @@ mod tests {
         ConfiguredReplayArtifactError, ConfiguredReplayClassification, ConfiguredReplayOptions,
         FailureIdentityArtifact, RecordedInvariant, RecordedVerdict, ReplayAttemptArtifact,
         ReplayAttemptVerdict, ReplayInvariantArtifact, ReplaySourceArtifact, ReplaySummary,
-        attempt_result, load_recorded_case, load_verified_configured_replay_source,
-        select_expected_failure,
+        attempt_result, completed_replay_report, load_recorded_case,
+        load_verified_configured_replay_source, select_expected_failure,
     };
     use crate::{
         artifacts::{RunArtifactStaging, verify_complete_run_artifact},
         compatibility::RunCompatibilityV1,
+        reports::{ReportCheckOutcome, ReportConclusion},
     };
 
     fn identity(invariant: &str) -> FailureIdentity {
@@ -1461,6 +1572,59 @@ mod tests {
             checkpoint_id: "checkout-quiescent".to_owned(),
             verdict,
             witness_count,
+        }
+    }
+
+    #[test]
+    fn replay_report_maps_every_real_producer_classification() {
+        let fixtures = [
+            (
+                ConfiguredReplayClassification::Stable,
+                3,
+                ReportConclusion::Counterexample,
+                ReportCheckOutcome::Failed,
+            ),
+            (
+                ConfiguredReplayClassification::Reproducible,
+                2,
+                ReportConclusion::Counterexample,
+                ReportCheckOutcome::Failed,
+            ),
+            (
+                ConfiguredReplayClassification::Inconclusive,
+                1,
+                ReportConclusion::Inconclusive,
+                ReportCheckOutcome::Skipped,
+            ),
+        ];
+
+        for (classification, matching_failure_count, conclusion, outcome) in fixtures {
+            let summary = ReplaySummary {
+                schema_version: 1,
+                status: "configured_replay_complete",
+                replay_id: "run_replay_report",
+                source_run_id: "run_source",
+                case_id: "case_0001",
+                expected_failure: FailureIdentityArtifact {
+                    invariant_id: "provider_object_uniqueness".to_owned(),
+                    checkpoint_id: "checkout_complete".to_owned(),
+                },
+                attempt_count: 3,
+                matching_failure_count,
+                classification,
+                attempts: &[],
+            };
+
+            let report = completed_replay_report(
+                &summary,
+                Path::new("/tmp/source"),
+                Path::new("/tmp/tiv.toml"),
+                1,
+            );
+
+            assert_eq!(report.conclusion(), conclusion);
+            assert_eq!(report.check_outcomes(), vec![outcome]);
+            assert_eq!(report.replay_command_count(), 1);
         }
     }
 

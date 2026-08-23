@@ -41,6 +41,11 @@ use crate::{
         snapshot::{ConfiguredSnapshot, ConfiguredSnapshotError, load_configured_snapshot},
     },
     reference_case::{ReferenceCaseRunError, preflight_reference_planned_case},
+    reports::{
+        ArtifactReport, ReplayCommand, ReportArtifactKind, ReportCheck, ReportCheckOutcome,
+        ReportConclusion, ReportFact, ReportFailure, partial_artifact_report,
+        validate_replay_command_paths, write_report_bundle,
+    },
     repository::capture_repository_provenance,
     run_supervisor::ComposeProjectLock,
 };
@@ -318,6 +323,14 @@ pub async fn run_configured_shrink_with_cancellation(
     let configured_quiescence = load_configured_quiescence(&config)?;
     let configured_snapshot = load_configured_snapshot(&config)?;
     preflight_reference_planned_case(source.original_trace().planned_case(), true, true)?;
+    let shrink_id = format!("run_{}", uuid::Uuid::new_v4().simple());
+    validate_replay_command_paths(artifact.root(), config.source_path())
+        .map_err(ConfiguredShrinkError::ReportPath)?;
+    validate_replay_command_paths(
+        &config.artifact_dir().join(&shrink_id),
+        config.source_path(),
+    )
+    .map_err(ConfiguredShrinkError::ReportPath)?;
     if cancellation.is_cancelled() {
         return Err(ConfiguredShrinkError::Interrupted);
     }
@@ -338,7 +351,6 @@ pub async fn run_configured_shrink_with_cancellation(
         .await
         .map_err(|error| ConfiguredShrinkError::Repository(Box::new(error)))?;
 
-    let shrink_id = format!("run_{}", uuid::Uuid::new_v4().simple());
     let mut artifacts = RunArtifactStaging::create_v2(
         config.root(),
         config.artifact_dir(),
@@ -392,6 +404,8 @@ pub async fn run_configured_shrink_with_cancellation(
                 artifacts,
                 &shrink_id,
                 &source,
+                artifact.root(),
+                config.source_path(),
                 options,
                 ConfiguredShrinkCompletion::SourceInconclusive,
                 &original_attempts,
@@ -420,6 +434,8 @@ pub async fn run_configured_shrink_with_cancellation(
             artifacts,
             &shrink_id,
             &source,
+            artifact.root(),
+            config.source_path(),
             options,
             ConfiguredShrinkCompletion::SourceInconclusive,
             &original_attempts,
@@ -516,6 +532,8 @@ pub async fn run_configured_shrink_with_cancellation(
         artifacts,
         &shrink_id,
         &source,
+        artifact.root(),
+        config.source_path(),
         options,
         completion,
         &original_attempts,
@@ -882,6 +900,8 @@ fn finalize_completed_shrink(
     mut artifacts: RunArtifactStaging,
     shrink_id: &str,
     source: &VerifiedConfiguredReplaySource,
+    source_replay_artifact_path: &Path,
+    config_path: &Path,
     options: ConfiguredShrinkOptions,
     completion: ConfiguredShrinkCompletion,
     original_attempts: &[AttemptArtifact],
@@ -897,32 +917,36 @@ fn finalize_completed_shrink(
     let original_action_count = source.original_trace().action_count();
     let best_action_count =
         best_trace.map_or(original_action_count, CompiledShrinkTrace::action_count);
-    artifacts.write_json(
-        "summary.json",
-        &ShrinkSummary {
-            schema_version: 1,
-            status: "configured_shrink_complete",
-            shrink_id,
-            source_replay_id: source.replay_id(),
-            source_run_id: source.source_run_id(),
-            case_id: source.case_id(),
-            expected_failure: source.expected_failure().into(),
-            completion,
-            candidate_limit: options.candidate_limit().value(),
-            max_time_milliseconds: u64::try_from(options.max_time().as_millis())
-                .unwrap_or(u64::MAX),
-            original_attempt_count: original_attempts.len(),
-            original_matching_failure_count,
-            evaluated_candidates: evaluations.len(),
-            cache_hits,
-            accepted_candidates,
-            original_action_count,
-            best_action_count,
-            minimized_trace_written: best_trace.is_some(),
-            original_attempts,
-            candidates: evaluations,
-        },
-    )?;
+    let summary = ShrinkSummary {
+        schema_version: 1,
+        status: "configured_shrink_complete",
+        shrink_id,
+        source_replay_id: source.replay_id(),
+        source_run_id: source.source_run_id(),
+        case_id: source.case_id(),
+        expected_failure: source.expected_failure().into(),
+        completion,
+        candidate_limit: options.candidate_limit().value(),
+        max_time_milliseconds: u64::try_from(options.max_time().as_millis()).unwrap_or(u64::MAX),
+        original_attempt_count: original_attempts.len(),
+        original_matching_failure_count,
+        evaluated_candidates: evaluations.len(),
+        cache_hits,
+        accepted_candidates,
+        original_action_count,
+        best_action_count,
+        minimized_trace_written: best_trace.is_some(),
+        original_attempts,
+        candidates: evaluations,
+    };
+    artifacts.write_json("summary.json", &summary)?;
+    let report = completed_shrink_report(
+        &summary,
+        source_replay_artifact_path,
+        artifacts.planned_final_path(),
+        config_path,
+    );
+    write_report_bundle(&mut artifacts, &report)?;
     let evaluated_candidates = evaluations.len();
     let mut authorities = vec![
         ArtifactAuthority::shrink_source(),
@@ -950,6 +974,94 @@ fn finalize_completed_shrink(
         best_action_count,
         artifact_path,
     })
+}
+
+fn completed_shrink_report(
+    summary: &ShrinkSummary<'_>,
+    source_replay_artifact_path: &Path,
+    shrink_artifact_path: &Path,
+    config_path: &Path,
+) -> ArtifactReport {
+    let (conclusion, outcome, stability, message) = match summary.completion {
+        ConfiguredShrinkCompletion::Complete => (
+            ReportConclusion::Counterexample,
+            ReportCheckOutcome::Failed,
+            format!(
+                "The source failure matched {}/{} fresh attempts; every accepted candidate matched at least 2/3.",
+                summary.original_matching_failure_count, summary.original_attempt_count
+            ),
+            "reproducible counterexample retained; bounded representable frontier completed",
+        ),
+        ConfiguredShrinkCompletion::BudgetExhausted => (
+            ReportConclusion::BudgetExhausted,
+            ReportCheckOutcome::Failed,
+            format!(
+                "The source failure matched {}/{} fresh attempts; the best accepted trace was retained before the budget ended.",
+                summary.original_matching_failure_count, summary.original_attempt_count
+            ),
+            "reproducible counterexample retained; shrink budget exhausted",
+        ),
+        ConfiguredShrinkCompletion::SourceInconclusive => (
+            ReportConclusion::Inconclusive,
+            ReportCheckOutcome::Skipped,
+            format!(
+                "The source failure matched {}/{} completed fresh attempts, below the 2/3 acceptance threshold.",
+                summary.original_matching_failure_count, summary.original_attempt_count
+            ),
+            "source replay was inconclusive; no shrink conclusion is available",
+        ),
+    };
+    let mut report = ArtifactReport::new(
+        summary.shrink_id,
+        ReportArtifactKind::Shrink,
+        conclusion,
+        format!(
+            "At most {} evaluated candidates and {} ms; one shared deadline.",
+            summary.candidate_limit, summary.max_time_milliseconds
+        ),
+        stability,
+    );
+    report.add_failure(ReportFailure::new(
+        &summary.expected_failure.invariant_id,
+        &summary.expected_failure.checkpoint_id,
+        None,
+    ));
+    report.add_check(ReportCheck::new(
+        format!(
+            "{} at {}",
+            summary.expected_failure.invariant_id, summary.expected_failure.checkpoint_id
+        ),
+        outcome,
+        message,
+    ));
+    report.add_fact(ReportFact::new("Source replay", summary.source_replay_id));
+    report.add_fact(ReportFact::new("Source run", summary.source_run_id));
+    report.add_fact(ReportFact::new("Case", summary.case_id));
+    report.add_fact(ReportFact::new(
+        "Evaluated candidates",
+        summary.evaluated_candidates.to_string(),
+    ));
+    report.add_fact(ReportFact::new(
+        "Accepted candidates",
+        summary.accepted_candidates.to_string(),
+    ));
+    report.add_fact(ReportFact::new(
+        "Action count",
+        format!(
+            "{} original; {} best",
+            summary.original_action_count, summary.best_action_count
+        ),
+    ));
+    report.add_replay_command(ReplayCommand::shrink(
+        source_replay_artifact_path,
+        config_path,
+        summary.candidate_limit,
+        summary.max_time_milliseconds,
+    ));
+    if summary.minimized_trace_written {
+        report.add_replay_command(ReplayCommand::minimized(shrink_artifact_path, config_path));
+    }
+    report
 }
 
 fn finalize_failed_shrink(
@@ -981,6 +1093,19 @@ fn finalize_failed_shrink(
             artifact,
         });
     }
+    let report = partial_shrink_report(
+        shrink_id,
+        failure_class,
+        failure_code,
+        completed_original_attempts,
+        completed_candidate_evaluations,
+    );
+    if let Err(artifact) = write_report_bundle(&mut artifacts, &report) {
+        return Err(ConfiguredShrinkError::PartialFinalization {
+            cause: Box::new(cause),
+            artifact,
+        });
+    }
     let artifact_path = match artifacts.finalize_partial_v2(
         partial_artifact_class(failure_class),
         failure_code,
@@ -1001,6 +1126,30 @@ fn finalize_failed_shrink(
         cause: Box::new(cause),
         artifact_path,
     })
+}
+
+fn partial_shrink_report(
+    shrink_id: &str,
+    failure_class: ConfiguredCampaignFailureClass,
+    failure_code: &'static str,
+    completed_original_attempts: usize,
+    completed_candidate_evaluations: usize,
+) -> ArtifactReport {
+    let mut report = partial_artifact_report(
+        shrink_id,
+        ReportArtifactKind::Shrink,
+        failure_class.into(),
+        failure_code,
+    );
+    report.add_fact(ReportFact::new(
+        "Completed original attempts",
+        completed_original_attempts.to_string(),
+    ));
+    report.add_fact(ReportFact::new(
+        "Completed candidate evaluations",
+        completed_candidate_evaluations.to_string(),
+    ));
+    report
 }
 
 const fn partial_status(class: ConfiguredCampaignFailureClass) -> &'static str {
@@ -1041,6 +1190,8 @@ pub enum ConfiguredShrinkError {
     Snapshot(#[from] ConfiguredSnapshotError),
     #[error("configured shrink case preflight failed: {0}")]
     CasePreflight(#[from] ReferenceCaseRunError),
+    #[error("configured shrink report path preflight failed: {0}")]
+    ReportPath(#[source] ArtifactError),
     #[error("configured shrink compatibility boundary failed: {0}")]
     Boundary(#[source] ConfiguredReplayError),
     #[error("configured shrink compatibility gate failed: {0}")]
@@ -1097,6 +1248,7 @@ impl ConfiguredShrinkError {
             | Self::Quiescence(_)
             | Self::Snapshot(_)
             | Self::CasePreflight(_)
+            | Self::ReportPath(_)
             | Self::Compatibility(_) => ConfiguredCampaignFailureClass::Configuration,
             Self::Boundary(error) => error.failure_class(),
             Self::Case(error) => error.failure_class(),
@@ -1131,6 +1283,7 @@ impl ConfiguredShrinkError {
             Self::Quiescence(_) => "invalid_quiescence",
             Self::Snapshot(_) => "invalid_snapshot",
             Self::CasePreflight(_) => "case_preflight",
+            Self::ReportPath(_) => "invalid_report_path",
             Self::Boundary(error) => error.failure_code(),
             Self::Compatibility(_) => "compatibility_mismatch",
             Self::ProjectLock(_) => "project_locked",
@@ -1159,9 +1312,101 @@ impl ConfiguredShrinkError {
 mod tests {
     use super::{
         ConfiguredShrinkCompletion, ConfiguredShrinkOptions, ConfiguredShrinkOptionsError,
-        MAX_SHRINK_TIME, capped_attempt_timeout,
+        FailureIdentityArtifact, MAX_SHRINK_TIME, ShrinkSummary, capped_attempt_timeout,
+        completed_shrink_report, partial_shrink_report,
     };
-    use std::time::Duration;
+    use crate::{
+        configured_campaign::ConfiguredCampaignFailureClass,
+        reports::{ReportCheckOutcome, ReportConclusion},
+    };
+    use std::{path::Path, time::Duration};
+
+    #[test]
+    fn shrink_report_maps_every_real_producer_completion() {
+        let fixtures = [
+            (
+                ConfiguredShrinkCompletion::Complete,
+                ReportConclusion::Counterexample,
+                ReportCheckOutcome::Failed,
+                true,
+                2,
+            ),
+            (
+                ConfiguredShrinkCompletion::BudgetExhausted,
+                ReportConclusion::BudgetExhausted,
+                ReportCheckOutcome::Failed,
+                true,
+                2,
+            ),
+            (
+                ConfiguredShrinkCompletion::SourceInconclusive,
+                ReportConclusion::Inconclusive,
+                ReportCheckOutcome::Skipped,
+                false,
+                1,
+            ),
+        ];
+
+        for (completion, conclusion, outcome, minimized_trace_written, replay_count) in fixtures {
+            let summary = ShrinkSummary {
+                schema_version: 1,
+                status: "configured_shrink_complete",
+                shrink_id: "run_shrink_report",
+                source_replay_id: "run_replay",
+                source_run_id: "run_source",
+                case_id: "case_0001",
+                expected_failure: FailureIdentityArtifact {
+                    invariant_id: "provider_object_uniqueness".to_owned(),
+                    checkpoint_id: "checkout_complete".to_owned(),
+                },
+                completion,
+                candidate_limit: 60,
+                max_time_milliseconds: 600_000,
+                original_attempt_count: 3,
+                original_matching_failure_count: if completion
+                    == ConfiguredShrinkCompletion::SourceInconclusive
+                {
+                    1
+                } else {
+                    3
+                },
+                evaluated_candidates: 1,
+                cache_hits: 0,
+                accepted_candidates: usize::from(minimized_trace_written),
+                original_action_count: 4,
+                best_action_count: if minimized_trace_written { 3 } else { 4 },
+                minimized_trace_written,
+                original_attempts: &[],
+                candidates: &[],
+            };
+
+            let report = completed_shrink_report(
+                &summary,
+                Path::new("/tmp/replay"),
+                Path::new("/tmp/shrink"),
+                Path::new("/tmp/tiv.toml"),
+            );
+
+            assert_eq!(report.conclusion(), conclusion);
+            assert_eq!(report.check_outcomes(), vec![outcome]);
+            assert_eq!(report.replay_command_count(), replay_count);
+        }
+    }
+
+    #[test]
+    fn shrink_partial_report_maps_failure_class_without_a_replay_command() {
+        let report = partial_shrink_report(
+            "run_partial_shrink",
+            ConfiguredCampaignFailureClass::Inconclusive,
+            "budget_expired",
+            1,
+            0,
+        );
+
+        assert_eq!(report.conclusion(), ReportConclusion::Inconclusive);
+        assert_eq!(report.check_outcomes(), vec![ReportCheckOutcome::Skipped]);
+        assert_eq!(report.replay_command_count(), 0);
+    }
 
     #[test]
     fn configured_shrink_options_enforce_both_v1_budgets() {

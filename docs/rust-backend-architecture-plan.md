@@ -753,6 +753,47 @@ initial compatibility rejection occurs before staging and emits no artifact.
 This is repeatable bounded counterexample execution, not proof of a global
 minimum or of correctness.
 
+### Implemented human and CI report bundle contract
+
+Every newly finalized configured campaign, replay, shrink, and minimized-replay
+artifact writes three derived files before checksums and the manifest:
+`summary.md`, `junit.xml`, and `replay.txt`. They are ordinary indexed evidence,
+not replay authorities. The existing typed `summary.json` remains the structured
+run record. Partial artifacts receive an explicitly partial report bundle; this
+does not add a manifest result, complete status, or replay authority.
+
+One allowlisted in-memory result model drives both the Markdown and JUnit
+renderers. Campaign JUnit contains one testcase per case/invariant outcome;
+replay and shrink reports contain the classified expected-failure check. Held
+checks pass, reproducible counterexamples are failures, inconclusive results are
+skipped, and a shrink-budget exhaustion remains a failed counterexample with
+exit `11`. JUnit properties repeat the artifact kind, result, run ID, and exact
+public exit code. `quick-xml` performs attribute and text escaping; fixture tests
+parse the emitted XML and bind held (`0`), counterexample (`10`), exhausted
+(`11`), and inconclusive (`4`) semantics to the same report conclusion.
+Configuration (`2`), infrastructure (`3`), and interrupted (`130`) partial runs
+emit one JUnit error; an inconclusive partial run emits one skipped testcase.
+Their report names the allowlisted failure code and completed-work counts, but
+never claims a product conclusion or emits an executable replay command.
+
+The Markdown report includes the allowlisted failure identity, bounded witness
+row count when the campaign has it, attempt/candidate/action counts, configured
+budget, replay stability, determinism boundary, exclusions, and the explicit
+“bounded counterexample search—not proof” claim. It never copies raw witness
+values, request bodies, journals, configuration, environment, URLs, SQL, or
+credentials.
+
+`replay.txt` and the Markdown report emit only real current CLI invocations.
+Paths beneath the recorded configuration directory are rendered relative to
+that directory; an explicitly supplied source outside it remains an exact
+absolute path. Dynamic arguments use POSIX single-quote escaping, including
+embedded apostrophes, and control-character or non-UTF-8 paths fail closed.
+Configured campaign/replay reports emit `tiv replay configured`; shrink reports
+emit the exact bounded shrink command and, when a minimized authority exists,
+`tiv replay minimized`; minimized-replay reports point back to the verified
+source shrink artifact. Every mutable command still performs complete-artifact,
+compatibility, and disposable-database safety checks before mutation.
+
 ## Concurrency, cancellation, and resource budgets
 
 The runtime is Tokio-based, but deliberately small:

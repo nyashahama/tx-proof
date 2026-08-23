@@ -21,6 +21,7 @@ pub mod provider_http;
 pub mod reference_app;
 pub mod reference_case;
 pub mod replay;
+pub(crate) mod reports;
 pub(crate) mod repository;
 pub(crate) mod run_supervisor;
 pub mod webhook_http;

@@ -342,6 +342,10 @@ impl RunArtifactStaging {
         self.write_bytes(relative, &bytes)
     }
 
+    pub(crate) fn planned_final_path(&self) -> &Path {
+        &self.final_path
+    }
+
     pub(crate) fn write_bytes(
         &mut self,
         relative: impl AsRef<Path>,
@@ -1008,8 +1012,12 @@ pub fn verify_complete_run_artifact(root: &Path) -> Result<VerifiedRunArtifact, 
     {
         return Err(ArtifactError::UnsafePath(root.to_owned()));
     }
-    let files = collect_regular_files(root)?;
-    enforce_artifact_budget(root, &files)?;
+    let root = root.canonicalize().map_err(|source| ArtifactError::Io {
+        path: root.to_owned(),
+        source,
+    })?;
+    let files = collect_regular_files(&root)?;
+    enforce_artifact_budget(&root, &files)?;
 
     for required in [MANIFEST_FILE, CHECKSUMS_FILE, COMPATIBILITY_FILE] {
         if !files.iter().any(|path| path == required) {
@@ -1063,7 +1071,7 @@ pub fn verify_complete_run_artifact(root: &Path) -> Result<VerifiedRunArtifact, 
     if checksums != expected_checksums.as_bytes() {
         return Err(ArtifactError::ChecksumIndexMismatch);
     }
-    let compatibility = load_compatibility(root)?;
+    let compatibility = load_compatibility(&root)?;
     let compatibility_digest = manifest
         .required_files
         .get(COMPATIBILITY_FILE)
@@ -1072,7 +1080,7 @@ pub fn verify_complete_run_artifact(root: &Path) -> Result<VerifiedRunArtifact, 
     let required_files = manifest.required_files.clone();
 
     Ok(VerifiedRunArtifact {
-        root: root.to_owned(),
+        root,
         run_id: manifest.run_id,
         manifest_schema_version: manifest.schema_version,
         manifest_digest: checksum_bytes(&manifest_bytes),
@@ -1486,6 +1494,12 @@ pub enum ArtifactError {
     ChecksumFormatting,
     #[error("artifact JSON serialization failed: {0}")]
     Serialize(#[source] serde_json::Error),
+    #[error("artifact JUnit XML serialization failed: {0}")]
+    ReportXml(#[source] std::io::Error),
+    #[error("artifact replay command path is not safe UTF-8 text: {0}")]
+    ReportPath(PathBuf),
+    #[error("artifact report input is inconsistent with the completed run")]
+    InvalidReport,
     #[error("artifact I/O failed at {path}: {source}")]
     Io {
         path: PathBuf,
@@ -1564,6 +1578,32 @@ mod tests {
             verified.compatibility_path(),
             final_path.join("compatibility.json")
         );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn verified_artifact_root_is_absolute_even_when_the_input_is_relative() {
+        let current = std::env::current_dir().unwrap().canonicalize().unwrap();
+        let root = current
+            .join("target")
+            .join(format!("tiv-relative-artifact-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let base = root.join("runs");
+        let mut staging = RunArtifactStaging::create(&root, &base, "run_relative").unwrap();
+        staging
+            .write_json("summary.json", &serde_json::json!({"status": "held"}))
+            .unwrap();
+        staging
+            .write_json("compatibility.json", &compatibility_fixture())
+            .unwrap();
+        let final_path = staging.finalize().unwrap();
+        let relative = final_path.strip_prefix(&current).unwrap();
+
+        let verified = verify_complete_run_artifact(relative).unwrap();
+
+        assert!(verified.root().is_absolute());
+        assert_eq!(verified.root(), final_path);
 
         fs::remove_dir_all(root).unwrap();
     }

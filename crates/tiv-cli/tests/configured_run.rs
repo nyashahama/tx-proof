@@ -158,6 +158,7 @@ async fn configured_run_executes_a_real_case_and_finalizes_private_evidence() {
 
 #[tokio::test]
 #[ignore = "requires the isolated reference-app Compose project"]
+#[allow(clippy::too_many_lines)]
 async fn configured_replay_reproduces_one_verified_failure_three_times() {
     let _guard = E2E_LOCK.lock().await;
     prepare_reference_baseline().await;
@@ -174,6 +175,12 @@ async fn configured_replay_reproduces_one_verified_failure_three_times() {
     let source_receipt: serde_json::Value = serde_json::from_slice(&source_output.stdout).unwrap();
     let source_path = Path::new(source_receipt["artifact_path"].as_str().unwrap());
     verify_complete_run_artifact(source_path).unwrap();
+    assert_complete_report_bundle(
+        source_path,
+        "configured_campaign",
+        "counterexample",
+        "tiv replay configured",
+    );
 
     let replay_output = configured_replay_command(source_path)
         .output()
@@ -194,6 +201,12 @@ async fn configured_replay_reproduces_one_verified_failure_three_times() {
 
     let replay_path = Path::new(replay_receipt["artifact_path"].as_str().unwrap());
     verify_complete_run_artifact(replay_path).unwrap();
+    assert_complete_report_bundle(
+        replay_path,
+        "configured_replay",
+        "counterexample",
+        "tiv replay configured",
+    );
     let replay_manifest: serde_json::Value =
         serde_json::from_slice(&fs::read(replay_path.join("manifest.json")).unwrap()).unwrap();
     assert_eq!(replay_manifest["schema_version"], 2);
@@ -277,6 +290,12 @@ async fn configured_shrink_evaluates_one_replayed_candidate_and_finalizes_eviden
     let source_receipt: serde_json::Value = serde_json::from_slice(&source_output.stdout).unwrap();
     let source_path = Path::new(source_receipt["artifact_path"].as_str().unwrap());
     verify_complete_run_artifact(source_path).unwrap();
+    assert_complete_report_bundle(
+        source_path,
+        "configured_campaign",
+        "counterexample",
+        "tiv replay configured",
+    );
 
     let replay_output = configured_replay_command(source_path)
         .output()
@@ -292,6 +311,12 @@ async fn configured_shrink_evaluates_one_replayed_candidate_and_finalizes_eviden
     assert_eq!(replay_receipt["matching_failure_count"], 3);
     let replay_path = Path::new(replay_receipt["artifact_path"].as_str().unwrap());
     verify_complete_run_artifact(replay_path).unwrap();
+    assert_complete_report_bundle(
+        replay_path,
+        "configured_replay",
+        "counterexample",
+        "tiv replay configured",
+    );
 
     let shrink_output = configured_shrink_command(replay_path)
         .output()
@@ -325,6 +350,16 @@ async fn configured_shrink_evaluates_one_replayed_candidate_and_finalizes_eviden
 
     let shrink_path = Path::new(shrink_receipt["artifact_path"].as_str().unwrap());
     verify_complete_run_artifact(shrink_path).unwrap();
+    assert_complete_report_bundle(
+        shrink_path,
+        "configured_shrink",
+        if shrink_receipt["completion"] == "budget_exhausted" {
+            "budget_exhausted"
+        } else {
+            "counterexample"
+        },
+        "tiv replay minimized",
+    );
     let shrink_manifest: serde_json::Value =
         serde_json::from_slice(&fs::read(shrink_path.join("manifest.json")).unwrap()).unwrap();
     assert_eq!(shrink_manifest["schema_version"], 2);
@@ -464,6 +499,12 @@ async fn configured_shrink_evaluates_one_replayed_candidate_and_finalizes_eviden
         Path::new(minimized_replay_receipt["artifact_path"].as_str().unwrap());
     assert_eq!(read_artifact_snapshot(shrink_path), shrink_snapshot);
     verify_complete_run_artifact(minimized_replay_path).unwrap();
+    assert_complete_report_bundle(
+        minimized_replay_path,
+        "configured_minimized_replay",
+        "counterexample",
+        "tiv replay minimized",
+    );
     let minimized_replay_manifest: serde_json::Value =
         serde_json::from_slice(&fs::read(minimized_replay_path.join("manifest.json")).unwrap())
             .unwrap();
@@ -639,6 +680,14 @@ async fn configured_replay_rechecks_compatibility_before_every_attempt_reset() {
         serde_json::from_slice(&fs::read(final_path.join("summary.json")).unwrap()).unwrap();
     assert_eq!(summary["failure_code"], "compatibility_mismatch");
     assert_eq!(summary["completed_attempts"], 1);
+    assert_partial_report_bundle(
+        &final_path,
+        "configured_replay",
+        "configuration_failure",
+        "compatibility_mismatch",
+        2,
+        false,
+    );
     assert!(
         !final_path
             .join("attempts/attempt_0002/observations.ndjson")
@@ -695,6 +744,14 @@ async fn configured_replay_interrupts_with_recovery_and_partial_evidence() {
         serde_json::from_slice(&fs::read(final_path.join("manifest.json")).unwrap()).unwrap();
     assert_eq!(manifest["complete"], false);
     assert_eq!(manifest["failure_class"], "interrupted");
+    assert_partial_report_bundle(
+        &final_path,
+        "configured_replay",
+        "interrupted",
+        "interrupted",
+        130,
+        false,
+    );
     assert_reference_app_healthy();
     verify_complete_run_artifact(source_path).unwrap();
 
@@ -827,6 +884,14 @@ async fn configured_run_interrupts_with_recovery_and_finalized_partial_evidence(
         serde_json::from_slice(&fs::read(final_path.join("manifest.json")).unwrap()).unwrap();
     assert_eq!(manifest["complete"], false);
     assert_eq!(manifest["failure_class"], "interrupted");
+    assert_partial_report_bundle(
+        &final_path,
+        "configured_campaign",
+        "interrupted",
+        "interrupted",
+        130,
+        false,
+    );
     assert_reference_app_healthy();
 
     cleanup_reference_databases().await;
@@ -1275,6 +1340,87 @@ async fn configured_case_identity() -> (u32, String) {
     drop(case);
     connection.await.unwrap().unwrap();
     (u32::try_from(oid).unwrap(), marker)
+}
+
+fn assert_complete_report_bundle(
+    artifact: &Path,
+    expected_kind: &str,
+    expected_result: &str,
+    expected_command: &str,
+) {
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(artifact.join("manifest.json")).unwrap()).unwrap();
+    assert_eq!(manifest["artifact"]["kind"], expected_kind);
+    assert_eq!(manifest["artifact"]["result"], expected_result);
+    let checksums = fs::read_to_string(artifact.join("checksums.txt")).unwrap();
+    for relative in ["summary.md", "junit.xml", "replay.txt"] {
+        assert!(artifact.join(relative).is_file());
+        assert!(
+            manifest["required_files"][relative]
+                .as_str()
+                .is_some_and(|digest| digest.len() == 64)
+        );
+        assert!(checksums.contains(&format!("  {relative}\n")));
+    }
+
+    let markdown = fs::read_to_string(artifact.join("summary.md")).unwrap();
+    assert!(markdown.contains(&format!("- Artifact: `{expected_kind}`")));
+    assert!(markdown.contains(&format!("- Result: `{expected_result}`")));
+    assert!(markdown.contains("counterexample search—not proof"));
+
+    let replay = fs::read_to_string(artifact.join("replay.txt")).unwrap();
+    assert!(replay.contains(expected_command));
+    assert!(replay.contains("exact compatibility before mutation"));
+
+    let junit = fs::read_to_string(artifact.join("junit.xml")).unwrap();
+    assert!(junit.starts_with("<?xml version=\"1.0\" encoding=\"UTF-8\"?>"));
+    assert!(junit.contains(&format!("value=\"{expected_kind}\"")));
+    assert!(junit.contains(&format!("value=\"{expected_result}\"")));
+    assert!(junit.contains("failures=\"1\""));
+}
+
+fn assert_partial_report_bundle(
+    artifact: &Path,
+    expected_kind: &str,
+    expected_result: &str,
+    expected_failure_code: &str,
+    expected_exit_code: u8,
+    expected_skipped: bool,
+) {
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(artifact.join("manifest.json")).unwrap()).unwrap();
+    let checksums = fs::read_to_string(artifact.join("checksums.txt")).unwrap();
+    for relative in ["summary.md", "junit.xml", "replay.txt"] {
+        assert!(artifact.join(relative).is_file());
+        assert!(
+            manifest["required_files"][relative]
+                .as_str()
+                .is_some_and(|digest| digest.len() == 64)
+        );
+        assert!(checksums.contains(&format!("  {relative}\n")));
+    }
+
+    let markdown = fs::read_to_string(artifact.join("summary.md")).unwrap();
+    assert!(markdown.contains(&format!("- Artifact: `{expected_kind}`")));
+    assert!(markdown.contains(&format!("- Result: `{expected_result}`")));
+    assert!(markdown.contains(&format!("Failure code: `{expected_failure_code}`")));
+    assert!(markdown.contains(&format!("- Exit code: `{expected_exit_code}`")));
+    assert!(markdown.contains("counterexample search—not proof"));
+
+    let replay = fs::read_to_string(artifact.join("replay.txt")).unwrap();
+    assert!(replay.contains("No executable counterexample replay command"));
+
+    let junit = fs::read_to_string(artifact.join("junit.xml")).unwrap();
+    assert!(junit.contains(&format!("value=\"{expected_kind}\"")));
+    assert!(junit.contains(&format!("value=\"{expected_result}\"")));
+    assert!(junit.contains(&format!("value=\"{expected_exit_code}\"")));
+    if expected_skipped {
+        assert!(junit.contains("errors=\"0\""));
+        assert!(junit.contains("skipped=\"1\""));
+    } else {
+        assert!(junit.contains("errors=\"1\""));
+        assert!(junit.contains("skipped=\"0\""));
+    }
 }
 
 fn rewrite_compatibility_digest_and_reseal(artifact: &Path) {

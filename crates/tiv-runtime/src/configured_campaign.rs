@@ -42,6 +42,11 @@ use crate::{
         ReferenceCaseRunReceipt, ReferenceShrinkCaseRunReceipt, preflight_reference_planned_case,
         run_configured_planned_case_with_process, run_configured_shrink_candidate_with_process,
     },
+    reports::{
+        ArtifactReport, PartialReportClass, ReplayCommand, ReportArtifactKind, ReportCheck,
+        ReportCheckOutcome, ReportConclusion, ReportFact, ReportFailure, partial_artifact_report,
+        validate_replay_command_paths, write_report_bundle,
+    },
     repository::capture_repository_provenance,
     run_supervisor::{
         ComposeProjectLock, SupervisedCaseOutcome, complete_supervision, supervise_execution,
@@ -120,6 +125,17 @@ impl ConfiguredCampaignFailureClass {
             Self::Infrastructure => 3,
             Self::Inconclusive => 4,
             Self::Interrupted => 130,
+        }
+    }
+}
+
+impl From<ConfiguredCampaignFailureClass> for PartialReportClass {
+    fn from(class: ConfiguredCampaignFailureClass) -> Self {
+        match class {
+            ConfiguredCampaignFailureClass::Configuration => Self::Configuration,
+            ConfiguredCampaignFailureClass::Infrastructure => Self::Infrastructure,
+            ConfiguredCampaignFailureClass::Inconclusive => Self::Inconclusive,
+            ConfiguredCampaignFailureClass::Interrupted => Self::Interrupted,
         }
     }
 }
@@ -271,6 +287,9 @@ pub async fn run_configured_campaign_with_cancellation(
     for case in campaign.cases() {
         preflight_reference_planned_case(case.plan(), true, true)?;
     }
+    let run_id = format!("run_{}", uuid::Uuid::new_v4().simple());
+    validate_replay_command_paths(&config.artifact_dir().join(&run_id), config.source_path())
+        .map_err(ConfiguredCampaignError::ReportPath)?;
     if cancellation.is_cancelled() {
         return Err(ConfiguredCampaignError::Interrupted { case_id: None });
     }
@@ -280,7 +299,6 @@ pub async fn run_configured_campaign_with_cancellation(
         .await
         .map_err(|error| ConfiguredCampaignError::Repository(Box::new(error)))?;
 
-    let run_id = format!("run_{}", uuid::Uuid::new_v4().simple());
     let mut artifacts = RunArtifactStaging::create_v2(
         config.root(),
         config.artifact_dir(),
@@ -319,6 +337,26 @@ pub async fn run_configured_campaign_with_cancellation(
                 cases: &case_results,
             };
             if let Err(artifact_error) = artifacts.write_json("summary.json", &summary) {
+                return Err(ConfiguredCampaignError::PartialFinalization {
+                    cause: Box::new(cause),
+                    artifact: Box::new(artifact_error),
+                });
+            }
+            let mut report = partial_artifact_report(
+                &run_id,
+                ReportArtifactKind::Campaign,
+                failure_class.into(),
+                failure_code,
+            );
+            report.add_fact(ReportFact::new(
+                "Configured cases",
+                campaign.cases().len().to_string(),
+            ));
+            report.add_fact(ReportFact::new(
+                "Completed cases",
+                case_results.len().to_string(),
+            ));
+            if let Err(artifact_error) = write_report_bundle(&mut artifacts, &report) {
                 return Err(ConfiguredCampaignError::PartialFinalization {
                     cause: Box::new(cause),
                     artifact: Box::new(artifact_error),
@@ -363,6 +401,12 @@ pub async fn run_configured_campaign_with_cancellation(
         cases: case_results,
     };
     artifacts.write_json("summary.json", &summary)?;
+    let report = completed_campaign_report(
+        &summary,
+        artifacts.planned_final_path(),
+        config.source_path(),
+    )?;
+    write_report_bundle(&mut artifacts, &report)?;
     let authorities = campaign_authorities(&summary.cases)?;
     let result = match campaign_verdict {
         ConfiguredCampaignVerdict::Held => ArtifactResult::Held,
@@ -902,6 +946,93 @@ fn campaign_authorities(cases: &[CaseArtifact]) -> Result<Vec<ArtifactAuthority>
     Ok(authorities)
 }
 
+fn completed_campaign_report(
+    summary: &CampaignSummary,
+    artifact_path: &Path,
+    config_path: &Path,
+) -> Result<ArtifactReport, ArtifactError> {
+    let conclusion = match summary.verdict {
+        ConfiguredCampaignVerdict::Held => ReportConclusion::Held,
+        ConfiguredCampaignVerdict::Violated => ReportConclusion::Counterexample,
+    };
+    let replay_stability = match summary.verdict {
+        ConfiguredCampaignVerdict::Held => {
+            "Not applicable: no violating case was observed.".to_owned()
+        }
+        ConfiguredCampaignVerdict::Violated => {
+            "Not yet classified; use the emitted three-attempt replay command for each violating case."
+                .to_owned()
+        }
+    };
+    let mut report = ArtifactReport::new(
+        &summary.run_id,
+        ReportArtifactKind::Campaign,
+        conclusion,
+        format!(
+            "{} configured serial cases; {} completed.",
+            summary.configured_cases, summary.completed_cases
+        ),
+        replay_stability,
+    );
+    report.add_fact(ReportFact::new(
+        "Configured cases",
+        summary.configured_cases.to_string(),
+    ));
+    report.add_fact(ReportFact::new(
+        "Completed cases",
+        summary.completed_cases.to_string(),
+    ));
+
+    let mut violating_cases = 0_usize;
+    for case in &summary.cases {
+        let mut case_violated = false;
+        for invariant in &case.invariants {
+            let name = format!(
+                "{} / {} at {}",
+                case.case_id, invariant.invariant_id, invariant.checkpoint_id
+            );
+            match invariant.verdict {
+                ConfiguredCampaignVerdict::Held => report.add_check(ReportCheck::new(
+                    name,
+                    ReportCheckOutcome::Passed,
+                    "invariant held for this bounded case",
+                )),
+                ConfiguredCampaignVerdict::Violated => {
+                    case_violated = true;
+                    report.add_check(ReportCheck::new(
+                        name,
+                        ReportCheckOutcome::Failed,
+                        "counterexample observed; fresh-baseline replay classification is required",
+                    ));
+                    report.add_failure(ReportFailure::new(
+                        &invariant.invariant_id,
+                        &invariant.checkpoint_id,
+                        Some(invariant.witness_count),
+                    ));
+                }
+            }
+        }
+        if case_violated {
+            violating_cases += 1;
+            let case_number = case
+                .case_id
+                .strip_prefix("case_")
+                .and_then(|value| value.parse::<u32>().ok())
+                .ok_or(ArtifactError::InvalidReport)?;
+            report.add_replay_command(ReplayCommand::configured(
+                artifact_path,
+                config_path,
+                case_number,
+            ));
+        }
+    }
+    report.add_fact(ReportFact::new(
+        "Violating cases",
+        violating_cases.to_string(),
+    ));
+    Ok(report)
+}
+
 const fn partial_status(class: ConfiguredCampaignFailureClass) -> &'static str {
     match class {
         ConfiguredCampaignFailureClass::Configuration
@@ -1010,6 +1141,8 @@ pub enum ConfiguredCampaignError {
     Compatibility(#[from] CompatibilityCaptureError),
     #[error("configured case preflight failed: {0}")]
     CasePreflight(#[from] ReferenceCaseRunError),
+    #[error("configured report path preflight failed: {0}")]
+    ReportPath(#[source] ArtifactError),
     #[error("configured run artifact failed: {0}")]
     Artifact(#[source] Box<dyn std::error::Error + Send + Sync>),
     #[error("configured baseline or case database failed: {0}")]
@@ -1074,6 +1207,7 @@ impl ConfiguredCampaignError {
             | Self::Quiescence(_)
             | Self::Snapshot(_)
             | Self::CasePreflight(_)
+            | Self::ReportPath(_)
             | Self::CaseDatabaseName
             | Self::DriverOrigin
             | Self::CaseConfig(_) => ConfiguredCampaignFailureClass::Configuration,
@@ -1131,6 +1265,7 @@ impl ConfiguredCampaignError {
             Self::Compose(_) => "compose_preflight",
             Self::Compatibility(_) => "compatibility_capture",
             Self::CasePreflight(_) => "case_preflight",
+            Self::ReportPath(_) => "invalid_report_path",
             Self::Artifact(_) => "artifact_failure",
             Self::Baseline(_) => "baseline_failure",
             Self::Process(_) => "process_failure",
@@ -1193,8 +1328,9 @@ mod tests {
     };
 
     use super::{
-        ConfiguredCampaignError, ConfiguredCampaignFailureClass, ConfiguredCampaignOptions,
-        ConfiguredCampaignOptionsError,
+        CampaignSummary, CaseArtifact, ConfiguredCampaignError, ConfiguredCampaignFailureClass,
+        ConfiguredCampaignOptions, ConfiguredCampaignOptionsError, ConfiguredCampaignVerdict,
+        InvariantArtifact, completed_campaign_report,
     };
     use crate::{
         compatibility::{CompatibilityCaptureError, CompatibilityError},
@@ -1203,7 +1339,50 @@ mod tests {
         reference_case::{
             ReferenceCaseError, ReferenceCaseRunError, preflight_reference_planned_case,
         },
+        reports::{ReportCheckOutcome, ReportConclusion},
     };
+
+    #[test]
+    fn held_campaign_report_maps_the_real_producer_outcome() {
+        let summary = CampaignSummary {
+            schema_version: 1,
+            run_id: "run_held".to_owned(),
+            verdict: ConfiguredCampaignVerdict::Held,
+            configured_cases: 1,
+            completed_cases: 1,
+            cases: vec![CaseArtifact {
+                schema_version: 1,
+                case_id: "case_0001".to_owned(),
+                seed: 1,
+                planned_action_count: 1,
+                executed_action_count: 1,
+                journal_record_count: 1,
+                journal_last_record_hash: None,
+                before_database_oid: 1,
+                after_database_oid: 2,
+                before_marker_uuid: "before".to_owned(),
+                after_marker_uuid: "after".to_owned(),
+                provider_object_count: 1,
+                invariants: vec![InvariantArtifact {
+                    invariant_id: "provider_object_uniqueness".to_owned(),
+                    checkpoint_id: "checkout_complete".to_owned(),
+                    verdict: ConfiguredCampaignVerdict::Held,
+                    witness_count: 0,
+                }],
+            }],
+        };
+
+        let report = completed_campaign_report(
+            &summary,
+            Path::new("/tmp/run_held"),
+            Path::new("/tmp/tiv.toml"),
+        )
+        .unwrap();
+
+        assert_eq!(report.conclusion(), ReportConclusion::Held);
+        assert_eq!(report.check_outcomes(), vec![ReportCheckOutcome::Passed]);
+        assert_eq!(report.replay_command_count(), 0);
+    }
 
     #[test]
     fn configured_campaign_options_are_explicit_and_bounded_by_typed_core_values() {
