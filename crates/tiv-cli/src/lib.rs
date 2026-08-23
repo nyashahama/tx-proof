@@ -16,6 +16,10 @@ use tiv_core::{
 use tiv_runtime::{
     baseline::{BaselineError, run_configured_baseline},
     config::{ConfigError, ProcessEnvironment, load_resolved_config},
+    configured_campaign::{
+        ConfiguredCampaignError, ConfiguredCampaignOptions, ConfiguredCampaignOptionsError,
+        ConfiguredCampaignVerdict, RunCancellation, run_configured_campaign_with_cancellation,
+    },
     doctor::{DoctorError, run_doctor},
     init::{InitError, initialize_project},
     postgres::{
@@ -38,6 +42,28 @@ pub struct TraceSummary {
     pub action_count: usize,
 }
 
+#[derive(Debug)]
+pub struct CliOutput {
+    body: String,
+    exit_code: u8,
+}
+
+impl CliOutput {
+    fn success(body: String) -> Self {
+        Self { body, exit_code: 0 }
+    }
+
+    #[must_use]
+    pub fn body(&self) -> &str {
+        &self.body
+    }
+
+    #[must_use]
+    pub const fn exit_code(&self) -> u8 {
+        self.exit_code
+    }
+}
+
 #[derive(Debug, Parser, PartialEq)]
 #[command(
     name = "tiv",
@@ -57,6 +83,8 @@ pub enum Command {
     Doctor(DoctorArgs),
     /// Seal and reset-prove one attested disposable `PostgreSQL` baseline.
     Baseline(BaselineArgs),
+    /// Execute a serial configured campaign against the attested disposable stack.
+    Run(RunArgs),
     /// Inspect replay readiness without executing customer code.
     Replay {
         #[command(subcommand)]
@@ -84,6 +112,22 @@ pub struct DoctorArgs {
     /// Typed TOML configuration to validate and inspect.
     #[arg(long, default_value = "tiv.toml")]
     pub config: PathBuf,
+}
+
+#[derive(Clone, Debug, PartialEq, Args)]
+pub struct RunArgs {
+    /// Typed TOML configuration for the disposable customer stack.
+    #[arg(long, default_value = "tiv.toml")]
+    pub config: PathBuf,
+    /// Optional deterministic campaign-seed override.
+    #[arg(long)]
+    pub seed: Option<u64>,
+    /// Optional serial case-count override within the v1 maximum.
+    #[arg(long)]
+    pub cases: Option<u32>,
+    /// Emit CI-oriented status and preserve the run verdict exit contract.
+    #[arg(long)]
+    pub ci: bool,
 }
 
 #[derive(Debug, PartialEq, Subcommand)]
@@ -196,6 +240,7 @@ pub fn execute(cli: Cli) -> Result<String, CliError> {
         }
         Command::Doctor(_)
         | Command::Baseline(_)
+        | Command::Run(_)
         | Command::Replay {
             command:
                 ReplayCommand::ReferenceApp(_)
@@ -218,7 +263,45 @@ pub fn execute(cli: Cli) -> Result<String, CliError> {
 ///
 /// Returns [`CliError`] when input validation, replay execution, or JSON
 /// encoding fails.
-pub async fn execute_async(cli: Cli) -> Result<String, CliError> {
+pub async fn execute_async(cli: Cli) -> Result<CliOutput, CliError> {
+    Box::pin(execute_async_with_cancellation(
+        cli,
+        &RunCancellation::new(),
+    ))
+    .await
+}
+
+/// Executes one CLI command with a root cancellation capability.
+///
+/// # Errors
+///
+/// Returns [`CliError`] after configured-run recovery and partial-evidence
+/// finalization when cancellation interrupts a mutable campaign.
+pub async fn execute_async_with_cancellation(
+    cli: Cli,
+    cancellation: &RunCancellation,
+) -> Result<CliOutput, CliError> {
+    match cli.command {
+        Command::Run(args) => {
+            let options = ConfiguredCampaignOptions::new(args.seed, args.cases, args.ci)?;
+            let output = Box::pin(run_configured_campaign_with_cancellation(
+                &args.config,
+                &ProcessEnvironment,
+                options,
+                cancellation,
+            ))
+            .await?;
+            let exit_code = run_verdict_exit_code(output.verdict());
+            let body = output.to_pretty_json().map_err(CliError::Encode)?;
+            Ok(CliOutput { body, exit_code })
+        }
+        command => execute_async_text(Cli { command })
+            .await
+            .map(CliOutput::success),
+    }
+}
+
+async fn execute_async_text(cli: Cli) -> Result<String, CliError> {
     match cli.command {
         Command::Doctor(args) => {
             let report = run_doctor(&args.config, &ProcessEnvironment).await?;
@@ -234,6 +317,7 @@ pub async fn execute_async(cli: Cli) -> Result<String, CliError> {
             .await?;
             output.to_pretty_json().map_err(CliError::Encode)
         }
+        Command::Run(_) => Err(CliError::AsyncCommand),
         Command::Replay {
             command: ReplayCommand::ReferenceApp(args),
         } => {
@@ -301,6 +385,13 @@ pub async fn execute_async(cli: Cli) -> Result<String, CliError> {
             evidence.to_pretty_json().map_err(CliError::Encode)
         }
         read_only => execute(Cli { command: read_only }),
+    }
+}
+
+const fn run_verdict_exit_code(verdict: ConfiguredCampaignVerdict) -> u8 {
+    match verdict {
+        ConfiguredCampaignVerdict::Held => 0,
+        ConfiguredCampaignVerdict::Violated => 10,
     }
 }
 
@@ -398,6 +489,10 @@ pub enum CliError {
     Config(#[from] ConfigError),
     #[error("configured SQL probe is invalid: {0}")]
     ConfiguredSqlProbe(#[source] ConfiguredSqlProbeError),
+    #[error("configured campaign options are invalid: {0}")]
+    ConfiguredCampaignOptions(#[from] ConfiguredCampaignOptionsError),
+    #[error("configured campaign failed: {0}")]
+    ConfiguredCampaign(#[from] ConfiguredCampaignError),
     #[error("the system clock could not produce a valid webhook timestamp")]
     InvalidSystemTime,
     #[error("reference app replay configuration is invalid: {0}")]
@@ -420,7 +515,41 @@ impl CliError {
         match self {
             Self::Doctor(error) if error.is_infrastructure_failure() => 3,
             Self::Baseline(error) if error.is_infrastructure_failure() => 3,
+            Self::ConfiguredCampaign(error) => error.exit_code(),
             _ => 2,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tiv_runtime::configured_campaign::{ConfiguredCampaignError, ConfiguredCampaignVerdict};
+
+    use super::{CliError, run_verdict_exit_code};
+
+    #[test]
+    fn configured_run_verdicts_have_non_overlapping_success_and_violation_codes() {
+        assert_eq!(run_verdict_exit_code(ConfiguredCampaignVerdict::Held), 0);
+        assert_eq!(
+            run_verdict_exit_code(ConfiguredCampaignVerdict::Violated),
+            10
+        );
+    }
+
+    #[test]
+    fn configured_run_failures_reach_the_runtime_classification_at_the_cli_boundary() {
+        let infrastructure = CliError::ConfiguredCampaign(ConfiguredCampaignError::Process(
+            Box::new(std::io::Error::other("docker unavailable")),
+        ));
+        let inconclusive = CliError::ConfiguredCampaign(ConfiguredCampaignError::CaseTimedOut {
+            case_id: "case_0001".to_owned(),
+        });
+        let interrupted = CliError::ConfiguredCampaign(ConfiguredCampaignError::Interrupted {
+            case_id: Some("case_0001".to_owned()),
+        });
+
+        assert_eq!(infrastructure.exit_code(), 3);
+        assert_eq!(inconclusive.exit_code(), 4);
+        assert_eq!(interrupted.exit_code(), 130);
     }
 }

@@ -11,6 +11,31 @@ use tiv_stripe_pi::{
 };
 use tokio::{net::TcpListener, sync::Mutex, time::timeout};
 
+#[test]
+fn fault_outcome_wire_names_match_the_campaign_plan_contract() {
+    let outcomes: Vec<FaultOutcome> = serde_json::from_value(json!([
+        "normal",
+        "pre_execute_429",
+        "pre_execute_500",
+        "post_execute_500",
+        "commit_then_close",
+        "commit_then_delay"
+    ]))
+    .expect("every campaign provider outcome is accepted by the fixture");
+
+    assert_eq!(
+        outcomes,
+        vec![
+            FaultOutcome::Normal,
+            FaultOutcome::PreExecute429,
+            FaultOutcome::PreExecute500,
+            FaultOutcome::PostExecute500,
+            FaultOutcome::CommitThenClose,
+            FaultOutcome::CommitThenDelay,
+        ]
+    );
+}
+
 #[tokio::test]
 async fn commit_then_delay_is_observable_until_the_exact_gate_is_released() {
     let mut fixture = ManagedFixture::new(Seed::new(42));
@@ -79,6 +104,139 @@ async fn reset_cancels_every_response_held_by_the_previous_fixture_state() {
 
     assert_eq!(cancellation.to_string(), "held response was cancelled");
     assert!(fixture.snapshot().held_gates().is_empty());
+}
+
+#[tokio::test]
+async fn webhook_ingress_capability_is_event_bound_single_use_and_cancelled_by_control() {
+    let mut fixture = ManagedFixture::new(Seed::new(57));
+    fixture
+        .reset(1, Seed::new(57), vec![FaultOutcome::Normal])
+        .expect("the provider plan is installed");
+    let created = fixture
+        .create_data_plane(
+            IdempotencyKey::new("op-57-attempt-1").unwrap(),
+            valid_create(),
+        )
+        .expect("the provider object is created");
+    assert!(matches!(created, ManagedDataPlaneDisposition::Response(_)));
+    let payment_intent_id = fixture.snapshot().payment_intents()[0].id().to_owned();
+    let event = fixture
+        .generate_event(2, &payment_intent_id)
+        .expect("the immutable event is generated");
+    let prepared = fixture
+        .prepare_webhook_request_gate(event.event_id())
+        .expect("one event-bound ingress gate is prepared");
+
+    assert!(matches!(
+        fixture.hold_webhook_request_forwarded("not-the-capability"),
+        Err(FixtureServiceError::InvalidWebhookRequestGate)
+    ));
+    let held = fixture
+        .hold_webhook_request_forwarded(prepared.capability())
+        .expect("the exact single-use capability marks ingress forwarded");
+    assert_eq!(held.gate_id(), prepared.gate_id());
+    let state = serde_json::to_value(fixture.webhook_request_state()).unwrap();
+    assert_eq!(state["command_sequence"], 2);
+    assert_eq!(
+        state["held_webhook_requests"][0]["event_id"],
+        event.event_id()
+    );
+    assert_eq!(state["held_webhook_requests"][0]["forwarded"], true);
+    assert!(
+        matches!(
+            fixture.hold_webhook_request_forwarded(prepared.capability()),
+            Err(FixtureServiceError::InvalidWebhookRequestGate)
+        ),
+        "the capability cannot be replayed"
+    );
+
+    let discarded = fixture
+        .discard_webhook_request(3, prepared.gate_id())
+        .expect("control discards the exact forwarded request");
+    let discarded = serde_json::to_value(discarded).unwrap();
+    assert!(
+        discarded["held_webhook_requests"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(held.wait().await, Err(tiv_stripe_pi::HeldResponseCancelled));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn managed_data_plane_blocks_the_exact_webhook_ingress_callback_until_discard() {
+    let fixture = Arc::new(Mutex::new(ManagedFixture::new(Seed::new(59))));
+    let prepared = {
+        let mut fixture = fixture.lock().await;
+        fixture
+            .reset(1, Seed::new(59), vec![FaultOutcome::Normal])
+            .unwrap();
+        fixture
+            .create_data_plane(
+                IdempotencyKey::new("op-59-attempt-1").unwrap(),
+                valid_create(),
+            )
+            .unwrap();
+        let payment_intent_id = fixture.snapshot().payment_intents()[0].id().to_owned();
+        let event = fixture.generate_event(2, &payment_intent_id).unwrap();
+        fixture
+            .prepare_webhook_request_gate(event.event_id())
+            .unwrap()
+    };
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server_fixture = Arc::clone(&fixture);
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let result = serve_managed_http1_connection(stream, server_fixture).await;
+        assert!(
+            result.is_err(),
+            "discard closes the held callback without an acknowledgment"
+        );
+    });
+    let capability = prepared.capability().to_owned();
+    let callback = tokio::spawn(async move {
+        reqwest::Client::new()
+            .post(format!("http://{address}/v1/tiv/webhook-request-forwarded"))
+            .header("X-Tiv-Webhook-Ingress-Capability", capability)
+            .body("")
+            .send()
+            .await
+    });
+
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let state = serde_json::to_value(fixture.lock().await.webhook_request_state()).unwrap();
+            if state["held_webhook_requests"][0]["forwarded"] == true {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the exact callback reaches the forwarded boundary");
+    assert!(
+        !callback.is_finished(),
+        "the application is held before persistence"
+    );
+    fixture
+        .lock()
+        .await
+        .discard_webhook_request(3, prepared.gate_id())
+        .unwrap();
+
+    assert!(
+        timeout(Duration::from_secs(2), callback)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_err(),
+        "discard cannot become an application acknowledgment"
+    );
+    timeout(Duration::from_secs(2), server)
+        .await
+        .unwrap()
+        .unwrap();
 }
 
 #[test]

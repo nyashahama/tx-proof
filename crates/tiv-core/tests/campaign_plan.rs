@@ -72,6 +72,33 @@ fn case_seed_derivation_has_a_pinned_v1_sequence() {
 }
 
 #[test]
+fn run_overrides_preserve_fault_capabilities_and_replace_only_seed_and_case_count() {
+    let original = CampaignSpec::payment_intent_v1(
+        Seed::new(424_242),
+        CaseCount::new(20).unwrap(),
+        ActionBudget::new(40).unwrap(),
+    );
+    let overridden =
+        original.with_run_overrides(Some(Seed::new(99)), Some(CaseCount::new(2).unwrap()));
+
+    assert_eq!(overridden.campaign_seed(), Seed::new(99));
+    assert_eq!(overridden.case_count(), CaseCount::new(2).unwrap());
+    assert_eq!(overridden.max_actions(), original.max_actions());
+    let encoded_original = serde_json::to_value(&original).unwrap();
+    let encoded_overridden = serde_json::to_value(&overridden).unwrap();
+    for key in [
+        "max_actions",
+        "provider_adapter",
+        "provider_api_version",
+        "provider_outcomes",
+        "webhook_faults",
+        "process_faults",
+    ] {
+        assert_eq!(encoded_overridden[key], encoded_original[key]);
+    }
+}
+
+#[test]
 fn campaign_capabilities_are_applied_to_every_case() {
     let spec = CampaignSpec::new_payment_intent_v1(
         Seed::new(7),

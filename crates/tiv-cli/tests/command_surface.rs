@@ -1,8 +1,44 @@
 use clap::Parser;
 use tiv_cli::{
     BaselineArgs, Cli, Command, DoctorArgs, ReferenceAppCaseArgs, ReferenceAppEvidenceArgs,
-    ReferenceAppReplayArgs, ReplayCommand, TraceCommand,
+    ReferenceAppReplayArgs, ReplayCommand, RunArgs, TraceCommand,
 };
+
+#[test]
+fn the_cli_exposes_configured_campaign_run_with_bounded_optional_overrides() {
+    let default = Cli::try_parse_from(["tiv", "run"]).expect("the run command parses");
+    assert_eq!(
+        default.command,
+        Command::Run(RunArgs {
+            config: "tiv.toml".into(),
+            seed: None,
+            cases: None,
+            ci: false,
+        })
+    );
+
+    let explicit = Cli::try_parse_from([
+        "tiv",
+        "run",
+        "--config",
+        "safe/tiv.toml",
+        "--seed",
+        "99",
+        "--cases",
+        "2",
+        "--ci",
+    ])
+    .expect("the bounded run overrides parse");
+    assert_eq!(
+        explicit.command,
+        Command::Run(RunArgs {
+            config: "safe/tiv.toml".into(),
+            seed: Some(99),
+            cases: Some(2),
+            ci: true,
+        })
+    );
+}
 
 #[test]
 fn the_cli_exposes_the_two_stage_customer_baseline_command() {

@@ -1,9 +1,13 @@
 //! Effectful runtime adapters for `TxProof`.
 
+pub(crate) mod artifacts;
 pub mod baseline;
 pub mod campaign;
 pub mod case_http;
 pub mod config;
+pub mod configured_campaign;
+pub(crate) mod configured_database;
+pub(crate) mod configured_process;
 pub mod doctor;
 pub mod evidence;
 pub mod init;
@@ -13,4 +17,5 @@ pub mod provider_http;
 pub mod reference_app;
 pub mod reference_case;
 pub mod replay;
+pub(crate) mod run_supervisor;
 pub mod webhook_http;

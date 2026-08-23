@@ -20,6 +20,7 @@ use crate::{
 
 const MAX_DRIVER_BODY_BYTES: usize = 16 * 1024;
 const MAX_CONTROL_TOKEN_BYTES: usize = 1_024;
+const DRIVER_ACTION_ID_HEADER: &str = "X-Tiv-Action-Id";
 
 /// Secret-bearing, loopback-only configuration for one provider case.
 ///
@@ -416,6 +417,7 @@ impl ProviderHttpAdapter {
                 &self.client,
                 self.config.driver_url.clone(),
                 &self.config.driver_body,
+                action_id,
                 provider_script,
             )
             .await?;
@@ -428,8 +430,14 @@ impl ProviderHttpAdapter {
         let (observed_tx, observed_rx) = oneshot::channel();
         let (gate_tx, gate_rx) = oneshot::channel::<()>();
         let task = tokio::spawn(async move {
-            let observed =
-                request_driver_checkout(&client, driver_url, &driver_body, provider_script).await;
+            let observed = request_driver_checkout(
+                &client,
+                driver_url,
+                &driver_body,
+                action_id,
+                provider_script,
+            )
+            .await;
             observed_tx
                 .send(observed)
                 .map_err(|_| ProviderHttpError::ClientResponseGateClosed)?;
@@ -720,6 +728,7 @@ impl ProviderHttpAdapter {
         provider_gate_capture(request.expected_outputs(), gate_id)
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn start_held_checkout(
         &mut self,
         request: &CaseEffectRequest<'_>,
@@ -747,10 +756,12 @@ impl ProviderHttpAdapter {
         let driver_url = self.config.driver_url.clone();
         let driver_body = self.config.driver_body.clone();
         let driver_timeout = self.config.timeout;
+        let action_id = request.action().id();
         let task = tokio::spawn(async move {
             timeout(driver_timeout, async move {
                 let response = client
                     .post(driver_url)
+                    .header(DRIVER_ACTION_ID_HEADER, action_id.value())
                     .json(&driver_body)
                     .send()
                     .await
@@ -1165,10 +1176,12 @@ async fn request_driver_checkout(
     client: &Client,
     driver_url: Url,
     driver_body: &serde_json::Value,
+    action_id: ActionId,
     provider_script: ProviderOutcomeScript,
 ) -> Result<Option<DriverCheckoutResponse>, ProviderHttpError> {
     let response = client
         .post(driver_url)
+        .header(DRIVER_ACTION_ID_HEADER, action_id.value())
         .json(driver_body)
         .send()
         .await
@@ -1525,4 +1538,10 @@ pub enum ProviderHttpError {
     Journal(#[from] JournalError),
     #[error("action is outside the provider HTTP adapter boundary")]
     UnsupportedAction,
+}
+
+impl ProviderHttpError {
+    pub(crate) const fn is_inconclusive(&self) -> bool {
+        matches!(self, Self::Timeout(_))
+    }
 }

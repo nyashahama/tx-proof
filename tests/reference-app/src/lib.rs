@@ -22,6 +22,9 @@ use sha2::Sha256;
 use tokio::{net::TcpStream, sync::Mutex, time::timeout};
 use tokio_postgres::{Client, NoTls};
 
+const DRIVER_ACTION_ID_HEADER: &str = "X-Tiv-Action-Id";
+const WEBHOOK_INGRESS_CAPABILITY_HEADER: &str = "X-Tiv-Webhook-Ingress-Capability";
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReferenceDatabaseName(String);
 
@@ -179,16 +182,56 @@ pub async fn create_with_changed_retry_key(
     fixture_base_url: &str,
     operation: &CheckoutOperation,
 ) -> Result<ObservedPaymentIntent, ReferenceAppError> {
+    create_with_changed_retry_key_in_scope(
+        client,
+        fixture_base_url,
+        operation,
+        operation.operation_id(),
+    )
+    .await
+}
+
+/// Executes the deliberately faulty provider retry in one caller-owned
+/// business-request scope.
+///
+/// A caller retry is a new business request, so its provider idempotency keys
+/// must not alias the keys used by an earlier planned action. The two provider
+/// attempts inside this request still intentionally use different keys.
+///
+/// # Errors
+///
+/// Returns [`ReferenceAppError`] when both attempts fail or the fixture returns
+/// an invalid response.
+pub async fn create_with_changed_retry_key_for_business_request(
+    client: &reqwest::Client,
+    fixture_base_url: &str,
+    operation: &CheckoutOperation,
+    business_request_id: u32,
+) -> Result<ObservedPaymentIntent, ReferenceAppError> {
+    let idempotency_scope = format!(
+        "{}-business-{business_request_id}",
+        operation.operation_id()
+    );
+    create_with_changed_retry_key_in_scope(client, fixture_base_url, operation, &idempotency_scope)
+        .await
+}
+
+async fn create_with_changed_retry_key_in_scope(
+    client: &reqwest::Client,
+    fixture_base_url: &str,
+    operation: &CheckoutOperation,
+    idempotency_scope: &str,
+) -> Result<ObservedPaymentIntent, ReferenceAppError> {
     let endpoint = format!(
         "{}/v1/payment_intents",
         fixture_base_url.trim_end_matches('/')
     );
-    let first_key = format!("{}-attempt-1", operation.operation_id());
+    let first_key = format!("{idempotency_scope}-attempt-1");
     let first = send_create(client, &endpoint, &first_key, operation).await;
     if let Ok(response) = first {
         decode_provider_response(response, operation).await
     } else {
-        let retry_key = format!("{}-attempt-2", operation.operation_id());
+        let retry_key = format!("{idempotency_scope}-attempt-2");
         let retry = send_create(client, &endpoint, &retry_key, operation)
             .await
             .map_err(|_| ReferenceAppError::ProviderTransport)?;
@@ -764,6 +807,9 @@ async fn handle_checkout(
     request: Request<Incoming>,
     app: &ReferenceApp,
 ) -> Result<Response<AppResponseBody>, AppHttpError> {
+    let Ok(business_request_id) = driver_business_request_id(&request) else {
+        return Ok(text_response(StatusCode::BAD_REQUEST, "invalid action id"));
+    };
     let Some(command) = decode_json::<CheckoutRequest>(request).await else {
         return Ok(text_response(StatusCode::BAD_REQUEST, "invalid checkout"));
     };
@@ -788,10 +834,26 @@ async fn handle_checkout(
             "operation registration conflict",
         ));
     }
-    let Ok(payment_intent) =
-        create_with_changed_retry_key(&app.http_client, &app.config.fixture_base_url, &operation)
+    let payment_intent = match business_request_id {
+        Some(business_request_id) => {
+            create_with_changed_retry_key_for_business_request(
+                &app.http_client,
+                &app.config.fixture_base_url,
+                &operation,
+                business_request_id,
+            )
             .await
-    else {
+        }
+        None => {
+            create_with_changed_retry_key(
+                &app.http_client,
+                &app.config.fixture_base_url,
+                &operation,
+            )
+            .await
+        }
+    };
+    let Ok(payment_intent) = payment_intent else {
         return Ok(text_response(StatusCode::BAD_GATEWAY, "provider failure"));
     };
     if app
@@ -813,6 +875,19 @@ async fn handle_checkout(
     )
 }
 
+fn driver_business_request_id<B>(request: &Request<B>) -> Result<Option<u32>, ()> {
+    let Some(value) = request.headers().get(DRIVER_ACTION_ID_HEADER) else {
+        return Ok(None);
+    };
+    value
+        .to_str()
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|value| *value > 0)
+        .map(Some)
+        .ok_or(())
+}
+
 async fn handle_webhook(
     request: Request<Incoming>,
     app: &ReferenceApp,
@@ -824,6 +899,12 @@ async fn handle_webhook(
         .map(str::to_owned);
     let Some(signature) = signature else {
         return Ok(text_response(StatusCode::UNAUTHORIZED, "invalid signature"));
+    };
+    let Ok(ingress_capability) = webhook_ingress_capability(&request) else {
+        return Ok(text_response(
+            StatusCode::BAD_REQUEST,
+            "invalid ingress capability",
+        ));
     };
     let raw_body = match Limited::new(request.into_body(), MAX_APP_REQUEST_BODY_BYTES)
         .collect()
@@ -852,6 +933,24 @@ async fn handle_webhook(
         }
         Err(_) => return Ok(text_response(StatusCode::BAD_REQUEST, "event mismatch")),
     };
+    if let Some(capability) = ingress_capability {
+        let callback = app
+            .http_client
+            .post(format!(
+                "{}/v1/tiv/webhook-request-forwarded",
+                app.config.fixture_base_url.trim_end_matches('/')
+            ))
+            .header(WEBHOOK_INGRESS_CAPABILITY_HEADER, capability)
+            .body("")
+            .send()
+            .await;
+        if !callback.is_ok_and(|response| response.status() == StatusCode::NO_CONTENT) {
+            return Ok(text_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "webhook ingress cancelled",
+            ));
+        }
+    }
     if app
         .persist_webhook(&registered.database, &payment_intent)
         .await
@@ -863,6 +962,24 @@ async fn handle_webhook(
         ));
     }
     json_response(StatusCode::OK, &serde_json::json!({"accepted": true}))
+}
+
+fn webhook_ingress_capability<B>(request: &Request<B>) -> Result<Option<String>, ()> {
+    let Some(value) = request.headers().get(WEBHOOK_INGRESS_CAPABILITY_HEADER) else {
+        return Ok(None);
+    };
+    value
+        .to_str()
+        .ok()
+        .filter(|value| {
+            value.len() == 64
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+        .map(str::to_owned)
+        .map(Some)
+        .ok_or(())
 }
 
 async fn decode_json<T>(request: Request<Incoming>) -> Option<T>
@@ -976,6 +1093,47 @@ impl Error for ReferenceAppError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn driver_action_identity_is_optional_but_strict_when_present() {
+        let absent = Request::new(());
+        assert_eq!(driver_business_request_id(&absent), Ok(None));
+
+        let valid = Request::builder()
+            .header(DRIVER_ACTION_ID_HEADER, "17")
+            .body(())
+            .unwrap();
+        assert_eq!(driver_business_request_id(&valid), Ok(Some(17)));
+
+        for invalid in ["0", "-1", "1.0", "action-1", " 1"] {
+            let request = Request::builder()
+                .header(DRIVER_ACTION_ID_HEADER, invalid)
+                .body(())
+                .unwrap();
+            assert_eq!(driver_business_request_id(&request), Err(()));
+        }
+    }
+
+    #[test]
+    fn webhook_ingress_capability_is_optional_but_strict_when_present() {
+        let absent = Request::new(());
+        assert_eq!(webhook_ingress_capability(&absent), Ok(None));
+
+        let capability = "a".repeat(64);
+        let valid = Request::builder()
+            .header(WEBHOOK_INGRESS_CAPABILITY_HEADER, &capability)
+            .body(())
+            .unwrap();
+        assert_eq!(webhook_ingress_capability(&valid), Ok(Some(capability)));
+
+        for invalid in ["", "abc", &"A".repeat(64), &"g".repeat(64), &"a".repeat(65)] {
+            let request = Request::builder()
+                .header(WEBHOOK_INGRESS_CAPABILITY_HEADER, invalid)
+                .body(())
+                .unwrap();
+            assert_eq!(webhook_ingress_capability(&request), Err(()));
+        }
+    }
 
     #[tokio::test]
     async fn a_fresh_process_routes_a_case_derived_webhook_to_durable_state() {

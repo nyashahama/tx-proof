@@ -30,7 +30,7 @@ use crate::{
         spike::{ReferenceSqlProbe, SpikePostgresConfig, SpikePostgresError, TruthSpikePostgres},
     },
     reference_case::{
-        ReferenceCaseRunConfig, ReferenceCaseRunConfigError, ReferenceCaseRunError,
+        CaseSqlProbe, ReferenceCaseRunConfig, ReferenceCaseRunConfigError, ReferenceCaseRunError,
         ReferenceProcessControl, ReferenceProcessControlError, ReferenceProcessControlFuture,
         preflight_reference_planned_case, run_reference_planned_case_with_process,
     },
@@ -625,6 +625,7 @@ struct ReferenceInvariantEvidence {
 ///
 /// Returns [`ReferenceAppEvidenceError`] when stack attestation, provisioning,
 /// planned execution, or oracle evaluation fails.
+#[allow(clippy::too_many_lines)]
 pub async fn run_reference_app_planned_case(
     planned_case: &PlannedCase,
     config: &ReferenceAppEvidenceConfig,
@@ -700,7 +701,9 @@ pub async fn run_reference_app_planned_case(
         journal_path,
         run_config,
         &mut process,
-        sql_probe.as_mut(),
+        sql_probe
+            .as_mut()
+            .map(|probe| probe as &mut dyn CaseSqlProbe),
     )
     .await?;
     let executed_action_count = receipt.executed().trace().action_count();

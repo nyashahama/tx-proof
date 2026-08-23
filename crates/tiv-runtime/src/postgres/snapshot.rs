@@ -71,6 +71,7 @@ const FORBIDDEN_FUNCTION_TOKENS: [&str; 10] = [
 ];
 
 /// One validated repository-owned witness query.
+#[derive(Clone)]
 pub struct InvariantQuery {
     id: InvariantId,
     sql: String,
@@ -113,11 +114,13 @@ impl InvariantQuery {
 }
 
 /// The fixed five v1 queries in canonical evaluation order.
+#[derive(Clone)]
 pub struct InvariantSuite {
     queries: [InvariantQuery; 5],
 }
 
 /// The five queries and timeout budgets loaded from one resolved config.
+#[derive(Clone)]
 pub struct ConfiguredSnapshot {
     suite: InvariantSuite,
     budgets: SnapshotBudgets,

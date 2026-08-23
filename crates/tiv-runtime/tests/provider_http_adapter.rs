@@ -981,6 +981,15 @@ async fn synthetic_checkout(
 ) -> Result<Response<Full<Bytes>>, Infallible> {
     assert_eq!(request.method(), Method::POST);
     assert_eq!(request.uri().path(), "/checkout");
+    assert!(
+        request
+            .headers()
+            .get("X-Tiv-Action-Id")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u32>().ok())
+            .is_some_and(|value| value > 0),
+        "every driver request carries its stable planned action identity"
+    );
     let body = request.into_body().collect().await.unwrap().to_bytes();
     let command: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(command["operation_id"], "op_73");

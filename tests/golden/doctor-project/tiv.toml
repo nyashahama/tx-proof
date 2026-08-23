@@ -44,6 +44,9 @@ api_version = "2026-02-25.clover"
 application_base_url = "http://stripe-fixture:12111"
 webhook_url = "http://reference-app:18080/webhooks/stripe"
 webhook_secret_env = "TIV_STRIPE_WEBHOOK_SECRET"
+control_url = "http://127.0.0.1:12112"
+control_token_env = "TIV_FIXTURE_CONTROL_TOKEN"
+poll_interval = "10ms"
 
 [driver]
 method = "POST"

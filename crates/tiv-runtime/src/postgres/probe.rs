@@ -14,12 +14,14 @@ use super::snapshot::{
 const MAX_QUERY_BYTES: usize = 64 * 1024;
 
 /// One validated parameter-free predicate query.
+#[derive(Clone)]
 pub struct SqlProbeQuery {
     sql: String,
 }
 
 /// One configured query plus the effective role and database-side budgets
 /// approved by the same typed configuration as `tiv doctor`.
+#[derive(Clone)]
 pub struct ConfiguredSqlProbe {
     query: SqlProbeQuery,
     budgets: SnapshotBudgets,

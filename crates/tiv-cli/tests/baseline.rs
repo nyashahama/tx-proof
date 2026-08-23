@@ -243,6 +243,15 @@ async fn sealed_customer_baseline_supports_two_fresh_attested_case_resets() {
         session.case_identity().database_oid(),
         second_reset.after_database_oid()
     );
+    let case_database = session
+        .attest_case_database()
+        .await
+        .expect("the freshly reset case accepts an exact attested verifier session");
+    assert_eq!(
+        case_database.identity(),
+        session.case_identity(),
+        "the verifier connection must remain bound to the reset identity"
+    );
     assert_seeded_clean_case().await;
 
     assert_eq!(
@@ -357,6 +366,7 @@ fn baseline_command(config: &str) -> Command {
         .env("TIV_POSTGRES_ADMIN_URL", ADMIN_URL)
         .env("DATABASE_URL", CASE_URL)
         .env("TIV_STRIPE_WEBHOOK_SECRET", "whsec_test_secret")
+        .env("TIV_FIXTURE_CONTROL_TOKEN", "fixture-control-token")
         .env("DOCKER_HOST", "tcp://127.0.0.1:9")
         .env("DOCKER_CONTEXT", "intentionally-remote")
         .env("DOCKER_TLS_VERIFY", "1")
@@ -859,6 +869,10 @@ fn test_environment() -> TestEnvironment {
         (
             "TIV_STRIPE_WEBHOOK_SECRET".to_owned(),
             "whsec_test_secret".to_owned(),
+        ),
+        (
+            "TIV_FIXTURE_CONTROL_TOKEN".to_owned(),
+            "fixture-control-token".to_owned(),
         ),
     ]))
 }

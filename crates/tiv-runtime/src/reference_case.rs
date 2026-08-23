@@ -11,12 +11,13 @@ use tiv_core::plan::{
 
 use crate::{
     campaign::{
-        CaseEffectAdapter, CaseEffectFuture, CaseEffectRequest, CaseExecutionError, ExecutedCase,
-        execute_planned_case,
+        CaseEffectAdapter, CaseEffectFuture, CaseEffectRequest, CaseExecutionCause,
+        CaseExecutionError, ExecutedCase, execute_planned_case,
     },
     case_http::{CaseHttpAdapter, CaseHttpError, ReferenceCaseHttpCompletion},
     postgres::{
         oracle::{ProviderPaymentIntent, QuiescencePermit},
+        quiescence::{DatabaseQuiescenceCompletion, QuiescenceError},
         safety::{DatabaseKind, DatabaseName},
         spike::ReferenceSqlProbe,
     },
@@ -36,6 +37,49 @@ pub(crate) type ReferenceProcessControlFuture<'a> =
 pub(crate) trait ReferenceProcessControl: Send {
     fn kill_application(&mut self) -> ReferenceProcessControlFuture<'_>;
     fn restart_and_await_health(&mut self) -> ReferenceProcessControlFuture<'_>;
+}
+
+pub(crate) type CaseSqlProbeFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<(), CaseSqlProbeError>> + Send + 'a>>;
+
+pub(crate) trait CaseSqlProbe: Send {
+    fn require_false(&mut self) -> CaseSqlProbeFuture<'_>;
+    fn observe_true(&mut self) -> CaseSqlProbeFuture<'_>;
+    fn observed(&self) -> bool;
+}
+
+impl CaseSqlProbe for ReferenceSqlProbe {
+    fn require_false(&mut self) -> CaseSqlProbeFuture<'_> {
+        Box::pin(async move {
+            ReferenceSqlProbe::require_false(self)
+                .await
+                .map_err(|_| CaseSqlProbeError)
+        })
+    }
+
+    fn observe_true(&mut self) -> CaseSqlProbeFuture<'_> {
+        Box::pin(async move {
+            ReferenceSqlProbe::observe_true(self)
+                .await
+                .map_err(|_| CaseSqlProbeError)
+        })
+    }
+
+    fn observed(&self) -> bool {
+        ReferenceSqlProbe::observed(self)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+#[error("the configured SQL probe failed")]
+pub(crate) struct CaseSqlProbeError;
+
+pub(crate) type CaseQuiescenceFuture<'a> = Pin<
+    Box<dyn Future<Output = Result<DatabaseQuiescenceCompletion, QuiescenceError>> + Send + 'a>,
+>;
+
+pub(crate) trait CaseQuiescenceGate: Send {
+    fn await_stable(&mut self) -> CaseQuiescenceFuture<'_>;
 }
 
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
@@ -82,15 +126,11 @@ impl ReferenceCaseRunConfig {
         timeout: Duration,
         poll_interval: Duration,
     ) -> Result<Self, ReferenceCaseRunConfigError> {
-        if case_database.kind() != DatabaseKind::Case {
-            return Err(ReferenceCaseRunConfigError::InvalidCaseDatabase);
-        }
         let reference_app_url = reference_app_url.as_ref().trim_end_matches('/');
-        let fixture_control_url_value = fixture_control_url.as_ref();
-        let fixture_control_token = fixture_control_token.into();
         let operation_id = operation_id.into();
         let currency = currency.into();
-        let provider = ProviderHttpConfig::new(
+        Self::from_http_contract(
+            case_database,
             format!("{reference_app_url}/checkout"),
             serde_json::json!({
                 "database": case_database.as_str(),
@@ -99,6 +139,44 @@ impl ReferenceCaseRunConfig {
                 "currency": currency,
             }),
             reference_app_url,
+            fixture_control_url,
+            fixture_control_token,
+            reset_sequence,
+            first_webhook_timestamp,
+            timeout,
+            poll_interval,
+        )
+    }
+
+    /// Builds the case adapters from one explicit configured loopback HTTP
+    /// contract rather than the reference application's fixed route/body.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReferenceCaseRunConfigError`] unless the case database and all
+    /// provider, driver, fixture-control, and timing inputs are bounded.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_http_contract(
+        case_database: &DatabaseName,
+        driver_url: impl AsRef<str>,
+        driver_body: serde_json::Value,
+        provider_proxy_url: impl AsRef<str>,
+        fixture_control_url: impl AsRef<str>,
+        fixture_control_token: impl Into<String>,
+        reset_sequence: u64,
+        first_webhook_timestamp: i64,
+        timeout: Duration,
+        poll_interval: Duration,
+    ) -> Result<Self, ReferenceCaseRunConfigError> {
+        if case_database.kind() != DatabaseKind::Case {
+            return Err(ReferenceCaseRunConfigError::InvalidCaseDatabase);
+        }
+        let fixture_control_url_value = fixture_control_url.as_ref();
+        let fixture_control_token = fixture_control_token.into();
+        let provider = ProviderHttpConfig::new(
+            driver_url,
+            driver_body,
+            provider_proxy_url,
             fixture_control_url_value,
             fixture_control_token.clone(),
             reset_sequence,
@@ -178,6 +256,7 @@ pub async fn run_reference_planned_case(
         config,
         None,
         None,
+        None,
     )
     .await
 }
@@ -189,7 +268,7 @@ pub(crate) async fn run_reference_planned_case_with_process(
     journal_path: impl AsRef<Path>,
     config: ReferenceCaseRunConfig,
     process: &mut dyn ReferenceProcessControl,
-    sql_probe: Option<&mut ReferenceSqlProbe>,
+    sql_probe: Option<&mut dyn CaseSqlProbe>,
 ) -> Result<ReferenceCaseRunReceipt, ReferenceCaseRunError> {
     run_reference_planned_case_inner(
         run_id,
@@ -199,21 +278,49 @@ pub(crate) async fn run_reference_planned_case_with_process(
         config,
         Some(process),
         sql_probe,
+        None,
     )
     .await
 }
 
-async fn run_reference_planned_case_inner<'a>(
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_configured_planned_case_with_process(
     run_id: impl Into<String>,
     case_id: impl Into<String>,
     planned_case: &PlannedCase,
     journal_path: impl AsRef<Path>,
     config: ReferenceCaseRunConfig,
-    process: Option<&'a mut dyn ReferenceProcessControl>,
-    sql_probe: Option<&'a mut ReferenceSqlProbe>,
+    process: &mut dyn ReferenceProcessControl,
+    sql_probe: Option<&mut dyn CaseSqlProbe>,
+    quiescence_gate: &mut dyn CaseQuiescenceGate,
+) -> Result<ReferenceCaseRunReceipt, ReferenceCaseRunError> {
+    run_reference_planned_case_inner(
+        run_id,
+        case_id,
+        planned_case,
+        journal_path,
+        config,
+        Some(process),
+        sql_probe,
+        Some(quiescence_gate),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_reference_planned_case_inner(
+    run_id: impl Into<String>,
+    case_id: impl Into<String>,
+    planned_case: &PlannedCase,
+    journal_path: impl AsRef<Path>,
+    config: ReferenceCaseRunConfig,
+    process: Option<&mut dyn ReferenceProcessControl>,
+    sql_probe: Option<&mut dyn CaseSqlProbe>,
+    quiescence_gate: Option<&mut dyn CaseQuiescenceGate>,
 ) -> Result<ReferenceCaseRunReceipt, ReferenceCaseRunError> {
     preflight_reference_planned_case(planned_case, process.is_some(), sql_probe.is_some())?;
     let client_response_cut_points = client_response_cut_point_actions(planned_case)?;
+    let webhook_request_cut_points = webhook_request_cut_point_actions(planned_case)?;
     let webhook_response_cut_points = webhook_response_cut_point_actions(planned_case)?;
     let sql_probe_cut_points = sql_probe_cut_point_actions(planned_case)?;
     let outcomes = provider_outcomes(planned_case);
@@ -223,11 +330,13 @@ async fn run_reference_planned_case_inner<'a>(
             ProviderHttpAdapter::new(config.provider)?
                 .with_client_response_cut_points(client_response_cut_points),
             WebhookHttpAdapter::new(config.webhook)?
+                .with_webhook_request_cut_points(webhook_request_cut_points)
                 .with_webhook_response_cut_points(webhook_response_cut_points),
         ),
         process,
         sql_probe,
         sql_probe_cut_points,
+        quiescence_gate,
     );
     let executed =
         execute_planned_case(run_id, case_id, planned_case, journal_path, &mut adapter).await?;
@@ -250,7 +359,9 @@ pub(crate) fn preflight_reference_planned_case(
         .actions()
         .iter()
         .any(|action| matches!(action.kind(), PlanActionKind::KillApplication { .. }));
-    if client_response_cut_point_actions(planned_case).is_err()
+    if client_request_cut_point_actions(planned_case).is_err()
+        || client_response_cut_point_actions(planned_case).is_err()
+        || webhook_request_cut_point_actions(planned_case).is_err()
         || webhook_response_cut_point_actions(planned_case).is_err()
         || sql_probe_cut_point_actions(planned_case).is_err()
         || planned_case.actions().iter().any(|action| {
@@ -261,6 +372,7 @@ pub(crate) fn preflight_reference_planned_case(
                         cut_point,
                         ProcessCutPoint::ClientRequestForwarded
                             | ProcessCutPoint::ClientResponseObserved
+                            | ProcessCutPoint::WebhookRequestForwarded
                             | ProcessCutPoint::WebhookResponseObserved
                             | ProcessCutPoint::SqlProbe
                     )
@@ -283,6 +395,47 @@ pub(crate) fn preflight_reference_planned_case(
         return Err(ReferenceCaseRunError::MissingProviderOutcomes);
     }
     Ok(())
+}
+
+fn client_request_cut_point_actions(
+    planned_case: &PlannedCase,
+) -> Result<std::collections::BTreeSet<tiv_core::trace::ActionId>, ReferenceCaseRunError> {
+    let mut action_ids = std::collections::BTreeSet::new();
+    for actions in planned_case.actions().windows(2) {
+        if !matches!(
+            actions[1].kind(),
+            PlanActionKind::KillApplication {
+                cut_point: ProcessCutPoint::ClientRequestForwarded
+            }
+        ) {
+            continue;
+        }
+        match actions[0].kind() {
+            PlanActionKind::DriveCheckout { provider_script }
+            | PlanActionKind::RetryBusinessRequest { provider_script }
+                if provider_script.terminal_outcome() == ProviderOutcome::CommitThenDelay =>
+            {
+                action_ids.insert(actions[0].id());
+            }
+            _ => return Err(ReferenceCaseRunError::UnsupportedProcessFault),
+        }
+    }
+    let expected = planned_case
+        .actions()
+        .iter()
+        .filter(|action| {
+            matches!(
+                action.kind(),
+                PlanActionKind::KillApplication {
+                    cut_point: ProcessCutPoint::ClientRequestForwarded
+                }
+            )
+        })
+        .count();
+    if action_ids.len() != expected {
+        return Err(ReferenceCaseRunError::UnsupportedProcessFault);
+    }
+    Ok(action_ids)
 }
 
 fn client_response_cut_point_actions(
@@ -356,6 +509,46 @@ fn webhook_response_cut_point_actions(
                 action.kind(),
                 PlanActionKind::KillApplication {
                     cut_point: ProcessCutPoint::WebhookResponseObserved
+                }
+            )
+        })
+        .count();
+    if action_ids.len() != expected {
+        return Err(ReferenceCaseRunError::UnsupportedProcessFault);
+    }
+    Ok(action_ids)
+}
+
+fn webhook_request_cut_point_actions(
+    planned_case: &PlannedCase,
+) -> Result<std::collections::BTreeSet<tiv_core::trace::ActionId>, ReferenceCaseRunError> {
+    let mut action_ids = std::collections::BTreeSet::new();
+    for actions in planned_case.actions().windows(2) {
+        if !matches!(
+            actions[1].kind(),
+            PlanActionKind::KillApplication {
+                cut_point: ProcessCutPoint::WebhookRequestForwarded
+            }
+        ) {
+            continue;
+        }
+        if matches!(
+            actions[0].kind(),
+            PlanActionKind::DeliverWebhook | PlanActionKind::DuplicateWebhook
+        ) {
+            action_ids.insert(actions[0].id());
+        } else {
+            return Err(ReferenceCaseRunError::UnsupportedProcessFault);
+        }
+    }
+    let expected = planned_case
+        .actions()
+        .iter()
+        .filter(|action| {
+            matches!(
+                action.kind(),
+                PlanActionKind::KillApplication {
+                    cut_point: ProcessCutPoint::WebhookRequestForwarded
                 }
             )
         })
@@ -472,37 +665,60 @@ struct ResetResponse {
 
 /// Executes HTTP effects plus the synthetic reference application's final
 /// quiescence and checkpoint boundaries.
-pub struct ReferenceCaseAdapter<'a> {
+pub struct ReferenceCaseAdapter<'process, 'probe, 'quiescence> {
     http: CaseHttpAdapter,
-    process: Option<&'a mut dyn ReferenceProcessControl>,
-    sql_probe: Option<&'a mut ReferenceSqlProbe>,
+    process: Option<&'process mut dyn ReferenceProcessControl>,
+    sql_probe: Option<&'probe mut dyn CaseSqlProbe>,
+    quiescence_gate: Option<&'quiescence mut dyn CaseQuiescenceGate>,
     sql_probe_action_ids: std::collections::BTreeSet<tiv_core::trace::ActionId>,
     postgres_producer_sequence: u64,
     sql_probe_observed: bool,
     application_healthy: bool,
     quiescence: Option<ReferenceCaseHttpCompletion>,
+    database_quiescence: Option<DatabaseQuiescenceCompletion>,
     checkpoint: Option<ReferenceCaseCheckpoint>,
 }
 
-impl<'a> ReferenceCaseAdapter<'a> {
+impl<'process, 'probe, 'quiescence> ReferenceCaseAdapter<'process, 'probe, 'quiescence> {
     #[must_use]
     pub(crate) const fn new(
         http: CaseHttpAdapter,
-        process: Option<&'a mut dyn ReferenceProcessControl>,
-        sql_probe: Option<&'a mut ReferenceSqlProbe>,
+        process: Option<&'process mut dyn ReferenceProcessControl>,
+        sql_probe: Option<&'probe mut dyn CaseSqlProbe>,
         sql_probe_action_ids: std::collections::BTreeSet<tiv_core::trace::ActionId>,
+        quiescence_gate: Option<&'quiescence mut dyn CaseQuiescenceGate>,
     ) -> Self {
         Self {
             http,
             process,
             sql_probe,
+            quiescence_gate,
             sql_probe_action_ids,
             postgres_producer_sequence: 0,
             sql_probe_observed: false,
             application_healthy: true,
             quiescence: None,
+            database_quiescence: None,
             checkpoint: None,
         }
+    }
+
+    #[must_use]
+    #[cfg(test)]
+    pub(crate) const fn new_configured(
+        http: CaseHttpAdapter,
+        process: Option<&'process mut dyn ReferenceProcessControl>,
+        sql_probe: Option<&'probe mut dyn CaseSqlProbe>,
+        sql_probe_action_ids: std::collections::BTreeSet<tiv_core::trace::ActionId>,
+        quiescence_gate: &'quiescence mut dyn CaseQuiescenceGate,
+    ) -> Self {
+        Self::new(
+            http,
+            process,
+            sql_probe,
+            sql_probe_action_ids,
+            Some(quiescence_gate),
+        )
     }
 
     /// Consumes a successfully executed adapter and returns its final
@@ -530,7 +746,17 @@ impl<'a> ReferenceCaseAdapter<'a> {
         if self.quiescence.is_some() || self.checkpoint.is_some() {
             return Err(ReferenceCaseError::InvalidLifecycleOrder);
         }
-        self.quiescence = Some(self.http.await_reference_quiescence().await?);
+        let http_completion = self.http.await_reference_quiescence().await?;
+        let database_completion = match self.quiescence_gate.as_deref_mut() {
+            Some(gate) => Some(
+                gate.await_stable()
+                    .await
+                    .map_err(ReferenceCaseError::DatabaseQuiescence)?,
+            ),
+            None => None,
+        };
+        self.quiescence = Some(http_completion);
+        self.database_quiescence = database_completion;
         Ok(Vec::new())
     }
 
@@ -552,7 +778,16 @@ impl<'a> ReferenceCaseAdapter<'a> {
             .quiescence
             .take()
             .ok_or(ReferenceCaseError::InvalidLifecycleOrder)?;
-        let quiescence = QuiescencePermit::after_reference_case_http_quiescent(&completion);
+        let quiescence = match (
+            self.quiescence_gate.is_some(),
+            self.database_quiescence.take(),
+        ) {
+            (false, None) => QuiescencePermit::after_reference_case_http_quiescent(&completion),
+            (true, Some(database_completion)) => {
+                QuiescencePermit::after_configured_case_quiescent(&completion, database_completion)
+            }
+            _ => return Err(ReferenceCaseError::InvalidLifecycleOrder),
+        };
         self.checkpoint = Some(ReferenceCaseCheckpoint {
             provider_payment_intents: completion.into_provider_payment_intents(),
             quiescence,
@@ -570,6 +805,7 @@ impl<'a> ReferenceCaseAdapter<'a> {
             cut_point,
             ProcessCutPoint::ClientRequestForwarded
                 | ProcessCutPoint::ClientResponseObserved
+                | ProcessCutPoint::WebhookRequestForwarded
                 | ProcessCutPoint::WebhookResponseObserved
                 | ProcessCutPoint::SqlProbe
         ) || !self.application_healthy
@@ -581,7 +817,7 @@ impl<'a> ReferenceCaseAdapter<'a> {
                 || !self
                     .sql_probe
                     .as_deref()
-                    .is_some_and(ReferenceSqlProbe::observed)
+                    .is_some_and(CaseSqlProbe::observed)
             {
                 return Err(ReferenceCaseError::InvalidLifecycleOrder);
             }
@@ -659,7 +895,7 @@ impl<'a> ReferenceCaseAdapter<'a> {
     }
 }
 
-impl CaseEffectAdapter for ReferenceCaseAdapter<'_> {
+impl CaseEffectAdapter for ReferenceCaseAdapter<'_, '_, '_> {
     type Error = ReferenceCaseError;
 
     fn execute<'a>(
@@ -728,12 +964,32 @@ pub enum ReferenceCaseError {
     MissingSqlProbe,
     #[error("reference case SQL probe failed")]
     SqlProbe,
+    #[error("configured reference case database quiescence failed: {0}")]
+    DatabaseQuiescence(#[source] QuiescenceError),
     #[error("reference case SQL-probe journal append failed: {0}")]
     SqlProbeJournal(#[source] crate::journal::JournalError),
     #[error("reference case PostgreSQL observation sequence exhausted")]
     PostgresObservationSequenceExhausted,
     #[error("reference case process action failed: {0}")]
     ProcessControl(#[from] ReferenceProcessControlError),
+}
+
+impl ReferenceCaseError {
+    pub(crate) const fn is_inconclusive(&self) -> bool {
+        match self {
+            Self::Http(error) => error.is_inconclusive(),
+            Self::SqlProbe | Self::DatabaseQuiescence(QuiescenceError::Timeout) => true,
+            Self::InvalidLifecycleOrder
+            | Self::UnexpectedOutputContract
+            | Self::MissingCheckpoint
+            | Self::MissingProcessControl
+            | Self::MissingSqlProbe
+            | Self::DatabaseQuiescence(_)
+            | Self::SqlProbeJournal(_)
+            | Self::PostgresObservationSequenceExhausted
+            | Self::ProcessControl(_) => false,
+        }
+    }
 }
 
 #[derive(Debug, Error)]
@@ -768,7 +1024,7 @@ pub enum ReferenceCaseRunError {
     ProviderAdapter(#[from] ProviderHttpError),
     #[error("could not construct the reference planned-case webhook adapter: {0}")]
     WebhookAdapter(#[from] WebhookHttpError),
-    #[error("reference planned-case serial execution failed")]
+    #[error("reference planned-case serial execution failed: {0:?}")]
     Execution(CaseExecutionError<ReferenceCaseError>),
     #[error("reference planned-case lifecycle did not complete: {0}")]
     Lifecycle(#[from] ReferenceCaseError),
@@ -777,6 +1033,26 @@ pub enum ReferenceCaseRunError {
 impl From<CaseExecutionError<ReferenceCaseError>> for ReferenceCaseRunError {
     fn from(error: CaseExecutionError<ReferenceCaseError>) -> Self {
         Self::Execution(error)
+    }
+}
+
+impl ReferenceCaseRunError {
+    pub(crate) fn is_inconclusive(&self) -> bool {
+        match self {
+            Self::Execution(CaseExecutionError::Failed(failure)) => {
+                matches!(failure.cause(), CaseExecutionCause::Effect(error) if error.is_inconclusive())
+            }
+            Self::Lifecycle(error) => error.is_inconclusive(),
+            Self::InvalidPlan(_)
+            | Self::UnsupportedProcessFault
+            | Self::MissingProviderOutcomes
+            | Self::ResetRequest(_)
+            | Self::UnexpectedResetStatus(_)
+            | Self::UnexpectedResetResponse
+            | Self::ProviderAdapter(_)
+            | Self::WebhookAdapter(_)
+            | Self::Execution(_) => false,
+        }
     }
 }
 
@@ -836,6 +1112,43 @@ mod tests {
 
         preflight_reference_planned_case(&plan, true, false)
             .expect("client-response process control is supported");
+    }
+
+    #[test]
+    fn client_request_forwarded_rejects_a_provider_confirmation_predecessor() {
+        let plan = (0..1_024)
+            .find_map(|seed| {
+                let spec = PlanSpec::new_payment_intent_v1(
+                    Seed::new(seed),
+                    ActionBudget::new(40).unwrap(),
+                    [ProviderOutcome::Normal, ProviderOutcome::CommitThenDelay],
+                    WebhookFaultSpec::new(0, [], false, false).unwrap(),
+                    ProcessFaultSpec::new([ProcessCutPoint::ClientRequestForwarded], 1).unwrap(),
+                )
+                .unwrap();
+                let plan = CasePlanCompiler::compile(&spec).unwrap();
+                plan.actions()
+                    .windows(2)
+                    .any(|actions| {
+                        matches!(
+                            actions[0].kind(),
+                            PlanActionKind::ConfirmPaymentIntent { .. }
+                                | PlanActionKind::RetryProviderRequest { .. }
+                        ) && matches!(
+                            actions[1].kind(),
+                            PlanActionKind::KillApplication {
+                                cut_point: ProcessCutPoint::ClientRequestForwarded
+                            }
+                        )
+                    })
+                    .then_some(plan)
+            })
+            .expect("the bounded seed corpus contains a confirmation-owned request cut point");
+
+        assert!(matches!(
+            preflight_reference_planned_case(&plan, true, false),
+            Err(ReferenceCaseRunError::UnsupportedProcessFault)
+        ));
     }
 
     #[test]
@@ -910,6 +1223,40 @@ mod tests {
     }
 
     #[test]
+    fn webhook_request_forwarded_passes_preflight_only_for_an_adjacent_delivery() {
+        let plan = (0..4_096)
+            .find_map(|seed| {
+                let spec = PlanSpec::new_payment_intent_v1(
+                    Seed::new(seed),
+                    ActionBudget::new(40).unwrap(),
+                    [ProviderOutcome::Normal],
+                    WebhookFaultSpec::new(1, [], false, false).unwrap(),
+                    ProcessFaultSpec::new([ProcessCutPoint::WebhookRequestForwarded], 1).unwrap(),
+                )
+                .unwrap();
+                let plan = CasePlanCompiler::compile(&spec).unwrap();
+                plan.actions()
+                    .windows(2)
+                    .any(|actions| {
+                        matches!(
+                            actions[0].kind(),
+                            PlanActionKind::DeliverWebhook | PlanActionKind::DuplicateWebhook
+                        ) && matches!(
+                            actions[1].kind(),
+                            PlanActionKind::KillApplication {
+                                cut_point: ProcessCutPoint::WebhookRequestForwarded
+                            }
+                        )
+                    })
+                    .then_some(plan)
+            })
+            .expect("the seed corpus contains a webhook-request delivery cut point");
+
+        preflight_reference_planned_case(&plan, true, false)
+            .expect("an instrumented fixture ingress owns the request-forwarded cut point");
+    }
+
+    #[test]
     fn sql_probe_passes_preflight_only_after_the_initial_checkout() {
         let plan = (0..4_096)
             .find_map(|seed| {
@@ -943,5 +1290,72 @@ mod tests {
         ));
         preflight_reference_planned_case(&plan, true, true)
             .expect("a real read-only payment probe can own this cut point");
+    }
+
+    #[test]
+    fn configured_case_accepts_an_explicit_driver_and_provider_proxy_contract() {
+        let case_database = DatabaseName::parse("tiv_case_deadbeef").unwrap();
+
+        ReferenceCaseRunConfig::from_http_contract(
+            &case_database,
+            "http://127.0.0.1:18080/custom-checkout",
+            serde_json::json!({
+                "database": "tiv_case_deadbeef",
+                "operation_id": "op_deadbeef",
+                "amount_minor": 2_500,
+                "currency": "usd",
+            }),
+            "http://127.0.0.1:18080",
+            "http://127.0.0.1:12112",
+            "fixture-control-token",
+            1,
+            1_800_000_000,
+            Duration::from_secs(10),
+            Duration::from_millis(10),
+        )
+        .expect("the configured loopback payment_intent_v1 contract is valid");
+    }
+
+    struct NeverQuiescenceGate;
+
+    impl CaseQuiescenceGate for NeverQuiescenceGate {
+        fn await_stable(&mut self) -> CaseQuiescenceFuture<'_> {
+            Box::pin(async { unreachable!("constructor contract does not execute the gate") })
+        }
+    }
+
+    #[test]
+    fn configured_adapter_requires_an_explicit_database_quiescence_gate() {
+        let case_database = DatabaseName::parse("tiv_case_deadbeef").unwrap();
+        let config = ReferenceCaseRunConfig::from_http_contract(
+            &case_database,
+            "http://127.0.0.1:18080/checkout",
+            serde_json::json!({
+                "operation_id": "op_deadbeef",
+                "amount_minor": 2_500,
+                "currency": "usd",
+            }),
+            "http://127.0.0.1:18080",
+            "http://127.0.0.1:12112",
+            "fixture-control-token",
+            1,
+            1_800_000_000,
+            Duration::from_secs(10),
+            Duration::from_millis(10),
+        )
+        .unwrap();
+        let http = CaseHttpAdapter::new(
+            ProviderHttpAdapter::new(config.provider).unwrap(),
+            WebhookHttpAdapter::new(config.webhook).unwrap(),
+        );
+        let mut gate = NeverQuiescenceGate;
+
+        let _adapter = ReferenceCaseAdapter::new_configured(
+            http,
+            None,
+            None,
+            std::collections::BTreeSet::new(),
+            &mut gate,
+        );
     }
 }

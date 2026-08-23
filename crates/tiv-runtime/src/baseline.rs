@@ -87,6 +87,18 @@ pub struct ConfiguredBaselineSession {
     case_target: DatabaseTarget<Unverified>,
 }
 
+/// One exact configured case database proven to match a freshly attested
+/// baseline session.
+///
+/// This value deliberately implements neither `Debug` nor `Serialize`: it
+/// retains the secret-bearing local connection boundary used to open fresh
+/// verifier sessions during one configured case.
+pub struct ConfiguredCaseDatabase {
+    inputs: BaselineInputs,
+    postgres_container_id: String,
+    identity: DatabaseIdentity,
+}
+
 impl ConfiguredBaselineSession {
     /// Re-attests the configured local `PostgreSQL` container, current case
     /// identity, and both catalog and in-database sealed-baseline markers.
@@ -119,6 +131,25 @@ impl ConfiguredBaselineSession {
     #[must_use]
     pub const fn baseline_identity(&self) -> &DatabaseIdentity {
         &self.baseline_identity
+    }
+
+    /// Re-attests the configured `PostgreSQL` container and current case, then
+    /// proves a direct verifier session is bound to that exact database OID.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BaselineError`] if the container, case identity, connection
+    /// target, or effective administrative role differs from this session.
+    pub async fn attest_case_database(&self) -> Result<ConfiguredCaseDatabase, BaselineError> {
+        let database = ConfiguredCaseDatabase {
+            inputs: self.inputs.clone(),
+            postgres_container_id: self.postgres_container_id.clone(),
+            identity: self.case_target.identity().clone(),
+        };
+        database.attest_current_identity().await?;
+        let direct = database.connect().await?;
+        direct.close().await?;
+        Ok(database)
     }
 
     /// Stops configured database clients, re-attests both identities, consumes
@@ -188,6 +219,53 @@ impl ConfiguredBaselineSession {
             (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
             (Err(_), Err(_)) => Err(BaselineError::CustomerServicesRecoveryFailed),
         }
+    }
+}
+
+impl ConfiguredCaseDatabase {
+    #[must_use]
+    pub const fn identity(&self) -> &DatabaseIdentity {
+        &self.identity
+    }
+
+    async fn attest_current_identity(&self) -> Result<(), BaselineError> {
+        let stack = attest_postgres_container(&self.inputs).await?;
+        if stack.container_id != self.postgres_container_id {
+            return Err(BaselineError::PostgresContainerChanged);
+        }
+        let observed = observe_case_identity(&self.inputs).await?;
+        if observed != self.identity {
+            return Err(BaselineError::UnexpectedDatabaseIdentity);
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn connect(&self) -> Result<PostgresSession, BaselineError> {
+        self.attest_current_identity().await?;
+        let session =
+            PostgresSession::connect(&self.inputs.database_url(self.identity.database_name()))
+                .await?;
+        let row = session
+            .client
+            .query_one(
+                "SELECT current_database(), database.oid::bigint, \
+                        current_user::text, session_user::text \
+                 FROM pg_database AS database \
+                 WHERE database.datname = current_database()",
+                &[],
+            )
+            .await?;
+        let database_oid = u32::try_from(row.get::<_, i64>(1))
+            .map_err(|_| BaselineError::UnexpectedDatabaseIdentity)?;
+        if row.get::<_, &str>(0) != self.identity.database_name().as_str()
+            || database_oid != self.identity.database_oid()
+            || row.get::<_, &str>(2) != self.inputs.admin_role
+            || row.get::<_, &str>(3) != self.inputs.admin_role
+        {
+            session.close().await?;
+            return Err(BaselineError::UnexpectedDatabaseIdentity);
+        }
+        Ok(session)
     }
 }
 
@@ -310,6 +388,7 @@ pub async fn run_configured_baseline(
     }
 }
 
+#[derive(Clone)]
 struct BaselineInputs {
     admin_url: Url,
     case_name: DatabaseName,
@@ -1197,9 +1276,9 @@ async fn configure_case_connect(
     let case = inputs.case_name.as_str();
     client
         .batch_execute(&format!(
-            "REVOKE CONNECT ON DATABASE {case} FROM PUBLIC; \
-             REVOKE CONNECT ON DATABASE {case} FROM {}; \
-             REVOKE CONNECT ON DATABASE {case} FROM {}; \
+            "REVOKE ALL ON DATABASE {case} FROM PUBLIC; \
+             REVOKE ALL ON DATABASE {case} FROM {}; \
+             REVOKE ALL ON DATABASE {case} FROM {}; \
              GRANT CONNECT ON DATABASE {case} TO {}; \
              GRANT CONNECT ON DATABASE {case} TO {}",
             inputs.application_role,
@@ -1591,8 +1670,8 @@ struct BoundedOutput {
     stdout: Vec<u8>,
 }
 
-struct PostgresSession {
-    client: tokio_postgres::Client,
+pub(crate) struct PostgresSession {
+    pub(crate) client: tokio_postgres::Client,
     connection: JoinHandle<Result<(), tokio_postgres::Error>>,
 }
 
@@ -1605,7 +1684,7 @@ impl PostgresSession {
         })
     }
 
-    async fn close(self) -> Result<(), BaselineError> {
+    pub(crate) async fn close(self) -> Result<(), BaselineError> {
         drop(self.client);
         self.connection
             .await

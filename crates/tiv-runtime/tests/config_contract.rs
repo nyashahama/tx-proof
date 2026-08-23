@@ -8,6 +8,7 @@ use tiv_runtime::config::{
 const ADMIN_URL: &str = "postgresql://tiv_admin:admin-canary@127.0.0.1:15432/postgres";
 const CASE_URL: &str = "postgresql://tiv_app:application-canary@127.0.0.1:15432/tiv_case_checkout";
 const WEBHOOK_SECRET: &str = "whsec_webhook-canary";
+const FIXTURE_CONTROL_TOKEN: &str = "fixture-control-canary";
 
 #[test]
 fn the_blueprint_config_resolves_and_redacts_every_secret_value() {
@@ -168,6 +169,52 @@ fn resolved_config_preserves_the_exact_serial_campaign_contract() {
     );
 }
 
+#[test]
+fn payment_intent_fixture_control_is_loopback_bounded_and_secret_redacted() {
+    let document = blueprint_document();
+
+    let config = resolve_document(&document).expect("the local fixture control contract resolves");
+    let encoded = serde_json::to_string_pretty(config.redacted())
+        .expect("the fixture control projection serializes");
+
+    assert!(encoded.contains("http://127.0.0.1:12112/"));
+    assert!(encoded.contains("TIV_FIXTURE_CONTROL_TOKEN"));
+    assert!(encoded.contains("\"poll_interval_ms\": 10"));
+    assert!(!encoded.contains(FIXTURE_CONTROL_TOKEN));
+}
+
+#[test]
+fn payment_intent_fixture_control_and_driver_body_fail_closed_before_execution() {
+    let document = blueprint_document();
+
+    assert!(matches!(
+        resolve_document(&document.replace(
+            "http://127.0.0.1:12112",
+            "http://fixture-control.example.com:12112"
+        )),
+        Err(ConfigError::NonLocalHttpUrl)
+    ));
+
+    let mut missing_token = test_environment();
+    missing_token.values.remove("TIV_FIXTURE_CONTROL_TOKEN");
+    assert!(matches!(
+        tiv_runtime::config::resolve_config_document(
+            &document,
+            config_path().parent().expect("the config fixture has a parent"),
+            &missing_token,
+        ),
+        Err(ConfigError::MissingEnvironment(name)) if name == "TIV_FIXTURE_CONTROL_TOKEN"
+    ));
+
+    assert!(matches!(
+        resolve_document(&document.replace(
+            "body_file = \"checkout.json\"",
+            "body_file = \"quiescence.sql\""
+        )),
+        Err(ConfigError::InvalidDriverBody)
+    ));
+}
+
 fn resolve_document(document: &str) -> Result<tiv_runtime::config::ResolvedConfig, ConfigError> {
     let path = config_path();
     let root = path.parent().expect("the config fixture has a parent");
@@ -204,6 +251,10 @@ fn test_environment() -> TestEnvironment {
             (
                 "TIV_STRIPE_WEBHOOK_SECRET".to_owned(),
                 WEBHOOK_SECRET.to_owned(),
+            ),
+            (
+                "TIV_FIXTURE_CONTROL_TOKEN".to_owned(),
+                FIXTURE_CONTROL_TOKEN.to_owned(),
             ),
         ]),
     }

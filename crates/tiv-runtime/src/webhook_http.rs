@@ -112,7 +112,9 @@ pub struct WebhookHttpAdapter {
     pending: VecDeque<PendingWebhook>,
     generated_events: BTreeSet<String>,
     last_delivered: Option<String>,
+    request_cut_points: BTreeSet<ActionId>,
     response_cut_points: BTreeSet<ActionId>,
+    pending_request: Option<PendingWebhookRequest>,
     pending_response: Option<PendingWebhookResponse>,
     fixture_producer_sequence: u64,
 }
@@ -138,7 +140,9 @@ impl WebhookHttpAdapter {
             pending: VecDeque::new(),
             generated_events: BTreeSet::new(),
             last_delivered: None,
+            request_cut_points: BTreeSet::new(),
             response_cut_points: BTreeSet::new(),
+            pending_request: None,
             pending_response: None,
             fixture_producer_sequence: 0,
         })
@@ -152,6 +156,17 @@ impl WebhookHttpAdapter {
         I: IntoIterator<Item = ActionId>,
     {
         self.response_cut_points = action_ids.into_iter().collect();
+        self
+    }
+
+    /// Marks delivery actions that must pause after the instrumented
+    /// application validates ingress and before it persists the webhook.
+    #[must_use]
+    pub fn with_webhook_request_cut_points<I>(mut self, action_ids: I) -> Self
+    where
+        I: IntoIterator<Item = ActionId>,
+    {
+        self.request_cut_points = action_ids.into_iter().collect();
         self
     }
 
@@ -171,7 +186,7 @@ impl WebhookHttpAdapter {
     }
 
     pub(crate) fn is_idle(&self) -> bool {
-        self.pending.is_empty() && self.pending_response.is_none()
+        self.pending.is_empty() && self.pending_request.is_none() && self.pending_response.is_none()
     }
 
     pub(crate) const fn fixture_producer_sequence(&self) -> u64 {
@@ -194,6 +209,13 @@ impl WebhookHttpAdapter {
             .as_ref()
             .map(|_| ())
             .ok_or(WebhookHttpError::NoPendingWebhookResponse)
+    }
+
+    pub(crate) fn require_forwarded_request(&self) -> Result<(), WebhookHttpError> {
+        self.pending_request
+            .as_ref()
+            .map(|_| ())
+            .ok_or(WebhookHttpError::NoPendingWebhookRequest)
     }
 
     async fn generate_event(
@@ -332,26 +354,104 @@ impl WebhookHttpAdapter {
         let next_timestamp = timestamp
             .checked_add(1)
             .ok_or(WebhookHttpError::SequenceExhausted)?;
-        let held = self.response_cut_points.contains(&request.action().id());
-        let delivered = if held {
-            self.start_held_delivery(request, event_id, next_sequence, timestamp)
-                .await?
-        } else {
-            send_delivery_request(
-                &self.client,
-                self.control_endpoint("/v1/control/deliver-event"),
-                &self.config.fixture_control_token,
-                next_sequence,
-                event_id,
-                timestamp,
+        let request_held = self.request_cut_points.contains(&request.action().id());
+        let response_held = self.response_cut_points.contains(&request.action().id());
+        if request_held && response_held {
+            return Err(WebhookHttpError::ConflictingWebhookCutPoints);
+        }
+        let progress = if request_held {
+            self.start_forwarded_request_delivery(request, event_id, next_sequence, timestamp)
+                .await?;
+            DeliveryProgress::RequestForwarded
+        } else if response_held {
+            DeliveryProgress::Complete(
+                self.start_held_delivery(request, event_id, next_sequence, timestamp)
+                    .await?,
             )
-            .await?
+        } else {
+            DeliveryProgress::Complete(
+                send_delivery_request(
+                    &self.client,
+                    self.control_endpoint("/v1/control/deliver-event"),
+                    &self.config.fixture_control_token,
+                    next_sequence,
+                    event_id,
+                    timestamp,
+                )
+                .await?,
+            )
         };
         self.config.control_sequence = next_sequence;
         self.config.next_timestamp = next_timestamp;
-        if !(200..300).contains(&delivered.status) {
+        if let DeliveryProgress::Complete(delivered) = progress
+            && !(200..300).contains(&delivered.status)
+        {
             return Err(WebhookHttpError::UnexpectedDeliveryStatus(delivered.status));
         }
+        Ok(())
+    }
+
+    async fn start_forwarded_request_delivery(
+        &mut self,
+        request: &CaseEffectRequest<'_>,
+        event_id: &str,
+        command_sequence: u64,
+        timestamp: i64,
+    ) -> Result<(), WebhookHttpError> {
+        if self.pending_request.is_some() || self.pending_response.is_some() {
+            return Err(WebhookHttpError::WebhookRequestAlreadyPending);
+        }
+        let client = self.client.clone();
+        let endpoint = self.control_endpoint("/v1/control/deliver-event-held-request");
+        let token = self.config.fixture_control_token.clone();
+        let task_event_id = event_id.to_owned();
+        let task = tokio::spawn(async move {
+            send_delivery_request(
+                &client,
+                endpoint,
+                &token,
+                command_sequence,
+                &task_event_id,
+                timestamp,
+            )
+            .await
+        });
+        let gate = match self
+            .wait_for_forwarded_webhook_request(event_id, command_sequence, &task)
+            .await
+        {
+            Ok(gate) if !task.is_finished() => gate,
+            Ok(_) => {
+                task.abort();
+                return Err(WebhookHttpError::RequestCompletedBeforeWebhookGate);
+            }
+            Err(error) => {
+                task.abort();
+                return Err(error);
+            }
+        };
+        let next_observation = self
+            .fixture_producer_sequence
+            .checked_add(1)
+            .ok_or(WebhookHttpError::SequenceExhausted)?;
+        if let Err(error) = request
+            .record_observation(
+                ObservationProducer::Fixture,
+                next_observation,
+                ObservationEvent::WebhookRequestForwarded {
+                    gate_id: gate.gate_id,
+                },
+            )
+            .await
+        {
+            task.abort();
+            return Err(WebhookHttpError::Journal(error));
+        }
+        self.fixture_producer_sequence = next_observation;
+        self.pending_request = Some(PendingWebhookRequest {
+            task: Some(task),
+            gate_id: gate.gate_id,
+        });
         Ok(())
     }
 
@@ -469,6 +569,121 @@ impl WebhookHttpAdapter {
         .map_err(|_| WebhookHttpError::Timeout("webhook response gate"))?
     }
 
+    async fn wait_for_forwarded_webhook_request(
+        &self,
+        event_id: &str,
+        command_sequence: u64,
+        task: &JoinHandle<Result<DeliveredEventResponse, WebhookHttpError>>,
+    ) -> Result<HeldWebhookRequest, WebhookHttpError> {
+        tokio::time::timeout(self.config.timeout, async {
+            loop {
+                if task.is_finished() {
+                    return Err(WebhookHttpError::RequestCompletedBeforeWebhookGate);
+                }
+                let response = self
+                    .client
+                    .get(self.control_endpoint("/v1/control/webhook-request-state"))
+                    .header("X-Tiv-Control-Token", &self.config.fixture_control_token)
+                    .send()
+                    .await
+                    .map_err(WebhookHttpError::ControlRequest)?;
+                require_status(response.status(), "webhook request state")?;
+                let state = response
+                    .json::<WebhookRequestState>()
+                    .await
+                    .map_err(WebhookHttpError::ControlRequest)?;
+                if state.command_sequence < self.config.control_sequence
+                    || state.command_sequence > command_sequence
+                {
+                    return Err(WebhookHttpError::UnexpectedControlResponse);
+                }
+                match state.held_webhook_requests.as_slice() {
+                    [] => tokio::time::sleep(Duration::from_millis(10)).await,
+                    [gate]
+                        if state.command_sequence == command_sequence
+                            && gate.event_id == event_id
+                            && gate.forwarded =>
+                    {
+                        return Ok(gate.clone());
+                    }
+                    [gate]
+                        if state.command_sequence == command_sequence
+                            && gate.event_id == event_id
+                            && !gate.forwarded =>
+                    {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    _ => return Err(WebhookHttpError::UnexpectedControlResponse),
+                }
+            }
+        })
+        .await
+        .map_err(|_| WebhookHttpError::Timeout("webhook request gate"))?
+    }
+
+    pub(crate) async fn discard_forwarded_request(
+        &mut self,
+        request: &CaseEffectRequest<'_>,
+    ) -> Result<(), WebhookHttpError> {
+        let mut pending = self
+            .pending_request
+            .take()
+            .ok_or(WebhookHttpError::NoPendingWebhookRequest)?;
+        let next_sequence = self.next_control_sequence()?;
+        let response = self
+            .client
+            .post(self.control_endpoint("/v1/control/discard-webhook-request"))
+            .header("X-Tiv-Control-Token", &self.config.fixture_control_token)
+            .json(&serde_json::json!({
+                "command_sequence": next_sequence,
+                "gate_id": pending.gate_id,
+            }))
+            .send()
+            .await
+            .map_err(WebhookHttpError::ControlRequest)?;
+        require_status(response.status(), "discard webhook request")?;
+        let state = response
+            .json::<WebhookRequestState>()
+            .await
+            .map_err(WebhookHttpError::ControlRequest)?;
+        if state.command_sequence != next_sequence || !state.held_webhook_requests.is_empty() {
+            return Err(WebhookHttpError::UnexpectedControlResponse);
+        }
+        self.config.control_sequence = next_sequence;
+        let task = pending
+            .task
+            .take()
+            .expect("a pending webhook request always owns its sender task");
+        let task_result = tokio::time::timeout(self.config.timeout, task)
+            .await
+            .map_err(|_| WebhookHttpError::Timeout("discarded webhook request"))?
+            .map_err(WebhookHttpError::RequestJoin)?;
+        if !matches!(
+            task_result,
+            Err(WebhookHttpError::UnexpectedControlStatus {
+                step: "deliver event",
+                status: StatusCode::BAD_GATEWAY,
+            })
+        ) {
+            return Err(WebhookHttpError::ExpectedDiscardedWebhookConnection);
+        }
+        let next_observation = self
+            .fixture_producer_sequence
+            .checked_add(1)
+            .ok_or(WebhookHttpError::SequenceExhausted)?;
+        request
+            .record_observation(
+                ObservationProducer::Fixture,
+                next_observation,
+                ObservationEvent::WebhookRequestDiscarded {
+                    gate_id: pending.gate_id,
+                },
+            )
+            .await?;
+        self.fixture_producer_sequence = next_observation;
+        Ok(())
+    }
+
     pub(crate) async fn discard_observed_response(
         &mut self,
         request: &CaseEffectRequest<'_>,
@@ -540,6 +755,7 @@ impl WebhookHttpAdapter {
 
 impl Drop for WebhookHttpAdapter {
     fn drop(&mut self) {
+        self.pending_request.take();
         self.pending_response.take();
     }
 }
@@ -662,6 +878,19 @@ struct PendingWebhookResponse {
     gate_id: u64,
 }
 
+struct PendingWebhookRequest {
+    task: Option<JoinHandle<Result<DeliveredEventResponse, WebhookHttpError>>>,
+    gate_id: u64,
+}
+
+impl Drop for PendingWebhookRequest {
+    fn drop(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+    }
+}
+
 impl Drop for PendingWebhookResponse {
     fn drop(&mut self) {
         if let Some(task) = self.task.take() {
@@ -678,11 +907,31 @@ struct HeldWebhookResponse {
     status: u16,
 }
 
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HeldWebhookRequest {
+    gate_id: u64,
+    event_id: String,
+    forwarded: bool,
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WebhookResponseState {
     command_sequence: u64,
     held_webhook_responses: Vec<HeldWebhookResponse>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WebhookRequestState {
+    command_sequence: u64,
+    held_webhook_requests: Vec<HeldWebhookRequest>,
+}
+
+enum DeliveryProgress {
+    Complete(DeliveredEventResponse),
+    RequestForwarded,
 }
 
 #[derive(Debug, Error)]
@@ -710,8 +959,14 @@ pub enum WebhookHttpError {
     UnexpectedQueueState,
     #[error("a webhook response is already pending at a process cut point")]
     WebhookResponseAlreadyPending,
+    #[error("a webhook request is already pending at a process cut point")]
+    WebhookRequestAlreadyPending,
+    #[error("one delivery cannot own both webhook request and response cut points")]
+    ConflictingWebhookCutPoints,
     #[error("no webhook response is pending at the process cut point")]
     NoPendingWebhookResponse,
+    #[error("no webhook request is pending at the process cut point")]
+    NoPendingWebhookRequest,
     #[error("the webhook delivery completed before its response gate was observed")]
     RequestCompletedBeforeWebhookGate,
     #[error("the discarded webhook response unexpectedly became an acknowledgment")]
@@ -724,4 +979,10 @@ pub enum WebhookHttpError {
     Journal(#[from] JournalError),
     #[error("action is outside the webhook HTTP adapter boundary")]
     UnsupportedAction,
+}
+
+impl WebhookHttpError {
+    pub(crate) const fn is_inconclusive(&self) -> bool {
+        matches!(self, Self::Timeout(_))
+    }
 }

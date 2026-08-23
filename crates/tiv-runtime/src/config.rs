@@ -9,6 +9,7 @@ use std::{
     time::Duration,
 };
 
+use reqwest::header::HeaderValue;
 use schemars::{JsonSchema, schema_for};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -35,6 +36,8 @@ const MAX_LOCK_TIMEOUT: Duration = Duration::from_millis(500);
 const MAX_DATABASE_BYTES: u64 = 2_147_483_648;
 const MAX_WEBHOOK_DUPLICATES: u32 = 3;
 const MAX_DELAY_MILLIS: u64 = 5_000;
+const MAX_DRIVER_BODY_BYTES: usize = 16 * 1024;
+const MAX_CONTROL_TOKEN_BYTES: usize = 1_024;
 const SUPPORTED_STRIPE_API_VERSION: &str = "2026-02-25.clover";
 const SUPPORTED_INVARIANT_IDS: [&str; 5] = [
     "provider-object-unique",
@@ -143,6 +146,9 @@ struct RawStripeConfig {
     application_base_url: String,
     webhook_url: String,
     webhook_secret_env: String,
+    control_url: String,
+    control_token_env: String,
+    poll_interval: String,
 }
 
 #[derive(Clone, Copy, Deserialize, JsonSchema, Serialize)]
@@ -330,6 +336,58 @@ impl ResolvedConfig {
         &self.private.sql_probe
     }
 
+    pub(crate) fn artifact_dir(&self) -> &Path {
+        &self.private.artifact_dir
+    }
+
+    pub(crate) const fn case_timeout(&self) -> Duration {
+        self.private.case_timeout
+    }
+
+    pub(crate) fn health_url(&self) -> &Url {
+        &self.private.health_url
+    }
+
+    pub(crate) const fn health_timeout(&self) -> Duration {
+        self.private.health_timeout
+    }
+
+    pub(crate) fn fixture_control_url(&self) -> &Url {
+        &self.private.fixture_control_url
+    }
+
+    pub(crate) fn fixture_control_token(&self) -> &str {
+        &self.private.fixture_control_token.value
+    }
+
+    pub(crate) const fn fixture_poll_interval(&self) -> Duration {
+        self.private.fixture_poll_interval
+    }
+
+    pub(crate) fn quiescence_sql_file(&self) -> &Path {
+        &self.private.quiescence_sql
+    }
+
+    pub(crate) const fn quiescence_stable_for(&self) -> Duration {
+        self.private.quiescence_stable_for
+    }
+
+    pub(crate) const fn quiescence_timeout(&self) -> Duration {
+        self.private.quiescence_timeout
+    }
+
+    pub(crate) fn driver_url(&self) -> &Url {
+        &self.private.driver_url
+    }
+
+    pub(crate) fn driver_body(&self) -> &serde_json::Value {
+        &self.private.driver_body
+    }
+
+    pub(crate) const fn driver_timeout(&self) -> Duration {
+        self.private.driver_timeout
+    }
+
     pub(crate) fn into_redacted(self) -> RedactedConfig {
         self.redacted
     }
@@ -340,30 +398,33 @@ struct SecretUrl {
 }
 
 struct SecretString {
-    _value: String,
+    value: String,
 }
 
 struct ResolvedPrivate {
-    _artifact_dir: PathBuf,
-    _case_timeout: Duration,
-    _health_url: Url,
-    _health_timeout: Duration,
+    artifact_dir: PathBuf,
+    case_timeout: Duration,
+    health_url: Url,
+    health_timeout: Duration,
     admin_url: SecretUrl,
     case_url: SecretUrl,
     case_database: String,
     baseline_database: String,
     max_database_bytes: u64,
     _webhook_secret: SecretString,
-    _quiescence_sql: PathBuf,
-    _quiescence_stable_for: Duration,
-    _quiescence_timeout: Duration,
+    fixture_control_url: Url,
+    fixture_control_token: SecretString,
+    fixture_poll_interval: Duration,
+    quiescence_sql: PathBuf,
+    quiescence_stable_for: Duration,
+    quiescence_timeout: Duration,
     statement_timeout: Duration,
     lock_timeout: Duration,
     _stripe_base: Url,
     _webhook_url: Url,
-    _driver_url: Url,
-    _driver_body: PathBuf,
-    _driver_timeout: Duration,
+    driver_url: Url,
+    driver_body: serde_json::Value,
+    driver_timeout: Duration,
     sql_probe: PathBuf,
     invariant_role: String,
     invariant_files: Vec<ResolvedInvariantFile>,
@@ -450,6 +511,9 @@ struct RedactedStripeConfig {
     application_base_url: String,
     webhook_url: String,
     webhook_secret_env: String,
+    control_url: String,
+    control_token_env: String,
+    poll_interval_ms: u64,
 }
 
 #[derive(Serialize)]
@@ -616,6 +680,7 @@ fn resolve_raw_config(
     validate_environment_name(&raw.database.admin_url_env)?;
     validate_environment_name(&raw.database.case_url_env)?;
     validate_environment_name(&raw.stripe.webhook_secret_env)?;
+    validate_environment_name(&raw.stripe.control_token_env)?;
     validate_database_name(
         &raw.database.case_database,
         &raw.safety.database_name_prefix,
@@ -643,6 +708,16 @@ fn resolve_raw_config(
         ));
     }
     reject_live_stripe_material(&webhook_secret)?;
+    let fixture_control_token = environment
+        .get(&raw.stripe.control_token_env)
+        .ok_or_else(|| ConfigError::MissingEnvironment(raw.stripe.control_token_env.clone()))?;
+    if fixture_control_token.trim().is_empty()
+        || fixture_control_token.len() > MAX_CONTROL_TOKEN_BYTES
+        || HeaderValue::from_str(&fixture_control_token).is_err()
+    {
+        return Err(ConfigError::InvalidFixtureControlToken);
+    }
+    reject_live_stripe_material(&fixture_control_token)?;
 
     let quiescence_sql = existing_repository_file(
         &canonical_root,
@@ -690,12 +765,25 @@ fn resolve_raw_config(
     if webhook_url.host_str() != Some(raw.compose.application_service.as_str()) {
         return Err(ConfigError::InvalidWebhookTarget);
     }
+    let fixture_control_url = local_http_origin(&raw.stripe.control_url)?;
 
     let driver_url = local_http_url(&raw.driver.url)?;
-    let driver_body =
+    if driver_url.port().is_none() {
+        return Err(ConfigError::InvalidHttpUrl);
+    }
+    let driver_body_file =
         existing_repository_file(&canonical_root, &repository_root, &raw.driver.body_file)?;
+    let driver_body = read_driver_body(&driver_body_file, &raw.database.case_database)?;
     let driver_timeout =
         bounded_duration(&raw.driver.timeout, MAX_DRIVER_TIMEOUT, "driver.timeout")?;
+    let fixture_poll_interval = bounded_duration(
+        &raw.stripe.poll_interval,
+        MAX_DRIVER_TIMEOUT,
+        "stripe.poll_interval",
+    )?;
+    if fixture_poll_interval > driver_timeout {
+        return Err(ConfigError::UnsafeBudget("stripe.poll_interval"));
+    }
 
     validate_faults(&raw.faults, &raw.compose.application_service)?;
     let campaign_spec = campaign_spec(&raw)?;
@@ -783,11 +871,14 @@ fn resolve_raw_config(
             application_base_url: stripe_base.to_string(),
             webhook_url: webhook_url.to_string(),
             webhook_secret_env: raw.stripe.webhook_secret_env,
+            control_url: fixture_control_url.to_string(),
+            control_token_env: raw.stripe.control_token_env,
+            poll_interval_ms: duration_millis(fixture_poll_interval)?,
         },
         driver: RedactedDriverConfig {
             method: raw.driver.method,
             url: driver_url.to_string(),
-            body_file: display_path(&driver_body),
+            body_file: display_path(&driver_body_file),
             timeout_ms: duration_millis(driver_timeout)?,
         },
         invariants: redacted_invariants,
@@ -803,28 +894,33 @@ fn resolve_raw_config(
         worker_services: raw.compose.worker_services,
         campaign_spec,
         private: ResolvedPrivate {
-            _artifact_dir: artifact_dir,
-            _case_timeout: case_timeout,
-            _health_url: health_url,
-            _health_timeout: health_timeout,
+            artifact_dir,
+            case_timeout,
+            health_url,
+            health_timeout,
             admin_url: SecretUrl { value: admin_url },
             case_url: SecretUrl { value: case_url },
             case_database: raw.database.case_database,
             baseline_database: raw.database.baseline_database,
             max_database_bytes: raw.safety.max_database_bytes,
             _webhook_secret: SecretString {
-                _value: webhook_secret,
+                value: webhook_secret,
             },
-            _quiescence_sql: quiescence_sql,
-            _quiescence_stable_for: quiescence_stable_for,
-            _quiescence_timeout: quiescence_timeout,
+            fixture_control_url,
+            fixture_control_token: SecretString {
+                value: fixture_control_token,
+            },
+            fixture_poll_interval,
+            quiescence_sql,
+            quiescence_stable_for,
+            quiescence_timeout,
             statement_timeout,
             lock_timeout,
             _stripe_base: stripe_base,
             _webhook_url: webhook_url,
-            _driver_url: driver_url,
-            _driver_body: driver_body,
-            _driver_timeout: driver_timeout,
+            driver_url,
+            driver_body,
+            driver_timeout,
             sql_probe,
             invariant_role: raw.database.invariant_role,
             invariant_files,
@@ -872,6 +968,61 @@ fn safe_output_path(root: &Path, path: &Path) -> Result<PathBuf, ConfigError> {
         return Err(ConfigError::UnsafePath(path.to_owned()));
     }
     Ok(root.join(path))
+}
+
+fn read_driver_body(
+    path: &Path,
+    configured_case_database: &str,
+) -> Result<serde_json::Value, ConfigError> {
+    let file = fs::File::open(path).map_err(|source| ConfigError::Read {
+        path: path.to_owned(),
+        source,
+    })?;
+    let mut document = String::new();
+    file.take((MAX_DRIVER_BODY_BYTES + 1) as u64)
+        .read_to_string(&mut document)
+        .map_err(|source| ConfigError::Read {
+            path: path.to_owned(),
+            source,
+        })?;
+    if document.len() > MAX_DRIVER_BODY_BYTES {
+        return Err(ConfigError::InvalidDriverBody);
+    }
+    reject_live_stripe_material(&document)?;
+    let body: serde_json::Value =
+        serde_json::from_str(&document).map_err(|_| ConfigError::InvalidDriverBody)?;
+    let object = body.as_object().ok_or(ConfigError::InvalidDriverBody)?;
+    let operation_id = object
+        .get("operation_id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| valid_operation_id(value))
+        .ok_or(ConfigError::InvalidDriverBody)?;
+    let amount_minor = object
+        .get("amount_minor")
+        .and_then(serde_json::Value::as_i64)
+        .filter(|value| *value > 0)
+        .ok_or(ConfigError::InvalidDriverBody)?;
+    let currency = object
+        .get("currency")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| value.len() == 3 && value.bytes().all(|byte| byte.is_ascii_lowercase()))
+        .ok_or(ConfigError::InvalidDriverBody)?;
+    if object
+        .get("database")
+        .is_some_and(|value| value.as_str() != Some(configured_case_database))
+    {
+        return Err(ConfigError::InvalidDriverBody);
+    }
+    let _ = (operation_id, amount_minor, currency);
+    Ok(body)
+}
+
+fn valid_operation_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 255
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
 }
 
 fn validate_environment_name(name: &str) -> Result<(), ConfigError> {
@@ -951,6 +1102,14 @@ fn local_http_url(value: &str) -> Result<Url, ConfigError> {
         host == "localhost" || host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
     }) {
         return Err(ConfigError::NonLocalHttpUrl);
+    }
+    Ok(url)
+}
+
+fn local_http_origin(value: &str) -> Result<Url, ConfigError> {
+    let url = local_http_url(value)?;
+    if url.port().is_none() || !matches!(url.path(), "" | "/") {
+        return Err(ConfigError::InvalidHttpUrl);
     }
     Ok(url)
 }
@@ -1211,6 +1370,10 @@ pub enum ConfigError {
     UnsupportedStripeApiVersion,
     #[error("webhook URL does not target the configured application service")]
     InvalidWebhookTarget,
+    #[error("fixture control token is outside the bounded HTTP header contract")]
+    InvalidFixtureControlToken,
+    #[error("driver body is not a bounded payment_intent_v1 JSON object")]
+    InvalidDriverBody,
     #[error("fault budget is outside the v0 limits")]
     UnsafeFaultBudget,
     #[error("fault model differs from the supported v0 model")]

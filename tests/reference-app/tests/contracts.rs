@@ -14,7 +14,8 @@ use tiv_core::{
 };
 use tiv_reference_app::{
     CheckoutOperation, ReferenceDatabaseName, create_with_changed_retry_key,
-    parse_succeeded_webhook, verify_webhook_signature,
+    create_with_changed_retry_key_for_business_request, parse_succeeded_webhook,
+    verify_webhook_signature,
 };
 use tiv_stripe_pi::{
     CreatePaymentIntent, FaultOutcome, IdempotencyKey, ManagedFixture, OperationId,
@@ -177,6 +178,58 @@ async fn ambiguous_transport_failure_is_retried_with_a_changed_key() {
         snapshot.payment_intents()[0].id(),
         snapshot.payment_intents()[1].id()
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn separate_business_requests_use_separate_provider_idempotency_scopes() {
+    let fixture = Arc::new(Mutex::new(ManagedFixture::new(Seed::new(41))));
+    fixture
+        .lock()
+        .await
+        .reset(
+            1,
+            Seed::new(41),
+            vec![FaultOutcome::Normal, FaultOutcome::Normal],
+        )
+        .expect("both business requests have one provider outcome");
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("a loopback port is available");
+    let address = listener.local_addr().expect("the listener has an address");
+    let server_fixture = Arc::clone(&fixture);
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("the app connects");
+        serve_managed_http1_connection(stream, server_fixture)
+            .await
+            .expect("both provider requests are served on the pooled connection");
+    });
+    let operation = CheckoutOperation::new("op_1", 2_500, "usd").expect("the operation is valid");
+    let client = reqwest::Client::new();
+
+    let first = create_with_changed_retry_key_for_business_request(
+        &client,
+        &format!("http://{address}"),
+        &operation,
+        1,
+    )
+    .await
+    .expect("the first business request succeeds");
+    let second = create_with_changed_retry_key_for_business_request(
+        &client,
+        &format!("http://{address}"),
+        &operation,
+        2,
+    )
+    .await
+    .expect("the caller retry is a distinct business request");
+
+    assert_ne!(first.id(), second.id());
+    assert_eq!(fixture.lock().await.snapshot().payment_intents().len(), 2);
+    drop(client);
+    timeout(Duration::from_secs(2), server)
+        .await
+        .expect("the provider server stops")
+        .expect("the provider server does not panic");
 }
 
 fn compiled_changed_key_retry_script() -> (Seed, ProviderOutcomeScript) {

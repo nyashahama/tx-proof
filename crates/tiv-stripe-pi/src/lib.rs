@@ -117,8 +117,11 @@ pub enum InvalidCreateRequest {
 #[serde(rename_all = "snake_case")]
 pub enum FaultOutcome {
     Normal,
+    #[serde(rename = "pre_execute_429")]
     PreExecute429,
+    #[serde(rename = "pre_execute_500")]
     PreExecute500,
+    #[serde(rename = "post_execute_500")]
     PostExecute500,
     CommitThenClose,
     CommitThenDelay,
@@ -230,6 +233,49 @@ pub struct HeldDataPlaneResponse {
 pub struct HeldWebhookResponse {
     gate_id: GateId,
     signal: Arc<GateSignal>,
+}
+
+/// A single-use, event-bound capability prepared before fixture webhook
+/// delivery. This type intentionally exposes no printable representation.
+pub struct PreparedWebhookRequestGate {
+    gate_id: GateId,
+    capability: String,
+}
+
+impl PreparedWebhookRequestGate {
+    #[must_use]
+    pub const fn gate_id(&self) -> GateId {
+        self.gate_id
+    }
+
+    #[must_use]
+    pub fn capability(&self) -> &str {
+        &self.capability
+    }
+}
+
+/// An application ingress callback paused before webhook persistence.
+#[derive(Debug)]
+pub struct HeldWebhookRequest {
+    gate_id: GateId,
+    signal: Arc<GateSignal>,
+}
+
+impl HeldWebhookRequest {
+    #[must_use]
+    pub const fn gate_id(&self) -> GateId {
+        self.gate_id
+    }
+
+    /// Waits until control discards this exact forwarded request.
+    ///
+    /// # Errors
+    ///
+    /// Always returns [`HeldResponseCancelled`] after discard or reset. A
+    /// request-forwarded crash cut never releases the application to persist.
+    pub async fn wait(self) -> Result<(), HeldResponseCancelled> {
+        self.signal.wait().await
+    }
 }
 
 impl HeldWebhookResponse {
@@ -499,6 +545,7 @@ pub struct ManagedFixture {
     fixture: PaymentIntentFixture,
     planned_outcomes: VecDeque<FaultOutcome>,
     held_gates: BTreeMap<GateId, Arc<GateSignal>>,
+    held_webhook_requests: BTreeMap<GateId, HeldWebhookRequestState>,
     held_webhook_responses: BTreeMap<GateId, HeldWebhookResponseState>,
     next_gate_sequence: u64,
     command_sequence: u64,
@@ -511,6 +558,7 @@ impl ManagedFixture {
             fixture: PaymentIntentFixture::new(seed),
             planned_outcomes: VecDeque::new(),
             held_gates: BTreeMap::new(),
+            held_webhook_requests: BTreeMap::new(),
             held_webhook_responses: BTreeMap::new(),
             next_gate_sequence: 0,
             command_sequence: 0,
@@ -537,12 +585,16 @@ impl ManagedFixture {
         for signal in self.held_gates.values() {
             signal.cancel();
         }
+        for request in self.held_webhook_requests.values() {
+            request.signal.cancel();
+        }
         for response in self.held_webhook_responses.values() {
             response.signal.cancel();
         }
         self.fixture = PaymentIntentFixture::new(seed);
         self.planned_outcomes = outcomes.into();
         self.held_gates.clear();
+        self.held_webhook_requests.clear();
         self.held_webhook_responses.clear();
         self.command_sequence = command_sequence;
         Ok(self.snapshot())
@@ -613,6 +665,108 @@ impl ManagedFixture {
         signal.release();
         self.command_sequence = command_sequence;
         Ok(self.snapshot())
+    }
+
+    /// Prepares one single-use application ingress capability before sending
+    /// an exact provider event.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unknown event, an already-active webhook
+    /// ingress gate, or an exhausted gate sequence.
+    pub fn prepare_webhook_request_gate(
+        &mut self,
+        event_id: &str,
+    ) -> Result<PreparedWebhookRequestGate, FixtureServiceError> {
+        if !self.held_webhook_requests.is_empty()
+            || !self
+                .fixture
+                .events()
+                .iter()
+                .any(|event| event.id() == event_id)
+        {
+            return Err(FixtureServiceError::InvalidWebhookRequestGate);
+        }
+        let gate_id = self.next_gate_id()?;
+        let capability = self.webhook_request_capability(gate_id, event_id);
+        let signal = Arc::new(GateSignal::default());
+        self.held_webhook_requests.insert(
+            gate_id,
+            HeldWebhookRequestState {
+                event_id: event_id.to_owned(),
+                capability: capability.clone(),
+                forwarded: false,
+                signal,
+            },
+        );
+        Ok(PreparedWebhookRequestGate {
+            gate_id,
+            capability,
+        })
+    }
+
+    /// Atomically consumes the exact application-facing ingress capability and
+    /// marks the webhook request forwarded before application persistence.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a missing, wrong, or replayed capability.
+    pub fn hold_webhook_request_forwarded(
+        &mut self,
+        capability: &str,
+    ) -> Result<HeldWebhookRequest, FixtureServiceError> {
+        let Some((gate_id, state)) = self
+            .held_webhook_requests
+            .iter_mut()
+            .find(|(_, state)| state.capability == capability && !state.forwarded)
+        else {
+            return Err(FixtureServiceError::InvalidWebhookRequestGate);
+        };
+        state.forwarded = true;
+        Ok(HeldWebhookRequest {
+            gate_id: *gate_id,
+            signal: Arc::clone(&state.signal),
+        })
+    }
+
+    /// Discards one exact forwarded webhook request without letting the
+    /// application proceed to persistence.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an out-of-order command or a gate that is absent
+    /// or has not reached the forwarded boundary.
+    pub fn discard_webhook_request(
+        &mut self,
+        command_sequence: u64,
+        gate_id: GateId,
+    ) -> Result<WebhookRequestState, FixtureServiceError> {
+        self.require_next_sequence(command_sequence)?;
+        if !self
+            .held_webhook_requests
+            .get(&gate_id)
+            .is_some_and(|state| state.forwarded)
+        {
+            return Err(FixtureServiceError::GateNotFound);
+        }
+        let held = self
+            .held_webhook_requests
+            .remove(&gate_id)
+            .ok_or(FixtureServiceError::GateNotFound)?;
+        held.signal.cancel();
+        self.command_sequence = command_sequence;
+        Ok(self.webhook_request_state())
+    }
+
+    pub(crate) fn abort_unforwarded_webhook_request(&mut self, gate_id: GateId) {
+        if self
+            .held_webhook_requests
+            .get(&gate_id)
+            .is_some_and(|state| !state.forwarded)
+            && let Some(held) = self.held_webhook_requests.remove(&gate_id)
+        {
+            held.signal.cancel();
+        }
     }
 
     /// Holds one fixture sender after a real application webhook response.
@@ -833,6 +987,32 @@ impl ManagedFixture {
         }
     }
 
+    #[must_use]
+    pub fn webhook_request_state(&self) -> WebhookRequestState {
+        WebhookRequestState {
+            command_sequence: self.command_sequence,
+            held_webhook_requests: self
+                .held_webhook_requests
+                .iter()
+                .map(|(gate_id, held)| HeldWebhookRequestSnapshot {
+                    gate_id: *gate_id,
+                    event_id: held.event_id.clone(),
+                    forwarded: held.forwarded,
+                })
+                .collect(),
+        }
+    }
+
+    fn webhook_request_capability(&self, gate_id: GateId, event_id: &str) -> String {
+        let mut hasher =
+            blake3::Hasher::new_derive_key("dev.txproof.webhook-ingress-capability.v1");
+        hasher.update(&self.fixture.seed.value().to_le_bytes());
+        hasher.update(&gate_id.0.to_le_bytes());
+        hasher.update(&self.command_sequence.to_le_bytes());
+        hasher.update(event_id.as_bytes());
+        hasher.finalize().to_hex().to_string()
+    }
+
     fn next_gate_id(&mut self) -> Result<GateId, FixtureServiceError> {
         self.next_gate_sequence = self
             .next_gate_sequence
@@ -857,6 +1037,26 @@ struct HeldWebhookResponseState {
     event_id: String,
     status: u16,
     signal: Arc<GateSignal>,
+}
+
+struct HeldWebhookRequestState {
+    event_id: String,
+    capability: String,
+    forwarded: bool,
+    signal: Arc<GateSignal>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct WebhookRequestState {
+    command_sequence: u64,
+    held_webhook_requests: Vec<HeldWebhookRequestSnapshot>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct HeldWebhookRequestSnapshot {
+    gate_id: GateId,
+    event_id: String,
+    forwarded: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -1058,6 +1258,7 @@ pub enum FixtureServiceError {
     GateNotFound,
     GateSequenceExhausted,
     InvalidWebhookResponseGate,
+    InvalidWebhookRequestGate,
     Fixture(FixtureError),
     UnexpectedCommandSequence { expected: u64, received: u64 },
     WebhookSignature(WebhookSignatureError),

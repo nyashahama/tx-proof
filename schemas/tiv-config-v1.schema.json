@@ -316,6 +316,15 @@
         "application_base_url": {
           "type": "string"
         },
+        "control_token_env": {
+          "type": "string"
+        },
+        "control_url": {
+          "type": "string"
+        },
+        "poll_interval": {
+          "type": "string"
+        },
         "webhook_secret_env": {
           "type": "string"
         },
@@ -328,7 +337,10 @@
         "api_version",
         "application_base_url",
         "webhook_url",
-        "webhook_secret_env"
+        "webhook_secret_env",
+        "control_url",
+        "control_token_env",
+        "poll_interval"
       ],
       "type": "object"
     },

@@ -117,15 +117,20 @@ impl WebhookTarget {
     async fn deliver(
         &self,
         attempt: &crate::SignedWebhookAttempt,
+        ingress_capability: Option<&str>,
     ) -> Result<u16, WebhookDeliveryError> {
         let raw_body =
             hex::decode(attempt.raw_body_hex()).map_err(|_| WebhookDeliveryError::InvalidBody)?;
-        let response = self
+        let mut request = self
             .client
             .post(self.url.clone())
             .header(CONTENT_TYPE, "application/json")
             .header("Stripe-Signature", attempt.signature_header())
-            .body(raw_body)
+            .body(raw_body);
+        if let Some(capability) = ingress_capability {
+            request = request.header("X-Tiv-Webhook-Ingress-Capability", capability);
+        }
+        let response = request
             .send()
             .await
             .map_err(WebhookDeliveryError::Request)?;
@@ -186,6 +191,7 @@ pub async fn serve_http1_connection(
         .await
 }
 
+#[allow(clippy::too_many_lines)]
 async fn handle_request(
     request: Request<Incoming>,
     fixture: Arc<Mutex<ManagedFixture>>,
@@ -213,6 +219,10 @@ async fn handle_request(
         }
         (&Method::GET, "/v1/control/webhook-response-state") => {
             let state = fixture.lock().await.webhook_response_state();
+            json_response(StatusCode::OK, &state)
+        }
+        (&Method::GET, "/v1/control/webhook-request-state") => {
+            let state = fixture.lock().await.webhook_request_state();
             json_response(StatusCode::OK, &state)
         }
         (&Method::POST, "/v1/control/reset") => {
@@ -248,10 +258,34 @@ async fn handle_request(
             service_result(result)
         }
         (&Method::POST, "/v1/control/deliver-event") => {
-            handle_deliver_event(request, fixture, &webhook_secret, &webhook_target, false).await
+            handle_deliver_event(
+                request,
+                fixture,
+                &webhook_secret,
+                &webhook_target,
+                WebhookDeliveryGate::None,
+            )
+            .await
         }
         (&Method::POST, "/v1/control/deliver-event-held-response") => {
-            handle_deliver_event(request, fixture, &webhook_secret, &webhook_target, true).await
+            handle_deliver_event(
+                request,
+                fixture,
+                &webhook_secret,
+                &webhook_target,
+                WebhookDeliveryGate::Response,
+            )
+            .await
+        }
+        (&Method::POST, "/v1/control/deliver-event-held-request") => {
+            handle_deliver_event(
+                request,
+                fixture,
+                &webhook_secret,
+                &webhook_target,
+                WebhookDeliveryGate::Request,
+            )
+            .await
         }
         (&Method::POST, "/v1/control/release-gate") => {
             let Some(command) = decode_json::<ReleaseGateCommand>(request).await else {
@@ -273,6 +307,16 @@ async fn handle_request(
                 .discard_webhook_response(command.command_sequence, command.gate_id);
             service_result(result)
         }
+        (&Method::POST, "/v1/control/discard-webhook-request") => {
+            let Some(command) = decode_json::<DiscardWebhookRequestCommand>(request).await else {
+                return Ok(text_response(StatusCode::BAD_REQUEST, "invalid command"));
+            };
+            let result = fixture
+                .lock()
+                .await
+                .discard_webhook_request(command.command_sequence, command.gate_id);
+            service_result(result)
+        }
         _ => Ok(text_response(StatusCode::NOT_FOUND, "not found")),
     }
 }
@@ -282,7 +326,7 @@ async fn handle_deliver_event(
     fixture: Arc<Mutex<ManagedFixture>>,
     webhook_secret: &WebhookSigningSecret,
     webhook_target: &WebhookTarget,
-    hold_response: bool,
+    gate: WebhookDeliveryGate,
 ) -> Result<Response<ResponseBody>, ControlHttpError> {
     let Some(command) = decode_json::<DeliverEventCommand>(request).await else {
         return Ok(text_response(StatusCode::BAD_REQUEST, "invalid command"));
@@ -297,7 +341,27 @@ async fn handle_deliver_event(
         Ok(attempt) => attempt,
         Err(error) => return service_result::<crate::SignedWebhookAttempt>(Err(error)),
     };
-    let status = match webhook_target.deliver(&attempt).await {
+    let prepared_request = if gate == WebhookDeliveryGate::Request {
+        match fixture
+            .lock()
+            .await
+            .prepare_webhook_request_gate(&command.event_id)
+        {
+            Ok(prepared) => Some(prepared),
+            Err(error) => return service_result::<serde_json::Value>(Err(error)),
+        }
+    } else {
+        None
+    };
+    let status = match webhook_target
+        .deliver(
+            &attempt,
+            prepared_request
+                .as_ref()
+                .map(super::PreparedWebhookRequestGate::capability),
+        )
+        .await
+    {
         Ok(status) => status,
         Err(WebhookDeliveryError::InvalidBody) => {
             return Ok(text_response(
@@ -307,13 +371,29 @@ async fn handle_deliver_event(
         }
         Err(WebhookDeliveryError::Request(error)) => {
             let _ = error;
+            if let Some(prepared) = &prepared_request {
+                fixture
+                    .lock()
+                    .await
+                    .abort_unforwarded_webhook_request(prepared.gate_id());
+            }
             return Ok(text_response(
                 StatusCode::BAD_GATEWAY,
                 "webhook delivery failed",
             ));
         }
     };
-    if hold_response {
+    if let Some(prepared) = &prepared_request {
+        fixture
+            .lock()
+            .await
+            .abort_unforwarded_webhook_request(prepared.gate_id());
+        return Ok(text_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "webhook request gate was bypassed",
+        ));
+    }
+    if gate == WebhookDeliveryGate::Response {
         let held = fixture
             .lock()
             .await
@@ -335,6 +415,13 @@ async fn handle_deliver_event(
             status,
         },
     )
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum WebhookDeliveryGate {
+    None,
+    Request,
+    Response,
 }
 
 async fn decode_json<T>(request: Request<Incoming>) -> Option<T>
@@ -381,6 +468,7 @@ where
             FixtureServiceError::CommandSequenceExhausted
             | FixtureServiceError::FaultPlanExhausted
             | FixtureServiceError::GateSequenceExhausted
+            | FixtureServiceError::InvalidWebhookRequestGate
             | FixtureServiceError::InvalidWebhookResponseGate
             | FixtureServiceError::Fixture(_)
             | FixtureServiceError::WebhookSignature(_),
@@ -460,6 +548,13 @@ struct ReleaseGateCommand {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DiscardWebhookResponseCommand {
+    command_sequence: u64,
+    gate_id: GateId,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DiscardWebhookRequestCommand {
     command_sequence: u64,
     gate_id: GateId,
 }

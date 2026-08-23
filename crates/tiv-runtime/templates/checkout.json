@@ -1,3 +1,5 @@
 {
-  "TODO": "replace with one synthetic checkout request accepted by the disposable app"
+  "operation_id": "op_checkout",
+  "amount_minor": 2500,
+  "currency": "usd"
 }

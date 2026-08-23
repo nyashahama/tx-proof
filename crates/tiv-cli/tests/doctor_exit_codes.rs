@@ -36,6 +36,7 @@ fn the_binary_preserves_the_doctor_exit_contract() {
             "postgresql://tiv_app:canary@127.0.0.1:15432/tiv_case_checkout",
         )
         .env("TIV_STRIPE_WEBHOOK_SECRET", "whsec_canary")
+        .env("TIV_FIXTURE_CONTROL_TOKEN", "fixture-control-canary")
         .env("PATH", "")
         .output()
         .expect("the tiv binary executes without PATH");

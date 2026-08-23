@@ -82,6 +82,11 @@ async fn handle_request(
     backend: DataPlaneBackend,
     close_connection: Arc<Notify>,
 ) -> Result<Response<ResponseBody>, FixtureHttpError> {
+    if request.method() == Method::POST
+        && request.uri().path() == "/v1/tiv/webhook-request-forwarded"
+    {
+        return handle_webhook_request_forwarded(request, &backend).await;
+    }
     if request.method() == Method::GET
         && let Some(payment_intent_id) = retrieve_payment_intent_id(request.uri().path())
     {
@@ -100,6 +105,59 @@ async fn handle_request(
         return Ok(response(StatusCode::NOT_FOUND, b"not found".as_slice()));
     }
     handle_create(request, &backend, &close_connection).await
+}
+
+async fn handle_webhook_request_forwarded(
+    request: Request<Incoming>,
+    backend: &DataPlaneBackend,
+) -> Result<Response<ResponseBody>, FixtureHttpError> {
+    if request.uri().query().is_some() {
+        return Ok(response(StatusCode::BAD_REQUEST, "unsupported query"));
+    }
+    let Some(capability) = request
+        .headers()
+        .get("X-Tiv-Webhook-Ingress-Capability")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| {
+            value.len() == 64
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+        .map(str::to_owned)
+    else {
+        return Ok(response(
+            StatusCode::FORBIDDEN,
+            "invalid ingress capability",
+        ));
+    };
+    let body = match Limited::new(request.into_body(), MAX_REQUEST_BODY_BYTES)
+        .collect()
+        .await
+    {
+        Ok(body) => body.to_bytes(),
+        Err(_) => return Ok(response(StatusCode::PAYLOAD_TOO_LARGE, "body too large")),
+    };
+    if !body.is_empty() {
+        return Ok(response(
+            StatusCode::BAD_REQUEST,
+            "unsupported callback body",
+        ));
+    }
+    let held = match backend.hold_webhook_request_forwarded(&capability).await {
+        Ok(held) => held,
+        Err(DataPlaneExecutionError::Service(FixtureServiceError::InvalidWebhookRequestGate)) => {
+            return Ok(response(
+                StatusCode::FORBIDDEN,
+                "invalid ingress capability",
+            ));
+        }
+        Err(error) => return Ok(provider_error_response(error)),
+    };
+    held.wait()
+        .await
+        .map_err(|_| FixtureHttpError::HeldResponseCancelled)?;
+    Ok(response(StatusCode::NO_CONTENT, Bytes::new()))
 }
 
 async fn handle_confirm(
@@ -257,6 +315,22 @@ enum DataPlaneBackend {
 }
 
 impl DataPlaneBackend {
+    async fn hold_webhook_request_forwarded(
+        &self,
+        capability: &str,
+    ) -> Result<crate::HeldWebhookRequest, DataPlaneExecutionError> {
+        match self {
+            Self::Managed(fixture) => fixture
+                .lock()
+                .await
+                .hold_webhook_request_forwarded(capability)
+                .map_err(DataPlaneExecutionError::Service),
+            Self::Fixed { .. } => Err(DataPlaneExecutionError::Service(
+                FixtureServiceError::InvalidWebhookRequestGate,
+            )),
+        }
+    }
+
     async fn create_data_plane(
         &self,
         key: IdempotencyKey,

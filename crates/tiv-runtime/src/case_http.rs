@@ -42,14 +42,19 @@ impl CaseHttpAdapter {
         &mut self,
         cut_point: ProcessCutPoint,
     ) -> Result<(), CaseHttpError> {
-        if cut_point == ProcessCutPoint::WebhookResponseObserved {
-            self.webhook
+        match cut_point {
+            ProcessCutPoint::WebhookRequestForwarded => self
+                .webhook
+                .require_forwarded_request()
+                .map_err(CaseHttpError::Webhook),
+            ProcessCutPoint::WebhookResponseObserved => self
+                .webhook
                 .require_observed_response()
-                .map_err(CaseHttpError::Webhook)
-        } else {
-            self.provider
+                .map_err(CaseHttpError::Webhook),
+            _ => self
+                .provider
                 .mark_application_killed(cut_point)
-                .map_err(CaseHttpError::Provider)
+                .map_err(CaseHttpError::Provider),
         }
     }
 
@@ -58,13 +63,25 @@ impl CaseHttpAdapter {
         request: &CaseEffectRequest<'_>,
         cut_point: ProcessCutPoint,
     ) -> Result<(), CaseHttpError> {
-        if cut_point != ProcessCutPoint::WebhookResponseObserved {
+        if !matches!(
+            cut_point,
+            ProcessCutPoint::WebhookRequestForwarded | ProcessCutPoint::WebhookResponseObserved
+        ) {
             return Ok(());
         }
-        self.webhook
-            .discard_observed_response(request)
-            .await
-            .map_err(CaseHttpError::Webhook)?;
+        match cut_point {
+            ProcessCutPoint::WebhookRequestForwarded => self
+                .webhook
+                .discard_forwarded_request(request)
+                .await
+                .map_err(CaseHttpError::Webhook)?,
+            ProcessCutPoint::WebhookResponseObserved => self
+                .webhook
+                .discard_observed_response(request)
+                .await
+                .map_err(CaseHttpError::Webhook)?,
+            _ => unreachable!("the webhook cut-point match is closed above"),
+        }
         self.provider
             .synchronize_control_sequence(self.webhook.control_sequence())
             .map_err(CaseHttpError::Provider)?;
@@ -152,6 +169,16 @@ pub enum CaseHttpError {
     UnsupportedAction,
     #[error("the provider or webhook HTTP boundary is not quiescent")]
     NotQuiescent,
+}
+
+impl CaseHttpError {
+    pub(crate) const fn is_inconclusive(&self) -> bool {
+        match self {
+            Self::Provider(error) => error.is_inconclusive(),
+            Self::Webhook(error) => error.is_inconclusive(),
+            Self::UnsupportedAction | Self::NotQuiescent => false,
+        }
+    }
 }
 
 pub(crate) struct ReferenceCaseHttpCompletion {

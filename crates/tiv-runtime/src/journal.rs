@@ -107,6 +107,8 @@ pub enum ObservationEvent {
     ClientResponseObserved,
     ProviderResponseHeld { gate_id: u64 },
     ProviderResponseReleased { gate_id: u64 },
+    WebhookRequestForwarded { gate_id: u64 },
+    WebhookRequestDiscarded { gate_id: u64 },
     WebhookResponseObserved { gate_id: u64 },
     WebhookResponseDiscarded { gate_id: u64 },
     SqlProbeTrue,
@@ -148,6 +150,8 @@ enum ObservationKind {
     ClientResponseObserved,
     ProviderResponseHeld,
     ProviderResponseReleased,
+    WebhookRequestForwarded,
+    WebhookRequestDiscarded,
     WebhookResponseObserved,
     WebhookResponseDiscarded,
     SqlProbeTrue,
@@ -175,6 +179,14 @@ impl ObservationEvent {
             ),
             Self::ProviderResponseReleased { gate_id } => (
                 ObservationKind::ProviderResponseReleased,
+                ObservationPayload::Gate { gate_id },
+            ),
+            Self::WebhookRequestForwarded { gate_id } => (
+                ObservationKind::WebhookRequestForwarded,
+                ObservationPayload::Gate { gate_id },
+            ),
+            Self::WebhookRequestDiscarded { gate_id } => (
+                ObservationKind::WebhookRequestDiscarded,
                 ObservationPayload::Gate { gate_id },
             ),
             Self::WebhookResponseObserved { gate_id } => (

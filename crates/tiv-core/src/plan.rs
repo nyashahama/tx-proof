@@ -1155,6 +1155,24 @@ impl CampaignSpec {
         self.max_actions
     }
 
+    /// Returns the same validated campaign capabilities with optional
+    /// command-line run bounds applied.
+    #[must_use]
+    pub fn with_run_overrides(
+        &self,
+        campaign_seed: Option<Seed>,
+        case_count: Option<CaseCount>,
+    ) -> Self {
+        let mut overridden = self.clone();
+        if let Some(campaign_seed) = campaign_seed {
+            overridden.campaign_seed = campaign_seed;
+        }
+        if let Some(case_count) = case_count {
+            overridden.case_count = case_count;
+        }
+        overridden
+    }
+
     /// Creates a campaign from validated v1 fault capabilities.
     ///
     /// # Errors

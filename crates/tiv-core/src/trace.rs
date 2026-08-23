@@ -43,6 +43,11 @@ impl ActionId {
     pub const fn new(value: u32) -> Self {
         Self(value)
     }
+
+    #[must_use]
+    pub const fn value(self) -> u32 {
+        self.0
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]

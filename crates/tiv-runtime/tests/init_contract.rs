@@ -42,6 +42,7 @@ fn init_writes_the_exact_fail_closed_v1_scaffold_without_secrets() {
     assert_eq!(config.matches("[[invariants]]").count(), 5);
     assert!(config.contains("TIV_POSTGRES_ADMIN_URL"));
     assert!(config.contains("TIV_STRIPE_WEBHOOK_SECRET"));
+    assert!(config.contains("TIV_FIXTURE_CONTROL_TOKEN"));
     assert!(config.contains("Replace every TODO mapping"));
     for forbidden in ["sk_live_", "rk_live_", "pk_live_", "whsec_"] {
         assert!(!config.contains(forbidden));
@@ -172,6 +173,7 @@ impl EnvironmentLookup for GeneratedConfigEnvironment {
             "TIV_POSTGRES_ADMIN_URL" => Some(database_url("postgres", "admin")),
             "DATABASE_URL" => Some(database_url("tiv_case_checkout", "app")),
             "TIV_STRIPE_WEBHOOK_SECRET" => Some("local-webhook-canary".to_owned()),
+            "TIV_FIXTURE_CONTROL_TOKEN" => Some("run-scoped-control-canary".to_owned()),
             _ => None,
         }
     }

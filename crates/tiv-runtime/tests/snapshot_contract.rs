@@ -156,6 +156,10 @@ fn test_environment() -> TestEnvironment {
             "TIV_STRIPE_WEBHOOK_SECRET".to_owned(),
             "local-webhook-canary".to_owned(),
         ),
+        (
+            "TIV_FIXTURE_CONTROL_TOKEN".to_owned(),
+            "fixture-control-canary".to_owned(),
+        ),
     ]))
 }
 

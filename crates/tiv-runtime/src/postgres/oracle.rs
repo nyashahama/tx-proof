@@ -5,7 +5,10 @@ use tiv_core::{
 };
 use tokio_postgres::{Client, IsolationLevel};
 
-use crate::{case_http::ReferenceCaseHttpCompletion, replay::ReferenceAppReplayCompletion};
+use crate::{
+    case_http::ReferenceCaseHttpCompletion, postgres::quiescence::DatabaseQuiescenceCompletion,
+    replay::ReferenceAppReplayCompletion,
+};
 
 const CHECKPOINT_ID: &str = "checkout-quiescent";
 const PROVIDER_UNIQUENESS_ID: &str = "provider-object-unique";
@@ -41,6 +44,13 @@ impl QuiescencePermit {
 
     pub(crate) const fn after_reference_case_http_quiescent(
         _completion: &ReferenceCaseHttpCompletion,
+    ) -> Self {
+        Self { _private: () }
+    }
+
+    pub(crate) const fn after_configured_case_quiescent(
+        _http_completion: &ReferenceCaseHttpCompletion,
+        _database_completion: DatabaseQuiescenceCompletion,
     ) -> Self {
         Self { _private: () }
     }
