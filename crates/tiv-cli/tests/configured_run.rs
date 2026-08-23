@@ -1287,11 +1287,13 @@ fn rewrite_compatibility_digest_and_reseal(artifact: &Path) {
     let manifest_path = artifact.join("manifest.json");
     let mut manifest: serde_json::Value =
         serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
-    manifest["required_files"]["compatibility.json"] = serde_json::Value::String(
-        blake3::hash(&fs::read(&compatibility_path).unwrap())
-            .to_hex()
-            .to_string(),
-    );
+    let compatibility_digest = blake3::hash(&fs::read(&compatibility_path).unwrap())
+        .to_hex()
+        .to_string();
+    manifest["required_files"]["compatibility.json"] =
+        serde_json::Value::String(compatibility_digest.clone());
+    manifest["provenance"]["compatibility"]["digest"] =
+        serde_json::Value::String(compatibility_digest);
     let required =
         serde_json::from_value::<BTreeMap<String, String>>(manifest["required_files"].clone())
             .unwrap();
