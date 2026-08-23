@@ -571,7 +571,50 @@ Artifacts are built in a private staging directory. The journal begins as recove
   replay.txt
 ```
 
-The manifest binds tool and adapter versions, trace schema, repository commit and relevant dirty hash, Compose hash, container digests, PostgreSQL facts, invariant hashes, config hash, OS/architecture, database identity, fixture image digest, and safety attestation.
+The manifest binds tool and adapter versions, trace schema, repository commit and an explicitly scoped worktree-status fingerprint, Compose hash, container digests, PostgreSQL facts, invariant hashes, config hash, OS/architecture, database identity, fixture image digest, and safety attestation. The status fingerprint is not described as a dirty-content hash: execution-relevant inputs are bound separately through the redacted configuration, compatibility document, and typed authority-file digests.
+
+### Implemented manifest-v2 provenance contract
+
+New configured campaign, replay, and shrink artifacts emit strict manifest
+schema `2`; the verifier continues to accept existing complete schema-`1`
+artifacts. A complete v2 manifest records one typed artifact kind, one coherent
+result, and its exact public exit code. Campaigns may be `held` (`0`) or
+`counterexample` (`10`); replays may be `counterexample` (`10`) or
+`inconclusive` (`4`); shrinks may additionally be `budget_exhausted` (`11`).
+Partial artifacts have no result or exit code and cannot be inspected as
+complete artifacts.
+
+Repository provenance is diagnostic metadata, never mutation authority. It
+records the resolved Git commit, `clean` or `dirty`, and the BLAKE3 digest of
+the exact bytes returned by `git status --porcelain=v1 -z --untracked-files=all
+--ignore-submodules=none`. The manifest tags that digest with format
+`git_porcelain_v1_z` and scope
+`tracked_index_worktree_and_non_ignored_untracked_with_non_recursive_submodules`.
+This binds status codes and paths, including non-ignored untracked entries, but
+does not bind dirty file contents or recursively attest submodule contents.
+Relevant executed configuration remains bound by `config.redacted.json` and
+`compatibility.json`. The bounded Git probe clears the inherited environment,
+keeps only the executable search path and fixed locale/Git controls, suppresses
+Git output from errors, and fails before execution after five seconds or one
+MiB of status output. Capture occurs under the Compose-project lock and, for
+replay and shrink, after compatibility attestation immediately before staging.
+
+The finalizer derives every bound digest from its own indexed-file map. Complete
+artifacts require both the redacted configuration and compatibility document;
+only then may safety state be
+`initial_execution_boundary_attested`. An earlier partial run uses
+`not_reached`. Authority roles are fixed to canonical files:
+`campaign-plan.json`, `cases/case_*/trace.json`, `source.json`,
+`trace.original.json`, and optional `trace.minimized.json`. Replay and shrink
+manifests contain exactly one cryptographic source-artifact identity; campaign
+manifests contain none. The verifier rejects incoherent kind/result/exit-code,
+source-count, role/path/schema, safety, or digest combinations.
+
+These checks provide bounded local integrity and provenance for a finalized
+directory. They are not a signature, transparency log, or hostile same-user
+chain of custody. A same-user filesystem or worktree race remains possible;
+consumers therefore reverify indexed bytes when reading them, and compatibility
+plus the disposable-database safety boundary—not Git metadata—govern execution.
 
 Redaction is structural:
 
@@ -614,8 +657,8 @@ tiv cleanup --run RUN_ID
 
 `tiv inspect PATH` is a synchronous, read-only trust-boundary command. It
 accepts only a finalized complete run directory whose private permissions,
-manifest, bounded file set, exact byte digests, checksum index, and v1
-compatibility document all verify. Partial, corrupt, malformed, oversized, or
+manifest (schema `1` or `2`), bounded file set, exact byte digests, checksum
+index, and v1 compatibility document all verify. Partial, corrupt, malformed, oversized, or
 unsafe artifacts fail with exit `2` and no success document on standard output.
 
 Successful inspection emits a versioned JSON receipt containing only the run

@@ -18,7 +18,10 @@ use tiv_core::{
 };
 
 use crate::{
-    artifacts::{ArtifactError, PartialRunClass, RunArtifactStaging, verify_complete_run_artifact},
+    artifacts::{
+        ArtifactAuthority, ArtifactError, ArtifactKind, ArtifactResult, ManifestSeed,
+        PartialRunClass, RunArtifactStaging, verify_complete_run_artifact,
+    },
     baseline::ConfiguredBaselineSession,
     compatibility::{CompatibilityError, RunCompatibilityV1},
     config::{ConfigError, EnvironmentLookup, ResolvedConfig, load_resolved_config},
@@ -38,6 +41,7 @@ use crate::{
         snapshot::{ConfiguredSnapshot, ConfiguredSnapshotError, load_configured_snapshot},
     },
     reference_case::{ReferenceCaseRunError, preflight_reference_planned_case},
+    repository::capture_repository_provenance,
     run_supervisor::ComposeProjectLock,
 };
 
@@ -330,10 +334,21 @@ pub async fn run_configured_shrink_with_cancellation(
     artifact
         .compatibility()
         .require_exact_match(&current_compatibility)?;
+    let repository = capture_repository_provenance(config.root())
+        .await
+        .map_err(|error| ConfiguredShrinkError::Repository(Box::new(error)))?;
 
     let shrink_id = format!("run_{}", uuid::Uuid::new_v4().simple());
-    let mut artifacts =
-        RunArtifactStaging::create(config.root(), config.artifact_dir(), &shrink_id)?;
+    let mut artifacts = RunArtifactStaging::create_v2(
+        config.root(),
+        config.artifact_dir(),
+        &shrink_id,
+        ManifestSeed::new(
+            ArtifactKind::Shrink,
+            repository,
+            vec![artifact.source_identity()],
+        ),
+    )?;
     artifacts.write_json("config.redacted.json", config.redacted())?;
     artifacts.write_json("compatibility.json", &current_compatibility)?;
     artifacts.write_bytes("trace.original.json", source.original_trace_bytes())?;
@@ -909,7 +924,19 @@ fn finalize_completed_shrink(
         },
     )?;
     let evaluated_candidates = evaluations.len();
-    let artifact_path = artifacts.finalize()?;
+    let mut authorities = vec![
+        ArtifactAuthority::shrink_source(),
+        ArtifactAuthority::original_trace(),
+    ];
+    if best_trace.is_some() {
+        authorities.push(ArtifactAuthority::minimized_trace());
+    }
+    let result = match completion {
+        ConfiguredShrinkCompletion::Complete => ArtifactResult::Counterexample,
+        ConfiguredShrinkCompletion::BudgetExhausted => ArtifactResult::BudgetExhausted,
+        ConfiguredShrinkCompletion::SourceInconclusive => ArtifactResult::Inconclusive,
+    };
+    let artifact_path = artifacts.finalize_complete(result, authorities)?;
     Ok(ConfiguredShrinkOutput {
         schema_version: 1,
         status: "configured_shrink_complete",
@@ -954,16 +981,22 @@ fn finalize_failed_shrink(
             artifact,
         });
     }
-    let artifact_path =
-        match artifacts.finalize_partial(partial_artifact_class(failure_class), failure_code) {
-            Ok(path) => path,
-            Err(artifact) => {
-                return Err(ConfiguredShrinkError::PartialFinalization {
-                    cause: Box::new(cause),
-                    artifact,
-                });
-            }
-        };
+    let artifact_path = match artifacts.finalize_partial_v2(
+        partial_artifact_class(failure_class),
+        failure_code,
+        vec![
+            ArtifactAuthority::shrink_source(),
+            ArtifactAuthority::original_trace(),
+        ],
+    ) {
+        Ok(path) => path,
+        Err(artifact) => {
+            return Err(ConfiguredShrinkError::PartialFinalization {
+                cause: Box::new(cause),
+                artifact,
+            });
+        }
+    };
     Err(ConfiguredShrinkError::RunFailed {
         cause: Box::new(cause),
         artifact_path,
@@ -998,6 +1031,8 @@ pub enum ConfiguredShrinkError {
     Candidate(ShrinkError),
     #[error("configured shrink configuration failed: {0}")]
     Config(#[from] ConfigError),
+    #[error("configured shrink repository provenance failed: {0}")]
+    Repository(#[source] Box<dyn std::error::Error + Send + Sync>),
     #[error("configured shrink SQL probe could not be prepared: {0}")]
     SqlProbe(#[from] ConfiguredSqlProbeError),
     #[error("configured shrink quiescence query could not be prepared: {0}")]
@@ -1057,6 +1092,7 @@ impl ConfiguredShrinkError {
             | Self::SourceArtifact(_)
             | Self::Candidate(_)
             | Self::Config(_)
+            | Self::Repository(_)
             | Self::SqlProbe(_)
             | Self::Quiescence(_)
             | Self::Snapshot(_)
@@ -1090,6 +1126,7 @@ impl ConfiguredShrinkError {
             Self::SourceArtifact(_) => "invalid_source_artifact",
             Self::Candidate(_) => "invalid_candidate",
             Self::Config(_) => "invalid_config",
+            Self::Repository(_) => "repository_provenance",
             Self::SqlProbe(_) => "invalid_sql_probe",
             Self::Quiescence(_) => "invalid_quiescence",
             Self::Snapshot(_) => "invalid_snapshot",

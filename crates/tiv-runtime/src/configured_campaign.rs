@@ -17,7 +17,10 @@ use tiv_core::{
 };
 
 use crate::{
-    artifacts::{ArtifactError, PartialRunClass, RunArtifactStaging},
+    artifacts::{
+        ArtifactAuthority, ArtifactError, ArtifactKind, ArtifactResult, ManifestSeed,
+        PartialRunClass, RunArtifactStaging,
+    },
     baseline::{BaselineError, ConfiguredBaselineSession, ConfiguredCaseResetReport},
     compatibility::{CompatibilityCaptureError, capture_run_compatibility},
     config::{ConfigError, EnvironmentLookup, ResolvedConfig, load_resolved_config},
@@ -39,6 +42,7 @@ use crate::{
         ReferenceCaseRunReceipt, ReferenceShrinkCaseRunReceipt, preflight_reference_planned_case,
         run_configured_planned_case_with_process, run_configured_shrink_candidate_with_process,
     },
+    repository::capture_repository_provenance,
     run_supervisor::{
         ComposeProjectLock, SupervisedCaseOutcome, complete_supervision, supervise_execution,
     },
@@ -243,6 +247,7 @@ pub async fn run_configured_campaign(
 ///
 /// Returns [`ConfiguredCampaignError`] after recovery and partial-evidence
 /// finalization when execution has already entered the mutable run boundary.
+#[allow(clippy::too_many_lines)]
 pub async fn run_configured_campaign_with_cancellation(
     config_path: &Path,
     environment: &impl EnvironmentLookup,
@@ -271,9 +276,17 @@ pub async fn run_configured_campaign_with_cancellation(
     }
     let _project_lock = ComposeProjectLock::try_acquire(config.root(), config.compose_project())
         .map_err(|error| ConfiguredCampaignError::ProjectLock(Box::new(error)))?;
+    let repository = capture_repository_provenance(config.root())
+        .await
+        .map_err(|error| ConfiguredCampaignError::Repository(Box::new(error)))?;
 
     let run_id = format!("run_{}", uuid::Uuid::new_v4().simple());
-    let mut artifacts = RunArtifactStaging::create(config.root(), config.artifact_dir(), &run_id)?;
+    let mut artifacts = RunArtifactStaging::create_v2(
+        config.root(),
+        config.artifact_dir(),
+        &run_id,
+        ManifestSeed::new(ArtifactKind::Campaign, repository, Vec::new()),
+    )?;
     artifacts.write_json("config.redacted.json", config.redacted())?;
     artifacts.write_json("campaign-plan.json", &campaign)?;
     let mut case_results = Vec::with_capacity(campaign.cases().len());
@@ -311,9 +324,20 @@ pub async fn run_configured_campaign_with_cancellation(
                     artifact: Box::new(artifact_error),
                 });
             }
-            let artifact_path = match artifacts
-                .finalize_partial(partial_artifact_class(failure_class), failure_code)
-            {
+            let authorities = match campaign_authorities(&case_results) {
+                Ok(authorities) => authorities,
+                Err(artifact_error) => {
+                    return Err(ConfiguredCampaignError::PartialFinalization {
+                        cause: Box::new(cause),
+                        artifact: Box::new(artifact_error),
+                    });
+                }
+            };
+            let artifact_path = match artifacts.finalize_partial_v2(
+                partial_artifact_class(failure_class),
+                failure_code,
+                authorities,
+            ) {
                 Ok(path) => path,
                 Err(artifact_error) => {
                     return Err(ConfiguredCampaignError::PartialFinalization {
@@ -339,7 +363,12 @@ pub async fn run_configured_campaign_with_cancellation(
         cases: case_results,
     };
     artifacts.write_json("summary.json", &summary)?;
-    let artifact_path = artifacts.finalize()?;
+    let authorities = campaign_authorities(&summary.cases)?;
+    let result = match campaign_verdict {
+        ConfiguredCampaignVerdict::Held => ArtifactResult::Held,
+        ConfiguredCampaignVerdict::Violated => ArtifactResult::Counterexample,
+    };
+    let artifact_path = artifacts.finalize_complete(result, authorities)?;
     Ok(ConfiguredCampaignOutput {
         schema_version: 1,
         status: "campaign_complete",
@@ -864,6 +893,15 @@ struct PartialCampaignSummary<'a> {
     cases: &'a [CaseArtifact],
 }
 
+fn campaign_authorities(cases: &[CaseArtifact]) -> Result<Vec<ArtifactAuthority>, ArtifactError> {
+    let mut authorities = Vec::with_capacity(cases.len() + 1);
+    authorities.push(ArtifactAuthority::campaign_plan());
+    for case in cases {
+        authorities.push(ArtifactAuthority::campaign_case_trace(&case.case_id)?);
+    }
+    Ok(authorities)
+}
+
 const fn partial_status(class: ConfiguredCampaignFailureClass) -> &'static str {
     match class {
         ConfiguredCampaignFailureClass::Configuration
@@ -956,6 +994,8 @@ pub enum ConfiguredCampaignError {
     Options(#[from] ConfiguredCampaignOptionsError),
     #[error("configured campaign configuration failed: {0}")]
     Config(#[from] ConfigError),
+    #[error("configured campaign repository provenance failed: {0}")]
+    Repository(#[source] Box<dyn std::error::Error + Send + Sync>),
     #[error("configured campaign could not be compiled")]
     CampaignCompile(CampaignCompileError),
     #[error("configured SQL probe could not be prepared: {0}")]
@@ -1028,6 +1068,7 @@ impl ConfiguredCampaignError {
         match self {
             Self::Options(_)
             | Self::Config(_)
+            | Self::Repository(_)
             | Self::CampaignCompile(_)
             | Self::SqlProbe(_)
             | Self::Quiescence(_)
@@ -1082,6 +1123,7 @@ impl ConfiguredCampaignError {
         match self {
             Self::Options(_) => "invalid_options",
             Self::Config(_) => "invalid_config",
+            Self::Repository(_) => "repository_provenance",
             Self::CampaignCompile(_) => "campaign_compile",
             Self::SqlProbe(_) => "invalid_sql_probe",
             Self::Quiescence(_) => "invalid_quiescence",

@@ -18,8 +18,8 @@ use tiv_core::{
 
 use crate::{
     artifacts::{
-        ArtifactError, PartialRunClass, RunArtifactStaging, VerifiedRunArtifact,
-        verify_complete_run_artifact,
+        ArtifactAuthority, ArtifactError, ArtifactKind, ArtifactResult, ManifestSeed,
+        PartialRunClass, RunArtifactStaging, VerifiedRunArtifact, verify_complete_run_artifact,
     },
     baseline::{BaselineError, ConfiguredBaselineSession},
     compatibility::{
@@ -41,6 +41,7 @@ use crate::{
         snapshot::{ConfiguredSnapshotError, load_configured_snapshot},
     },
     reference_case::{ReferenceCaseRunError, preflight_reference_planned_case},
+    repository::capture_repository_provenance,
     run_supervisor::ComposeProjectLock,
 };
 
@@ -443,11 +444,22 @@ pub async fn run_configured_replay_with_cancellation(
     if cancellation.is_cancelled() {
         return Err(ConfiguredReplayError::Interrupted);
     }
+    let repository = capture_repository_provenance(config.root())
+        .await
+        .map_err(|error| ConfiguredReplayError::Repository(Box::new(error)))?;
 
     let replay_id = format!("run_{}", uuid::Uuid::new_v4().simple());
-    let mut artifacts =
-        RunArtifactStaging::create(config.root(), config.artifact_dir(), &replay_id)
-            .map_err(ConfiguredReplayError::EvidenceArtifact)?;
+    let mut artifacts = RunArtifactStaging::create_v2(
+        config.root(),
+        config.artifact_dir(),
+        &replay_id,
+        ManifestSeed::new(
+            ArtifactKind::Replay,
+            repository,
+            vec![source.source_identity()],
+        ),
+    )
+    .map_err(ConfiguredReplayError::EvidenceArtifact)?;
     artifacts
         .write_json("config.redacted.json", config.redacted())
         .map_err(ConfiguredReplayError::EvidenceArtifact)?;
@@ -525,8 +537,20 @@ pub async fn run_configured_replay_with_cancellation(
             },
         )
         .map_err(ConfiguredReplayError::EvidenceArtifact)?;
+    let result = match classification {
+        ConfiguredReplayClassification::Stable | ConfiguredReplayClassification::Reproducible => {
+            ArtifactResult::Counterexample
+        }
+        ConfiguredReplayClassification::Inconclusive => ArtifactResult::Inconclusive,
+    };
     let artifact_path = artifacts
-        .finalize()
+        .finalize_complete(
+            result,
+            vec![
+                ArtifactAuthority::replay_source(),
+                ArtifactAuthority::original_trace(),
+            ],
+        )
         .map_err(ConfiguredReplayError::EvidenceArtifact)?;
     Ok(ConfiguredReplayOutput {
         schema_version: 1,
@@ -737,16 +761,22 @@ fn finalize_failed_replay(
             artifact,
         });
     }
-    let artifact_path =
-        match artifacts.finalize_partial(partial_artifact_class(failure_class), failure_code) {
-            Ok(path) => path,
-            Err(artifact) => {
-                return Err(ConfiguredReplayError::PartialFinalization {
-                    cause: Box::new(cause),
-                    artifact,
-                });
-            }
-        };
+    let artifact_path = match artifacts.finalize_partial_v2(
+        partial_artifact_class(failure_class),
+        failure_code,
+        vec![
+            ArtifactAuthority::replay_source(),
+            ArtifactAuthority::original_trace(),
+        ],
+    ) {
+        Ok(path) => path,
+        Err(artifact) => {
+            return Err(ConfiguredReplayError::PartialFinalization {
+                cause: Box::new(cause),
+                artifact,
+            });
+        }
+    };
     Err(ConfiguredReplayError::RunFailed {
         cause: Box::new(cause),
         artifact_path,
@@ -775,6 +805,15 @@ fn load_recorded_case(
     artifact: &VerifiedRunArtifact,
     options: ConfiguredReplayOptions,
 ) -> Result<RecordedConfiguredCase, ConfiguredReplayArtifactError> {
+    if artifact
+        .artifact_kind()
+        .is_some_and(|kind| kind != ArtifactKind::Campaign)
+        || artifact
+            .artifact_result()
+            .is_some_and(|result| result != ArtifactResult::Counterexample)
+    {
+        return Err(ConfiguredReplayArtifactError::InvalidCampaignSummary);
+    }
     let campaign_bytes = artifact.read_indexed_bytes(std::path::Path::new("campaign-plan.json"))?;
     let campaign: CampaignPlan = serde_json::from_slice(&campaign_bytes).map_err(|source| {
         ConfiguredReplayArtifactError::Decode {
@@ -836,6 +875,15 @@ fn load_recorded_case(
 pub(crate) fn load_verified_configured_replay_source(
     artifact: &VerifiedRunArtifact,
 ) -> Result<VerifiedConfiguredReplaySource, ConfiguredReplayArtifactError> {
+    if artifact
+        .artifact_kind()
+        .is_some_and(|kind| kind != ArtifactKind::Replay)
+        || artifact
+            .artifact_result()
+            .is_some_and(|result| result != ArtifactResult::Counterexample)
+    {
+        return Err(ConfiguredReplayArtifactError::InvalidReplaySummary);
+    }
     let source_path = PathBuf::from("source.json");
     let source: ReplaySourceDocument = decode_indexed(artifact, &source_path)?;
     let summary_path = PathBuf::from("summary.json");
@@ -1238,6 +1286,8 @@ pub enum ConfiguredReplayError {
     SourceArtifact(#[from] ConfiguredReplayArtifactError),
     #[error("configured replay configuration failed: {0}")]
     Config(#[from] ConfigError),
+    #[error("configured replay repository provenance failed: {0}")]
+    Repository(#[source] Box<dyn std::error::Error + Send + Sync>),
     #[error("configured replay SQL probe could not be prepared: {0}")]
     SqlProbe(#[from] ConfiguredSqlProbeError),
     #[error("configured replay quiescence query could not be prepared: {0}")]
@@ -1289,6 +1339,7 @@ impl ConfiguredReplayError {
             Self::Options(_)
             | Self::SourceArtifact(_)
             | Self::Config(_)
+            | Self::Repository(_)
             | Self::SqlProbe(_)
             | Self::Quiescence(_)
             | Self::Snapshot(_)
@@ -1331,6 +1382,7 @@ impl ConfiguredReplayError {
             Self::Options(_) => "invalid_options",
             Self::SourceArtifact(_) => "invalid_source_artifact",
             Self::Config(_) => "invalid_config",
+            Self::Repository(_) => "repository_provenance",
             Self::SqlProbe(_) => "invalid_sql_probe",
             Self::Quiescence(_) => "invalid_quiescence",
             Self::Snapshot(_) => "invalid_snapshot",

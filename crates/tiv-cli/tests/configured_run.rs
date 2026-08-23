@@ -23,6 +23,7 @@ const ARTIFACT_ROOT: &str = concat!(
 
 #[tokio::test]
 #[ignore = "requires the isolated reference-app Compose project"]
+#[allow(clippy::too_many_lines)]
 async fn configured_run_executes_a_real_case_and_finalizes_private_evidence() {
     let _guard = E2E_LOCK.lock().await;
     prepare_reference_baseline().await;
@@ -51,6 +52,27 @@ async fn configured_run_executes_a_real_case_and_finalizes_private_evidence() {
     );
 
     let artifact_path = Path::new(receipt["artifact_path"].as_str().unwrap());
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(artifact_path.join("manifest.json")).unwrap()).unwrap();
+    assert_eq!(manifest["schema_version"], 2);
+    assert_eq!(manifest["artifact"]["kind"], "configured_campaign");
+    assert_eq!(
+        manifest["artifact"]["result"],
+        if receipt["verdict"] == "violated" {
+            "counterexample"
+        } else {
+            "held"
+        }
+    );
+    assert_eq!(manifest["artifact"]["exit_code"], code.unwrap());
+    assert_eq!(
+        manifest["provenance"]["source_artifacts"],
+        serde_json::json!([])
+    );
+    assert_eq!(
+        manifest["provenance"]["safety"]["state"],
+        "initial_execution_boundary_attested"
+    );
     assert!(artifact_path.join("manifest.json").is_file());
     assert!(artifact_path.join("compatibility.json").is_file());
     assert!(artifact_path.join("campaign-plan.json").is_file());
@@ -168,6 +190,23 @@ async fn configured_replay_reproduces_one_verified_failure_three_times() {
 
     let replay_path = Path::new(replay_receipt["artifact_path"].as_str().unwrap());
     verify_complete_run_artifact(replay_path).unwrap();
+    let replay_manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(replay_path.join("manifest.json")).unwrap()).unwrap();
+    assert_eq!(replay_manifest["schema_version"], 2);
+    assert_eq!(replay_manifest["artifact"]["kind"], "configured_replay");
+    assert_eq!(replay_manifest["artifact"]["result"], "counterexample");
+    assert_eq!(replay_manifest["artifact"]["exit_code"], 10);
+    assert_eq!(
+        replay_manifest["provenance"]["source_artifacts"][0]["run_id"],
+        source_receipt["run_id"]
+    );
+    assert_eq!(
+        replay_manifest["provenance"]["source_artifacts"][0]["manifest_digest"]
+            .as_str()
+            .unwrap()
+            .len(),
+        64
+    );
     let summary: serde_json::Value =
         serde_json::from_slice(&fs::read(replay_path.join("summary.json")).unwrap()).unwrap();
     let attempts = summary["attempts"].as_array().unwrap();
@@ -282,6 +321,26 @@ async fn configured_shrink_evaluates_one_replayed_candidate_and_finalizes_eviden
 
     let shrink_path = Path::new(shrink_receipt["artifact_path"].as_str().unwrap());
     verify_complete_run_artifact(shrink_path).unwrap();
+    let shrink_manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(shrink_path.join("manifest.json")).unwrap()).unwrap();
+    assert_eq!(shrink_manifest["schema_version"], 2);
+    assert_eq!(shrink_manifest["artifact"]["kind"], "configured_shrink");
+    assert_eq!(
+        shrink_manifest["artifact"]["result"],
+        if shrink_receipt["completion"] == "budget_exhausted" {
+            "budget_exhausted"
+        } else {
+            "counterexample"
+        }
+    );
+    assert_eq!(
+        shrink_manifest["artifact"]["exit_code"],
+        shrink_output.status.code().unwrap()
+    );
+    assert_eq!(
+        shrink_manifest["provenance"]["source_artifacts"][0]["run_id"],
+        replay_receipt["replay_id"]
+    );
     assert_eq!(
         fs::read(shrink_path.join("trace.original.json")).unwrap(),
         fs::read(replay_path.join("trace.original.json")).unwrap()
