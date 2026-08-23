@@ -496,7 +496,7 @@ Preferred reset:
 
 PostgreSQL requires no connected sessions on the template source while copying. Template cloning is therefore a capability proven by `doctor`, not an assumption.
 
-Fallback reset uses a custom-format `pg_dump` and `pg_restore --single-transaction --exit-on-error`. `doctor` verifies client/server version compatibility. The baseline dump is trusted local test input, mode `0600`, excluded from CI artifacts, and deleted by cleanup.
+Fallback reset uses a custom-format `pg_dump` and `pg_restore --single-transaction --exit-on-error`. `doctor` verifies client/server version compatibility. The baseline dump is trusted local test input, mode `0600`, excluded from CI artifacts, and deleted by the process-owned `BaselineArchive` lifecycle. The artifact-only `tiv cleanup` command does not scan or recover temporary baseline archives.
 
 Transactions, exported snapshots, copied live volumes, and rollback of one connection are not accepted as whole-application reset strategies.
 
@@ -650,7 +650,7 @@ tiv replay configured --artifact PATH [--config tiv.toml] --case N
 tiv replay minimized --artifact SHRINK_PATH [--config tiv.toml]
 tiv shrink configured --artifact REPLAY_PATH [--config tiv.toml] [--max-candidates N] [--max-time 10m]
 tiv inspect PATH
-tiv cleanup --run RUN_ID
+tiv cleanup --run RUN_ID [--config tiv.toml]
 ```
 
 `replay` fails before mutation if the compatibility fingerprint is missing or incompatible. `inspect` never executes customer code.
@@ -669,6 +669,42 @@ load project configuration, inspect evidence payloads, contact Docker or
 PostgreSQL, or execute customer code. Paths, compatibility contents, summary
 contents, filenames, and digests are deliberately excluded from the public
 receipt so that inspection cannot turn secret-bearing evidence into CLI output.
+
+### Implemented exact-run artifact cleanup contract
+
+`tiv cleanup --run RUN_ID [--config tiv.toml]` is an explicit, idempotent
+artifact-deletion command. `RUN_ID` is parsed with the existing run-identity
+grammar; paths, separators, staging names, globs, uppercase text, and traversal
+are rejected. The selected target is always derived as the exact child
+`<configured artifact_dir>/<run-id>` after loading the configuration. Cleanup
+does not create a missing artifact directory.
+
+Before deletion, cleanup acquires the configured Compose-project lock, rejects
+the repository root as an artifact base, rejects any symlinked or non-private
+artifact-directory component, refuses a matching staging directory, and runs
+the complete-artifact verifier over the target.
+Partial, corrupt, malformed, oversized, permission-unsafe, or otherwise
+unverifiable evidence is preserved with exit `2`. A held project lock or an I/O
+failure exits `3` without a success receipt.
+
+The runtime scans only verified complete sibling artifacts in the same
+configured artifact directory. If a manifest-v2 sibling cryptographically
+identifies the selected run as its source, cleanup refuses to remove that
+source. A verified, unreferenced target is removed, the parent directory is
+synced, and success is reported only after the exact path is absent. A missing
+target is a successful `already_absent` no-op, so retrying the same command is
+safe. The versioned JSON receipt contains only `status` and `run_id`; it never
+prints configuration or filesystem paths.
+
+This v0 command is intentionally artifact-only. It never invokes Docker,
+Compose, PostgreSQL, baseline reset, or temporary-archive recovery; it never
+deletes staging, partial, or corrupt evidence; and it does not implement
+age-based retention, global graph traversal, `--force`, or cross-artifact-root
+reference discovery. Baseline dump files remain process-owned temporary data
+removed by their existing lifecycle. Same-user filesystem replacement races
+remain outside the local-integrity threat model, and an operating-system error
+during recursive removal can leave an incomplete target that later cleanup
+will refuse rather than misreport as successfully removed.
 
 ### Implemented configured-shrink contract
 

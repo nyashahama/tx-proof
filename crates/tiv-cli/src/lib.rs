@@ -16,6 +16,7 @@ use tiv_core::{
 use tiv_runtime::{
     artifacts::{ArtifactError, verify_complete_run_artifact},
     baseline::{BaselineError, run_configured_baseline},
+    cleanup::{CleanupError, CleanupOptions, cleanup_configured_run},
     config::{ConfigError, ProcessEnvironment, load_resolved_config},
     configured_campaign::{
         ConfiguredCampaignError, ConfiguredCampaignOptions, ConfiguredCampaignOptionsError,
@@ -110,6 +111,8 @@ pub enum Command {
     Run(RunArgs),
     /// Verify one complete run artifact without executing customer code.
     Inspect { path: PathBuf },
+    /// Remove one exact, verified, unreferenced complete run artifact.
+    Cleanup(CleanupArgs),
     /// Inspect replay readiness without executing customer code.
     Replay {
         #[command(subcommand)]
@@ -125,6 +128,16 @@ pub enum Command {
         #[command(subcommand)]
         command: TraceCommand,
     },
+}
+
+#[derive(Clone, Debug, PartialEq, Args)]
+pub struct CleanupArgs {
+    /// Typed TOML configuration that owns the private artifact directory.
+    #[arg(long, default_value = "tiv.toml")]
+    pub config: PathBuf,
+    /// Exact run identifier; artifact paths and staging names are rejected.
+    #[arg(long)]
+    pub run: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Args)]
@@ -331,6 +344,11 @@ pub fn execute(cli: Cli) -> Result<String, CliError> {
                 indexed_file_count: verified.indexed_file_count(),
             };
             serde_json::to_string(&receipt).map_err(CliError::Encode)
+        }
+        Command::Cleanup(args) => {
+            let options = CleanupOptions::new(args.run)?;
+            let receipt = cleanup_configured_run(&args.config, &ProcessEnvironment, &options)?;
+            receipt.to_pretty_json().map_err(CliError::Encode)
         }
         Command::Doctor(_)
         | Command::Baseline(_)
@@ -677,6 +695,8 @@ pub enum CliError {
     ConfiguredShrink(#[from] ConfiguredShrinkError),
     #[error("run artifact inspection failed: {0}")]
     Artifact(#[from] ArtifactError),
+    #[error("run artifact cleanup failed: {0}")]
+    Cleanup(#[from] CleanupError),
     #[error("the system clock could not produce a valid webhook timestamp")]
     InvalidSystemTime,
     #[error("reference app replay configuration is invalid: {0}")]
@@ -703,6 +723,7 @@ impl CliError {
             Self::ConfiguredReplay(error) => error.exit_code(),
             Self::ConfiguredMinimizedReplay(error) => error.exit_code(),
             Self::ConfiguredShrink(error) => error.exit_code(),
+            Self::Cleanup(error) => error.exit_code(),
             _ => 2,
         }
     }
@@ -710,7 +731,10 @@ impl CliError {
 
 #[cfg(test)]
 mod tests {
-    use tiv_runtime::configured_campaign::{ConfiguredCampaignError, ConfiguredCampaignVerdict};
+    use tiv_runtime::{
+        cleanup::CleanupError,
+        configured_campaign::{ConfiguredCampaignError, ConfiguredCampaignVerdict},
+    };
 
     use super::{CliError, run_verdict_exit_code};
 
@@ -738,5 +762,11 @@ mod tests {
         assert_eq!(infrastructure.exit_code(), 3);
         assert_eq!(inconclusive.exit_code(), 4);
         assert_eq!(interrupted.exit_code(), 130);
+    }
+
+    #[test]
+    fn cleanup_keeps_safety_refusals_distinct_from_infrastructure_failures() {
+        assert_eq!(CliError::Cleanup(CleanupError::InvalidRunId).exit_code(), 2);
+        assert_eq!(CliError::Cleanup(CleanupError::ProjectBusy).exit_code(), 3);
     }
 }

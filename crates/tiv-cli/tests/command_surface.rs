@@ -2,9 +2,9 @@ use std::time::Duration;
 
 use clap::Parser;
 use tiv_cli::{
-    BaselineArgs, Cli, Command, ConfiguredReplayArgs, ConfiguredShrinkArgs, DoctorArgs,
-    MinimizedReplayArgs, ReferenceAppCaseArgs, ReferenceAppEvidenceArgs, ReferenceAppReplayArgs,
-    ReplayCommand, RunArgs, ShrinkCommand, TraceCommand,
+    BaselineArgs, CleanupArgs, Cli, Command, ConfiguredReplayArgs, ConfiguredShrinkArgs,
+    DoctorArgs, MinimizedReplayArgs, ReferenceAppCaseArgs, ReferenceAppEvidenceArgs,
+    ReferenceAppReplayArgs, ReplayCommand, RunArgs, ShrinkCommand, TraceCommand,
 };
 
 #[test]
@@ -109,6 +109,39 @@ fn the_cli_exposes_read_only_complete_artifact_inspection() {
             path: ".tiv/runs/run_deadbeef".into(),
         }
     );
+}
+
+#[test]
+fn the_cli_exposes_exact_run_cleanup_with_a_safe_default_config_path() {
+    let default = Cli::try_parse_from(["tiv", "cleanup", "--run", "run_deadbeef"])
+        .expect("the cleanup command parses");
+    assert_eq!(
+        default.command,
+        Command::Cleanup(CleanupArgs {
+            config: "tiv.toml".into(),
+            run: "run_deadbeef".to_owned(),
+        })
+    );
+
+    let explicit = Cli::try_parse_from([
+        "tiv",
+        "cleanup",
+        "--config",
+        "safe/tiv.toml",
+        "--run",
+        "run_0123abcd",
+    ])
+    .expect("the configured cleanup command parses");
+    assert_eq!(
+        explicit.command,
+        Command::Cleanup(CleanupArgs {
+            config: "safe/tiv.toml".into(),
+            run: "run_0123abcd".to_owned(),
+        })
+    );
+
+    assert!(Cli::try_parse_from(["tiv", "cleanup"]).is_err());
+    assert!(Cli::try_parse_from(["tiv", "cleanup", "--run", "run_a", "extra"]).is_err());
 }
 
 #[test]

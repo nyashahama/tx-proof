@@ -852,6 +852,7 @@ struct VerifiedManifest {
     required_files: BTreeMap<String, String>,
     artifact_kind: Option<ArtifactKind>,
     artifact_result: Option<ArtifactResult>,
+    source_artifacts: Vec<SourceArtifactIdentity>,
     authorities: Vec<BoundAuthorityV2>,
 }
 
@@ -871,6 +872,7 @@ pub struct VerifiedRunArtifact {
     compatibility_digest: String,
     artifact_kind: Option<ArtifactKind>,
     artifact_result: Option<ArtifactResult>,
+    source_artifacts: Vec<SourceArtifactIdentity>,
     authorities: Vec<BoundAuthorityV2>,
     compatibility: RunCompatibilityV1,
     required_files: BTreeMap<String, String>,
@@ -906,6 +908,12 @@ impl VerifiedRunArtifact {
             checksums_digest: self.checksums_digest.clone(),
             compatibility_digest: self.compatibility_digest.clone(),
         }
+    }
+
+    pub(crate) fn references_source(&self, source: &SourceArtifactIdentity) -> bool {
+        self.source_artifacts
+            .iter()
+            .any(|candidate| candidate == source)
     }
 
     pub(crate) fn read_unique_authority_bytes(
@@ -1088,6 +1096,7 @@ pub fn verify_complete_run_artifact(root: &Path) -> Result<VerifiedRunArtifact, 
         compatibility_digest,
         artifact_kind: manifest.artifact_kind,
         artifact_result: manifest.artifact_result,
+        source_artifacts: manifest.source_artifacts,
         authorities: manifest.authorities,
         compatibility,
         required_files,
@@ -1126,6 +1135,7 @@ fn decode_complete_manifest(
                 required_files: manifest.required_files,
                 artifact_kind: None,
                 artifact_result: None,
+                source_artifacts: Vec::new(),
                 authorities: Vec::new(),
             })
         }
@@ -1158,6 +1168,7 @@ fn decode_complete_manifest(
                 required_files: manifest.required_files,
                 artifact_kind: Some(manifest.artifact.kind),
                 artifact_result: manifest.artifact.result,
+                source_artifacts: manifest.provenance.source_artifacts,
                 authorities: manifest.provenance.authorities,
             })
         }
@@ -1277,7 +1288,7 @@ fn load_compatibility(root: &Path) -> Result<RunCompatibilityV1, ArtifactError> 
     RunCompatibilityV1::from_json(bytes).map_err(ArtifactError::Compatibility)
 }
 
-fn validate_run_id(run_id: &str) -> Result<(), ArtifactError> {
+pub(crate) fn validate_run_id(run_id: &str) -> Result<(), ArtifactError> {
     if !(run_id.starts_with("run_")
         && (5..=80).contains(&run_id.len())
         && run_id
