@@ -444,7 +444,6 @@ fn sql_probe_kill_restarts_and_finishes_the_live_case() {
             "postgresql://tiv_app:tiv-app-local-only-password@127.0.0.1:15432/tiv_case_checkout",
         )
         .env("TIV_STRIPE_WEBHOOK_SECRET", "whsec_reference-canary")
-        .env("TIV_FIXTURE_CONTROL_TOKEN", "fixture-control-token")
         .env("DOCKER_HOST", "tcp://127.0.0.1:9")
         .env("DOCKER_CONTEXT", "intentionally-remote")
         .env("HTTP_PROXY", "http://127.0.0.1:9")
