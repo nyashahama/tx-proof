@@ -239,6 +239,7 @@ pub struct VerifiedRunArtifact {
     root: PathBuf,
     run_id: String,
     compatibility: RunCompatibilityV1,
+    required_files: BTreeMap<String, String>,
 }
 
 impl VerifiedRunArtifact {
@@ -260,6 +261,49 @@ impl VerifiedRunArtifact {
     #[must_use]
     pub const fn compatibility(&self) -> &RunCompatibilityV1 {
         &self.compatibility
+    }
+
+    pub(crate) fn read_indexed_bytes(&self, relative: &Path) -> Result<Vec<u8>, ArtifactError> {
+        let relative = validate_relative(relative)?;
+        let key = relative
+            .to_str()
+            .ok_or_else(|| ArtifactError::UnsafePath(relative.to_owned()))?;
+        let expected = self
+            .required_files
+            .get(key)
+            .ok_or_else(|| ArtifactError::MissingRequiredArtifact(relative.to_owned()))?;
+        let path = self.root.join(relative);
+        let metadata = fs::symlink_metadata(&path).map_err(|source| ArtifactError::Io {
+            path: path.clone(),
+            source,
+        })?;
+        if metadata.file_type().is_symlink()
+            || !metadata.is_file()
+            || metadata.permissions().mode() & 0o777 != FILE_MODE
+        {
+            return Err(ArtifactError::UnsafePath(path));
+        }
+        if metadata.len() > MAX_RUN_BYTES {
+            return Err(ArtifactError::ArtifactTooLarge);
+        }
+        let file = File::open(&path).map_err(|source| ArtifactError::Io {
+            path: path.clone(),
+            source,
+        })?;
+        let mut bytes = Vec::new();
+        file.take(MAX_RUN_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|source| ArtifactError::Io {
+                path: path.clone(),
+                source,
+            })?;
+        if u64::try_from(bytes.len()).map_or(true, |size| size > MAX_RUN_BYTES) {
+            return Err(ArtifactError::ArtifactTooLarge);
+        }
+        if checksum_bytes(&bytes) != *expected {
+            return Err(ArtifactError::DigestMismatch(relative.to_owned()));
+        }
+        Ok(bytes)
     }
 }
 
@@ -352,11 +396,13 @@ pub fn verify_complete_run_artifact(root: &Path) -> Result<VerifiedRunArtifact, 
         return Err(ArtifactError::ChecksumIndexMismatch);
     }
     let compatibility = load_compatibility(root)?;
+    let required_files = manifest.required_files.clone();
 
     Ok(VerifiedRunArtifact {
         root: root.to_owned(),
         run_id: manifest.run_id,
         compatibility,
+        required_files,
     })
 }
 
@@ -724,6 +770,46 @@ mod tests {
         assert!(matches!(
             verify_complete_run_artifact(&final_path),
             Err(ArtifactError::ChecksumsDigestMismatch)
+        ));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn verified_artifact_rechecks_only_manifest_indexed_files_when_they_are_loaded() {
+        let root = std::env::temp_dir().join(format!("tiv-artifact-{}", Uuid::new_v4()));
+        fs::create_dir(&root).unwrap();
+        let base = root.join(".tiv/runs");
+        let mut staging = RunArtifactStaging::create(&root, &base, "run_indexed_read").unwrap();
+        staging
+            .write_json("summary.json", &serde_json::json!({"status": "held"}))
+            .unwrap();
+        staging
+            .write_json("compatibility.json", &compatibility_fixture())
+            .unwrap();
+        let final_path = staging.finalize().unwrap();
+        let verified = verify_complete_run_artifact(&final_path).unwrap();
+
+        assert_eq!(
+            verified
+                .read_indexed_bytes(Path::new("summary.json"))
+                .unwrap(),
+            fs::read(final_path.join("summary.json")).unwrap()
+        );
+        assert!(matches!(
+            verified.read_indexed_bytes(Path::new("not-indexed.json")),
+            Err(ArtifactError::MissingRequiredArtifact(ref path))
+                if path == Path::new("not-indexed.json")
+        ));
+
+        fs::write(
+            final_path.join("summary.json"),
+            b"{\"status\":\"changed\"}\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            verified.read_indexed_bytes(Path::new("summary.json")),
+            Err(ArtifactError::DigestMismatch(ref path)) if path == Path::new("summary.json")
         ));
 
         fs::remove_dir_all(root).unwrap();

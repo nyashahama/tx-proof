@@ -20,6 +20,10 @@ use tiv_runtime::{
         ConfiguredCampaignError, ConfiguredCampaignOptions, ConfiguredCampaignOptionsError,
         ConfiguredCampaignVerdict, RunCancellation, run_configured_campaign_with_cancellation,
     },
+    configured_replay::{
+        ConfiguredReplayError, ConfiguredReplayOptions, ConfiguredReplayOptionsError,
+        run_configured_replay_with_cancellation,
+    },
     doctor::{DoctorError, run_doctor},
     init::{InitError, initialize_project},
     postgres::{
@@ -134,12 +138,27 @@ pub struct RunArgs {
 pub enum ReplayCommand {
     /// Compile a trace into the runtime replay plan without executing it.
     Inspect { path: PathBuf },
+    /// Replay one violating case from a verified configured-run artifact.
+    Configured(ConfiguredReplayArgs),
     /// Execute the committed reference-app checkout path against loopback services.
     ReferenceApp(ReferenceAppReplayArgs),
     /// Run three fresh-baseline reference attempts into bounded evidence.
     ReferenceAppEvidence(ReferenceAppEvidenceArgs),
     /// Execute one compiled serial case through the attested reference stack.
     ReferenceAppCase(ReferenceAppCaseArgs),
+}
+
+#[derive(Clone, Debug, PartialEq, Args)]
+pub struct ConfiguredReplayArgs {
+    /// Complete configured-run artifact containing the recorded case.
+    #[arg(long)]
+    pub artifact: PathBuf,
+    /// Typed TOML configuration for the same disposable customer stack.
+    #[arg(long, default_value = "tiv.toml")]
+    pub config: PathBuf,
+    /// One-based recorded campaign case to replay exactly three times.
+    #[arg(long)]
+    pub case: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Args)]
@@ -245,7 +264,8 @@ pub fn execute(cli: Cli) -> Result<String, CliError> {
             command:
                 ReplayCommand::ReferenceApp(_)
                 | ReplayCommand::ReferenceAppEvidence(_)
-                | ReplayCommand::ReferenceAppCase(_),
+                | ReplayCommand::ReferenceAppCase(_)
+                | ReplayCommand::Configured(_),
         } => Err(CliError::AsyncCommand),
         Command::Trace {
             command: TraceCommand::Validate { path },
@@ -295,6 +315,22 @@ pub async fn execute_async_with_cancellation(
             let body = output.to_pretty_json().map_err(CliError::Encode)?;
             Ok(CliOutput { body, exit_code })
         }
+        Command::Replay {
+            command: ReplayCommand::Configured(args),
+        } => {
+            let options = ConfiguredReplayOptions::new(args.case)?;
+            let output = Box::pin(run_configured_replay_with_cancellation(
+                &args.artifact,
+                &args.config,
+                &ProcessEnvironment,
+                options,
+                cancellation,
+            ))
+            .await?;
+            let exit_code = output.classification().exit_code();
+            let body = output.to_pretty_json().map_err(CliError::Encode)?;
+            Ok(CliOutput { body, exit_code })
+        }
         command => execute_async_text(Cli { command })
             .await
             .map(CliOutput::success),
@@ -317,7 +353,10 @@ async fn execute_async_text(cli: Cli) -> Result<String, CliError> {
             .await?;
             output.to_pretty_json().map_err(CliError::Encode)
         }
-        Command::Run(_) => Err(CliError::AsyncCommand),
+        Command::Run(_)
+        | Command::Replay {
+            command: ReplayCommand::Configured(_),
+        } => Err(CliError::AsyncCommand),
         Command::Replay {
             command: ReplayCommand::ReferenceApp(args),
         } => {
@@ -493,6 +532,10 @@ pub enum CliError {
     ConfiguredCampaignOptions(#[from] ConfiguredCampaignOptionsError),
     #[error("configured campaign failed: {0}")]
     ConfiguredCampaign(#[from] ConfiguredCampaignError),
+    #[error("configured replay options are invalid: {0}")]
+    ConfiguredReplayOptions(#[from] ConfiguredReplayOptionsError),
+    #[error("configured replay failed: {0}")]
+    ConfiguredReplay(#[from] ConfiguredReplayError),
     #[error("the system clock could not produce a valid webhook timestamp")]
     InvalidSystemTime,
     #[error("reference app replay configuration is invalid: {0}")]
@@ -516,6 +559,7 @@ impl CliError {
             Self::Doctor(error) if error.is_infrastructure_failure() => 3,
             Self::Baseline(error) if error.is_infrastructure_failure() => 3,
             Self::ConfiguredCampaign(error) => error.exit_code(),
+            Self::ConfiguredReplay(error) => error.exit_code(),
             _ => 2,
         }
     }

@@ -762,6 +762,26 @@ impl CompiledCaseTrace {
             .find(|captured| captured.output_ref == output_ref)
             .map(|captured| &captured.value)
     }
+
+    /// Checks that a fresh execution followed this compiled replay authority.
+    ///
+    /// The complete validated planned case and every durable provider/event ID
+    /// must match. Provider gate IDs are deliberately excluded: they are
+    /// single-use, process-local fixture capabilities and must be freshly
+    /// rebound rather than replayed after reset.
+    #[must_use]
+    pub fn matches_replay_authority(&self, executed: &Self) -> bool {
+        self.schema_version == executed.schema_version
+            && self.planned_case == executed.planned_case
+            && self.actions == executed.actions
+            && self
+                .captured
+                .iter()
+                .filter(|captured| !matches!(captured.value, CaseCapturedValue::ProviderGateId(_)))
+                .eq(executed.captured.iter().filter(|captured| {
+                    !matches!(captured.value, CaseCapturedValue::ProviderGateId(_))
+                }))
+    }
 }
 
 #[derive(Clone, Copy)]

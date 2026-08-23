@@ -1,13 +1,19 @@
 use std::process::ExitCode;
 
 use clap::Parser;
-use tiv_cli::{Cli, Command, execute_async, execute_async_with_cancellation};
+use tiv_cli::{Cli, Command, ReplayCommand, execute_async, execute_async_with_cancellation};
 use tiv_runtime::configured_campaign::RunCancellation;
 
 #[tokio::main]
 async fn main() -> ExitCode {
     let cli = Cli::parse();
-    let result = if matches!(&cli.command, Command::Run(_)) {
+    let result = if matches!(
+        &cli.command,
+        Command::Run(_)
+            | Command::Replay {
+                command: ReplayCommand::Configured(_)
+            }
+    ) {
         let cancellation = RunCancellation::new();
         let signal_cancellation = cancellation.clone();
         let mut signal_task = tokio::spawn(async move {

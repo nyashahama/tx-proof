@@ -1,7 +1,7 @@
 use clap::Parser;
 use tiv_cli::{
-    BaselineArgs, Cli, Command, DoctorArgs, ReferenceAppCaseArgs, ReferenceAppEvidenceArgs,
-    ReferenceAppReplayArgs, ReplayCommand, RunArgs, TraceCommand,
+    BaselineArgs, Cli, Command, ConfiguredReplayArgs, DoctorArgs, ReferenceAppCaseArgs,
+    ReferenceAppEvidenceArgs, ReferenceAppReplayArgs, ReplayCommand, RunArgs, TraceCommand,
 };
 
 #[test]
@@ -122,6 +122,61 @@ fn the_cli_exposes_read_only_replay_inspection_for_compiled_traces() {
                 path: "compiled-trace.json".into(),
             },
         }
+    );
+}
+
+#[test]
+fn the_cli_exposes_exactly_three_attempts_for_one_configured_artifact_case() {
+    let cli = Cli::try_parse_from([
+        "tiv",
+        "replay",
+        "configured",
+        "--artifact",
+        ".tiv/runs/run_1234",
+        "--config",
+        "safe/tiv.toml",
+        "--case",
+        "7",
+    ])
+    .expect("the compatibility-gated configured replay command parses");
+
+    assert_eq!(
+        cli.command,
+        Command::Replay {
+            command: ReplayCommand::Configured(ConfiguredReplayArgs {
+                artifact: ".tiv/runs/run_1234".into(),
+                config: "safe/tiv.toml".into(),
+                case: 7,
+            }),
+        }
+    );
+    assert!(
+        Cli::try_parse_from([
+            "tiv",
+            "replay",
+            "configured",
+            "--artifact",
+            ".tiv/runs/run_1234",
+            "--config",
+            "safe/tiv.toml",
+        ])
+        .is_err()
+    );
+    assert!(
+        Cli::try_parse_from([
+            "tiv",
+            "replay",
+            "configured",
+            "--artifact",
+            ".tiv/runs/run_1234",
+            "--config",
+            "safe/tiv.toml",
+            "--case",
+            "7",
+            "--attempts",
+            "1",
+        ])
+        .is_err()
     );
 }
 

@@ -1,4 +1,7 @@
-use std::{fs, os::unix::fs::PermissionsExt, path::Path, process::Command};
+use std::{
+    collections::BTreeMap, fmt::Write as _, fs, os::unix::fs::PermissionsExt, path::Path,
+    process::Command,
+};
 
 use tiv_runtime::{artifacts::verify_complete_run_artifact, compatibility::RunCompatibilityV1};
 use tokio_postgres::NoTls;
@@ -122,6 +125,251 @@ async fn configured_run_executes_a_real_case_and_finalizes_private_evidence() {
             "secret material must not enter finalized artifacts"
         );
     }
+
+    cleanup_reference_databases().await;
+    fs::remove_dir_all(ARTIFACT_ROOT).unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires the isolated reference-app Compose project"]
+async fn configured_replay_reproduces_one_verified_failure_three_times() {
+    let _guard = E2E_LOCK.lock().await;
+    prepare_reference_baseline().await;
+    reset_fixture_process().await;
+    let _ = fs::remove_dir_all(ARTIFACT_ROOT);
+
+    let source_output = run_configured_command(8);
+    assert_eq!(
+        source_output.status.code(),
+        Some(10),
+        "seed 8 must record a violating source case: {}",
+        String::from_utf8_lossy(&source_output.stderr)
+    );
+    let source_receipt: serde_json::Value = serde_json::from_slice(&source_output.stdout).unwrap();
+    let source_path = Path::new(source_receipt["artifact_path"].as_str().unwrap());
+    verify_complete_run_artifact(source_path).unwrap();
+
+    let replay_output = configured_replay_command(source_path)
+        .output()
+        .expect("the configured replay command executes");
+    assert_eq!(
+        replay_output.status.code(),
+        Some(10),
+        "configured replay failed: {}",
+        String::from_utf8_lossy(&replay_output.stderr)
+    );
+    let replay_receipt: serde_json::Value = serde_json::from_slice(&replay_output.stdout).unwrap();
+    assert_eq!(replay_receipt["status"], "configured_replay_complete");
+    assert_eq!(replay_receipt["source_run_id"], source_receipt["run_id"]);
+    assert_eq!(replay_receipt["case_id"], "case_0001");
+    assert_eq!(replay_receipt["attempt_count"], 3);
+    assert_eq!(replay_receipt["matching_failure_count"], 3);
+    assert_eq!(replay_receipt["classification"], "stable");
+
+    let replay_path = Path::new(replay_receipt["artifact_path"].as_str().unwrap());
+    verify_complete_run_artifact(replay_path).unwrap();
+    let summary: serde_json::Value =
+        serde_json::from_slice(&fs::read(replay_path.join("summary.json")).unwrap()).unwrap();
+    let attempts = summary["attempts"].as_array().unwrap();
+    assert_eq!(attempts.len(), 3);
+    assert!(attempts.iter().all(|attempt| {
+        attempt["trace_matches_source"] == true
+            && attempt["verdict"] == "expected_violation"
+            && attempt["invariants"]
+                .as_array()
+                .is_some_and(|items| items.len() == 5)
+            && attempt["before_database_oid"] != attempt["after_database_oid"]
+    }));
+    assert_ne!(
+        attempts[0]["after_database_oid"],
+        attempts[1]["after_database_oid"]
+    );
+    assert_ne!(
+        attempts[1]["after_database_oid"],
+        attempts[2]["after_database_oid"]
+    );
+    for attempt in 1..=3 {
+        assert!(
+            replay_path
+                .join(format!("attempts/attempt_{attempt:04}/trace.json"))
+                .is_file()
+        );
+        assert!(
+            replay_path
+                .join(format!("attempts/attempt_{attempt:04}/observations.ndjson"))
+                .is_file()
+        );
+    }
+    let artifact_bytes = read_artifact_tree(replay_path);
+    for secret in [
+        "tiv-local-only-password",
+        "tiv-app-local-only-password",
+        "whsec_test_secret",
+        "run-scoped-control-token",
+    ] {
+        assert!(!artifact_bytes.contains(secret));
+    }
+    assert_reference_app_healthy();
+
+    cleanup_reference_databases().await;
+    fs::remove_dir_all(ARTIFACT_ROOT).unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires the isolated reference-app Compose project"]
+async fn configured_replay_rejects_compatibility_drift_before_case_reset() {
+    let _guard = E2E_LOCK.lock().await;
+    prepare_reference_baseline().await;
+    reset_fixture_process().await;
+    let _ = fs::remove_dir_all(ARTIFACT_ROOT);
+
+    let source_output = run_configured_command(8);
+    assert_eq!(source_output.status.code(), Some(10));
+    let source_receipt: serde_json::Value = serde_json::from_slice(&source_output.stdout).unwrap();
+    let source_path = Path::new(source_receipt["artifact_path"].as_str().unwrap());
+    rewrite_compatibility_digest_and_reseal(source_path);
+    verify_complete_run_artifact(source_path).unwrap();
+    let identity_before = configured_case_identity().await;
+
+    let replay_output = configured_replay_command(source_path).output().unwrap();
+
+    assert_eq!(replay_output.status.code(), Some(2));
+    assert!(replay_output.stdout.is_empty());
+    assert!(
+        String::from_utf8(replay_output.stderr)
+            .unwrap()
+            .contains("compatibility gate failed")
+    );
+    assert_eq!(configured_case_identity().await, identity_before);
+    assert_eq!(
+        fs::read_dir(Path::new(ARTIFACT_ROOT).join("runs"))
+            .unwrap()
+            .count(),
+        1,
+        "incompatible replay must not enter replay evidence staging"
+    );
+    assert_reference_app_healthy();
+
+    cleanup_reference_databases().await;
+    fs::remove_dir_all(ARTIFACT_ROOT).unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires the isolated reference-app Compose project"]
+async fn configured_replay_rechecks_compatibility_before_every_attempt_reset() {
+    let _guard = E2E_LOCK.lock().await;
+    prepare_reference_baseline().await;
+    reset_fixture_process().await;
+    let (project_root, config, compose_extension) = prepare_replay_drift_project();
+    let artifact_root = project_root.join(".tiv");
+
+    let source_output = configured_command_with_config(8, 1, &config)
+        .output()
+        .unwrap();
+    assert_eq!(
+        source_output.status.code(),
+        Some(10),
+        "drift fixture source run failed: {}",
+        String::from_utf8_lossy(&source_output.stderr)
+    );
+    let source_receipt: serde_json::Value = serde_json::from_slice(&source_output.stdout).unwrap();
+    let source_path = Path::new(source_receipt["artifact_path"].as_str().unwrap());
+    verify_complete_run_artifact(source_path).unwrap();
+
+    let mut child = configured_replay_command_with_config(source_path, &config)
+        .spawn()
+        .expect("the configured replay command starts");
+    let staging = wait_for_replay_observation_in(&mut child, "action_intent", &artifact_root).await;
+    fs::write(&compose_extension, "x-tiv-replay-drift: changed\n").unwrap();
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(120),
+        tokio::task::spawn_blocking(move || child.wait_with_output().unwrap()),
+    )
+    .await
+    .expect("the compatibility-gated replay exits within its case budget")
+    .unwrap();
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "mid-replay compatibility drift was accepted: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8(output.stderr)
+            .unwrap()
+            .contains("compatibility gate failed")
+    );
+    let final_path = staging.parent().unwrap().join(
+        staging
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .trim_start_matches('.')
+            .trim_end_matches(".staging"),
+    );
+    let summary: serde_json::Value =
+        serde_json::from_slice(&fs::read(final_path.join("summary.json")).unwrap()).unwrap();
+    assert_eq!(summary["failure_code"], "compatibility_mismatch");
+    assert_eq!(summary["completed_attempts"], 1);
+    assert!(
+        !final_path
+            .join("attempts/attempt_0002/observations.ndjson")
+            .exists()
+    );
+    assert_reference_app_healthy();
+    verify_complete_run_artifact(source_path).unwrap();
+
+    cleanup_reference_databases().await;
+    fs::remove_dir_all(project_root).unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires the isolated reference-app Compose project"]
+async fn configured_replay_interrupts_with_recovery_and_partial_evidence() {
+    let _guard = E2E_LOCK.lock().await;
+    prepare_reference_baseline().await;
+    reset_fixture_process().await;
+    let _ = fs::remove_dir_all(ARTIFACT_ROOT);
+
+    let source_output = run_configured_command(8);
+    assert_eq!(source_output.status.code(), Some(10));
+    let source_receipt: serde_json::Value = serde_json::from_slice(&source_output.stdout).unwrap();
+    let source_path = Path::new(source_receipt["artifact_path"].as_str().unwrap());
+    let mut child = configured_replay_command(source_path)
+        .spawn()
+        .expect("the configured replay command starts");
+    let staging = wait_for_replay_observation(&mut child, "action_intent").await;
+    let interrupted = Command::new("kill")
+        .args(["-INT", &child.id().to_string()])
+        .output()
+        .unwrap();
+    assert!(interrupted.status.success());
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        tokio::task::spawn_blocking(move || child.wait_with_output().unwrap()),
+    )
+    .await
+    .expect("interrupted replay exits within its recovery budget")
+    .unwrap();
+    assert_eq!(output.status.code(), Some(130));
+
+    let final_path = staging.parent().unwrap().join(
+        staging
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .trim_start_matches('.')
+            .trim_end_matches(".staging"),
+    );
+    assert!(final_path.is_dir());
+    assert!(!staging.exists());
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(final_path.join("manifest.json")).unwrap()).unwrap();
+    assert_eq!(manifest["complete"], false);
+    assert_eq!(manifest["failure_class"], "interrupted");
+    assert_reference_app_healthy();
+    verify_complete_run_artifact(source_path).unwrap();
 
     cleanup_reference_databases().await;
     fs::remove_dir_all(ARTIFACT_ROOT).unwrap();
@@ -270,13 +518,44 @@ fn run_configured_command_with_cases(seed: u64, cases: u32) -> std::process::Out
 }
 
 fn configured_command(seed: u64, cases: u32) -> Command {
+    configured_command_with_config(seed, cases, Path::new(CONFIG))
+}
+
+fn configured_command_with_config(seed: u64, cases: u32, config: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_tiv"));
     command
-        .args(["run", "--config", CONFIG, "--seed"])
+        .args(["run", "--config"])
+        .arg(config)
+        .arg("--seed")
         .arg(seed.to_string())
         .arg("--cases")
         .arg(cases.to_string())
         .arg("--ci")
+        .env("TIV_POSTGRES_ADMIN_URL", ADMIN_URL)
+        .env("DATABASE_URL", CASE_URL)
+        .env("TIV_STRIPE_WEBHOOK_SECRET", "whsec_test_secret")
+        .env("TIV_FIXTURE_CONTROL_TOKEN", "run-scoped-control-token")
+        .env("DOCKER_HOST", "tcp://127.0.0.1:9")
+        .env("DOCKER_CONTEXT", "intentionally-remote")
+        .env("HTTP_PROXY", "http://127.0.0.1:9")
+        .env("HTTPS_PROXY", "http://127.0.0.1:9")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    command
+}
+
+fn configured_replay_command(artifact: &Path) -> Command {
+    configured_replay_command_with_config(artifact, Path::new(CONFIG))
+}
+
+fn configured_replay_command_with_config(artifact: &Path, config: &Path) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_tiv"));
+    command
+        .args(["replay", "configured", "--artifact"])
+        .arg(artifact)
+        .arg("--config")
+        .arg(config)
+        .args(["--case", "1"])
         .env("TIV_POSTGRES_ADMIN_URL", ADMIN_URL)
         .env("DATABASE_URL", CASE_URL)
         .env("TIV_STRIPE_WEBHOOK_SECRET", "whsec_test_secret")
@@ -316,6 +595,76 @@ async fn wait_for_observation(
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
     panic!("configured run did not durably record {observation} before the test timeout");
+}
+
+async fn wait_for_replay_observation(
+    child: &mut std::process::Child,
+    observation: &str,
+) -> std::path::PathBuf {
+    wait_for_replay_observation_in(child, observation, Path::new(ARTIFACT_ROOT)).await
+}
+
+async fn wait_for_replay_observation_in(
+    child: &mut std::process::Child,
+    observation: &str,
+    artifact_root: &Path,
+) -> std::path::PathBuf {
+    for _ in 0..6_000 {
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "configured replay exited before the requested observation"
+        );
+        let runs = artifact_root.join("runs");
+        if let Ok(entries) = fs::read_dir(runs) {
+            for entry in entries.flatten() {
+                let staging = entry.path();
+                if !entry.file_name().to_string_lossy().ends_with(".staging") {
+                    continue;
+                }
+                let journal = staging.join("attempts/attempt_0001/observations.ndjson");
+                if fs::read_to_string(journal).is_ok_and(|contents| contents.contains(observation))
+                {
+                    return staging;
+                }
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("configured replay did not record {observation} before the test timeout");
+}
+
+fn prepare_replay_drift_project() -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+    let project_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests")
+        .join(format!(".configured-replay-drift-{}", Uuid::new_v4()));
+    fs::create_dir(&project_root).unwrap();
+    let config = project_root.join("tiv.toml");
+    let compose_extension = project_root.join("compose-drift.yaml");
+    let contents = fs::read_to_string(CONFIG)
+        .unwrap()
+        .replace(
+            "files = [\"../../spike/reference-app.compose.yaml\"]",
+            "files = [\"../../spike/reference-app.compose.yaml\", \"compose-drift.yaml\"]",
+        )
+        .replace(
+            "quiescence_sql = \"quiescence.sql\"",
+            "quiescence_sql = \"../configured-run-project/quiescence.sql\"",
+        )
+        .replace(
+            "body_file = \"checkout.json\"",
+            "body_file = \"../configured-run-project/checkout.json\"",
+        )
+        .replace(
+            "sql_probe_file = \"kill_probe.sql\"",
+            "sql_probe_file = \"../configured-run-project/kill_probe.sql\"",
+        )
+        .replace(
+            "sql_file = \"invariants/",
+            "sql_file = \"../configured-run-project/invariants/",
+        );
+    fs::write(&config, contents).unwrap();
+    fs::write(&compose_extension, "x-tiv-replay-drift: initial\n").unwrap();
+    (project_root, config, compose_extension)
 }
 
 fn assert_reference_app_healthy() {
@@ -528,6 +877,69 @@ async fn cleanup_reference_databases() {
     }
     drop(client);
     connection.await.unwrap().unwrap();
+}
+
+async fn configured_case_identity() -> (u32, String) {
+    let (admin, connection) = tokio_postgres::connect(ADMIN_URL, NoTls).await.unwrap();
+    let connection = tokio::spawn(connection);
+    let oid = admin
+        .query_one(
+            "SELECT oid::bigint FROM pg_database WHERE datname = 'tiv_case_deadbeef'",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get::<_, i64>(0);
+    drop(admin);
+    connection.await.unwrap().unwrap();
+    let case_url = ADMIN_URL.replace("/postgres", "/tiv_case_deadbeef");
+    let (case, connection) = tokio_postgres::connect(&case_url, NoTls).await.unwrap();
+    let connection = tokio::spawn(connection);
+    let marker = case
+        .query_one(
+            "SELECT marker_uuid::text FROM tiv_verifier_marker WHERE singleton",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get::<_, String>(0);
+    drop(case);
+    connection.await.unwrap().unwrap();
+    (u32::try_from(oid).unwrap(), marker)
+}
+
+fn rewrite_compatibility_digest_and_reseal(artifact: &Path) {
+    let compatibility_path = artifact.join("compatibility.json");
+    let mut compatibility: serde_json::Value =
+        serde_json::from_slice(&fs::read(&compatibility_path).unwrap()).unwrap();
+    compatibility["config_digest"] = serde_json::Value::String("b".repeat(64));
+    write_pretty_json(&compatibility_path, &compatibility);
+
+    let manifest_path = artifact.join("manifest.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+    manifest["required_files"]["compatibility.json"] = serde_json::Value::String(
+        blake3::hash(&fs::read(&compatibility_path).unwrap())
+            .to_hex()
+            .to_string(),
+    );
+    let required =
+        serde_json::from_value::<BTreeMap<String, String>>(manifest["required_files"].clone())
+            .unwrap();
+    let mut checksums = String::new();
+    for (path, digest) in required {
+        writeln!(checksums, "{digest}  {path}").unwrap();
+    }
+    fs::write(artifact.join("checksums.txt"), checksums.as_bytes()).unwrap();
+    manifest["checksums_digest"] =
+        serde_json::Value::String(blake3::hash(checksums.as_bytes()).to_hex().to_string());
+    write_pretty_json(&manifest_path, &manifest);
+}
+
+fn write_pretty_json(path: &Path, value: &serde_json::Value) {
+    let mut bytes = serde_json::to_vec_pretty(value).unwrap();
+    bytes.push(b'\n');
+    fs::write(path, bytes).unwrap();
 }
 
 fn read_artifact_tree(root: &Path) -> String {

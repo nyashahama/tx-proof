@@ -145,6 +145,20 @@ fn a_materialized_case_round_trips_and_revalidates_the_complete_artifact() {
 }
 
 #[test]
+fn replay_authority_rebinds_only_process_local_gate_capabilities() {
+    let recorded = CaseTraceMaterializer::materialize(&golden_case(), complete_captures()).unwrap();
+    let mut rebound_gate = complete_captures();
+    rebound_gate[2].1 = CaseCapturedValue::provider_gate_id(99).unwrap();
+    let rebound = CaseTraceMaterializer::materialize(&golden_case(), rebound_gate).unwrap();
+    let mut changed_provider_id = complete_captures();
+    changed_provider_id[0].1 = CaseCapturedValue::payment_intent_id("pi_tiv_changed").unwrap();
+    let changed = CaseTraceMaterializer::materialize(&golden_case(), changed_provider_id).unwrap();
+
+    assert!(recorded.matches_replay_authority(&rebound));
+    assert!(!recorded.matches_replay_authority(&changed));
+}
+
+#[test]
 fn materialization_rejects_missing_unexpected_duplicate_and_wrong_typed_values() {
     let plan = golden_case();
     let mut missing = complete_captures();

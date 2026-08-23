@@ -9,6 +9,7 @@ pub mod config;
 pub mod configured_campaign;
 pub(crate) mod configured_database;
 pub(crate) mod configured_process;
+pub mod configured_replay;
 pub mod doctor;
 pub mod evidence;
 pub mod init;

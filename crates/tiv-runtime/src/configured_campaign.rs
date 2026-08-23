@@ -10,12 +10,14 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tiv_core::{
     decision::Seed,
-    plan::{CampaignCompileError, CampaignPlan, CampaignPlanner, CaseCount},
+    plan::{CampaignCompileError, CampaignPlan, CampaignPlanner, CaseCount, PlannedCase},
+    result::FailureIdentity,
+    trace::CompiledCaseTrace,
 };
 
 use crate::{
     artifacts::{ArtifactError, PartialRunClass, RunArtifactStaging},
-    baseline::{BaselineError, ConfiguredBaselineSession},
+    baseline::{BaselineError, ConfiguredBaselineSession, ConfiguredCaseResetReport},
     compatibility::{CompatibilityCaptureError, capture_run_compatibility},
     config::{ConfigError, EnvironmentLookup, ResolvedConfig, load_resolved_config},
     configured_database::ConfiguredDatabaseError,
@@ -126,6 +128,63 @@ pub struct ConfiguredCampaignOutput {
     artifact_path: PathBuf,
 }
 
+/// One fully recovered configured execution attempt and its bounded oracle
+/// result. Replay reuses this exact path so campaign and replay cannot drift in
+/// reset, process supervision, quiescence, or snapshot semantics.
+pub(crate) struct ConfiguredCaseExecution {
+    reset: ConfiguredCaseResetReport,
+    trace: CompiledCaseTrace,
+    journal_record_count: usize,
+    journal_last_record_hash: Option<String>,
+    provider_object_count: usize,
+    invariants: Vec<ConfiguredInvariantOutcome>,
+}
+
+impl ConfiguredCaseExecution {
+    pub(crate) const fn reset(&self) -> &ConfiguredCaseResetReport {
+        &self.reset
+    }
+
+    pub(crate) const fn trace(&self) -> &CompiledCaseTrace {
+        &self.trace
+    }
+
+    pub(crate) const fn journal_record_count(&self) -> usize {
+        self.journal_record_count
+    }
+
+    pub(crate) fn journal_last_record_hash(&self) -> Option<&str> {
+        self.journal_last_record_hash.as_deref()
+    }
+
+    pub(crate) const fn provider_object_count(&self) -> usize {
+        self.provider_object_count
+    }
+
+    pub(crate) fn invariants(&self) -> &[ConfiguredInvariantOutcome] {
+        &self.invariants
+    }
+}
+
+pub(crate) struct ConfiguredInvariantOutcome {
+    identity: FailureIdentity,
+    witness_count: usize,
+}
+
+impl ConfiguredInvariantOutcome {
+    pub(crate) const fn identity(&self) -> &FailureIdentity {
+        &self.identity
+    }
+
+    pub(crate) const fn witness_count(&self) -> usize {
+        self.witness_count
+    }
+
+    pub(crate) const fn violated(&self) -> bool {
+        self.witness_count > 0
+    }
+}
+
 impl ConfiguredCampaignOutput {
     #[must_use]
     pub const fn verdict(&self) -> ConfiguredCampaignVerdict {
@@ -214,7 +273,7 @@ pub async fn run_configured_campaign_with_cancellation(
     artifacts.write_json("campaign-plan.json", &campaign)?;
     let mut case_results = Vec::with_capacity(campaign.cases().len());
 
-    let execution = execute_staged_campaign(
+    let execution = Box::pin(execute_staged_campaign(
         &config,
         &campaign,
         &configured_probe,
@@ -224,7 +283,7 @@ pub async fn run_configured_campaign_with_cancellation(
         &mut artifacts,
         &mut case_results,
         cancellation,
-    )
+    ))
     .await;
     let campaign_verdict = match execution {
         Ok(verdict) => verdict,
@@ -287,6 +346,148 @@ pub async fn run_configured_campaign_with_cancellation(
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+pub(crate) async fn execute_configured_case_attempt(
+    config: &ResolvedConfig,
+    configured_probe: &ConfiguredSqlProbe,
+    configured_quiescence: &ConfiguredQuiescence,
+    configured_snapshot: &ConfiguredSnapshot,
+    baseline: ConfiguredBaselineSession,
+    planned_case: &PlannedCase,
+    run_id: &str,
+    case_id: &str,
+    journal_path: PathBuf,
+    cancellation: &RunCancellation,
+) -> Result<(ConfiguredBaselineSession, ConfiguredCaseExecution), ConfiguredCampaignError> {
+    if cancellation.is_cancelled() {
+        return Err(ConfiguredCampaignError::Interrupted {
+            case_id: Some(case_id.to_owned()),
+        });
+    }
+    let (baseline, reset) = baseline.reset_case().await?;
+    let database = baseline.attest_case_database().await?;
+    let mut process = ConfiguredProcessControl::attest(config).await?;
+    let reset_sequence = fixture_control_sequence(config)
+        .await?
+        .checked_add(1)
+        .ok_or(ConfiguredCampaignError::FixtureSequenceExhausted)?;
+    let case_database_name = DatabaseName::parse(config.case_database())
+        .map_err(|_| ConfiguredCampaignError::CaseDatabaseName)?;
+    let provider_proxy_url = driver_origin(config.driver_url())?;
+    let run_config = ReferenceCaseRunConfig::from_http_contract(
+        &case_database_name,
+        config.driver_url().as_str(),
+        config.driver_body().clone(),
+        provider_proxy_url.as_str(),
+        config.fixture_control_url().as_str(),
+        config.fixture_control_token().to_owned(),
+        reset_sequence,
+        current_unix_timestamp()?,
+        config.driver_timeout(),
+        config.fixture_poll_interval(),
+    )?;
+    let mut sql_probe = database
+        .open_sql_probe(
+            configured_probe.clone(),
+            config.case_timeout(),
+            config.fixture_poll_interval(),
+        )
+        .await?;
+    let mut quiescence = database
+        .open_quiescence(
+            configured_quiescence.clone(),
+            config.fixture_poll_interval(),
+        )
+        .await?;
+    let outcome = supervise_execution(
+        config.case_timeout(),
+        cancellation,
+        run_configured_planned_case_with_process(
+            run_id.to_owned(),
+            case_id.to_owned(),
+            planned_case,
+            journal_path,
+            run_config,
+            &mut process,
+            Some(&mut sql_probe as &mut dyn CaseSqlProbe),
+            &mut quiescence,
+        ),
+    )
+    .await;
+    let supervised = complete_supervision(&mut process, outcome).await;
+    let probe_close = sql_probe.close().await;
+    let quiescence_close = quiescence.close().await;
+    let (outcome, process_recovery) = supervised.into_parts();
+    let primary = match outcome {
+        SupervisedCaseOutcome::Completed(result) => {
+            result.map_err(ConfiguredCampaignError::CaseRun)
+        }
+        SupervisedCaseOutcome::TimedOut => Err(ConfiguredCampaignError::CaseTimedOut {
+            case_id: case_id.to_owned(),
+        }),
+        SupervisedCaseOutcome::Cancelled => Err(ConfiguredCampaignError::Interrupted {
+            case_id: Some(case_id.to_owned()),
+        }),
+    };
+    let cleanup = configured_case_cleanup_error(process_recovery, probe_close, quiescence_close);
+    let receipt = match (primary, cleanup) {
+        (Ok(receipt), None) => receipt,
+        (Err(cause), None) => return Err(cause),
+        (Ok(_), Some(recovery)) => {
+            return Err(ConfiguredCampaignError::RecoveryFailed {
+                cause: None,
+                recovery,
+            });
+        }
+        (Err(cause), Some(recovery)) => {
+            return Err(ConfiguredCampaignError::RecoveryFailed {
+                cause: Some(Box::new(cause)),
+                recovery,
+            });
+        }
+    };
+    if cancellation.is_cancelled() {
+        return Err(ConfiguredCampaignError::Interrupted {
+            case_id: Some(case_id.to_owned()),
+        });
+    }
+    let (executed, checkpoint) = receipt.into_parts();
+    let journal_record_count = executed.journal_summary().record_count();
+    let journal_last_record_hash = executed
+        .journal_summary()
+        .last_record_hash()
+        .map(str::to_owned);
+    let (provider_objects, quiescence_permit) = checkpoint.into_oracle_parts();
+    let provider_object_count = provider_objects.len();
+    let snapshot = database
+        .open_snapshot(configured_snapshot.clone())
+        .await?
+        .run(&provider_objects, quiescence_permit)
+        .await?;
+    let invariants = snapshot
+        .outcomes()
+        .iter()
+        .map(|outcome| ConfiguredInvariantOutcome {
+            identity: outcome.identity().clone(),
+            witness_count: match outcome.verdict() {
+                InvariantVerdict::Held => 0,
+                InvariantVerdict::Violated(witnesses) => witnesses.len(),
+            },
+        })
+        .collect();
+    Ok((
+        baseline,
+        ConfiguredCaseExecution {
+            reset,
+            trace: executed.trace().clone(),
+            journal_record_count,
+            journal_last_record_hash,
+            provider_object_count,
+            invariants,
+        },
+    ))
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn execute_staged_campaign(
     config: &ResolvedConfig,
     campaign: &CampaignPlan,
@@ -316,9 +517,6 @@ async fn execute_staged_campaign(
         configured_snapshot,
     )?;
     artifacts.write_json("compatibility.json", &compatibility)?;
-    let case_database_name = DatabaseName::parse(config.case_database())
-        .map_err(|_| ConfiguredCampaignError::CaseDatabaseName)?;
-    let provider_proxy_url = driver_origin(config.driver_url())?;
     let mut campaign_verdict = ConfiguredCampaignVerdict::Held;
 
     for case in campaign.cases() {
@@ -328,124 +526,38 @@ async fn execute_staged_campaign(
                 case_id: Some(case_id),
             });
         }
-        let (fresh_baseline, reset) = baseline.reset_case().await?;
-        baseline = fresh_baseline;
-        let database = baseline.attest_case_database().await?;
-        let mut process = ConfiguredProcessControl::attest(config).await?;
-        let reset_sequence = fixture_control_sequence(config)
-            .await?
-            .checked_add(1)
-            .ok_or(ConfiguredCampaignError::FixtureSequenceExhausted)?;
-        let run_config = ReferenceCaseRunConfig::from_http_contract(
-            &case_database_name,
-            config.driver_url().as_str(),
-            config.driver_body().clone(),
-            provider_proxy_url.as_str(),
-            config.fixture_control_url().as_str(),
-            config.fixture_control_token().to_owned(),
-            reset_sequence,
-            current_unix_timestamp()?,
-            config.driver_timeout(),
-            config.fixture_poll_interval(),
-        )?;
-        let mut sql_probe = database
-            .open_sql_probe(
-                configured_probe.clone(),
-                config.case_timeout(),
-                config.fixture_poll_interval(),
-            )
-            .await?;
-        let mut quiescence = database
-            .open_quiescence(
-                configured_quiescence.clone(),
-                config.fixture_poll_interval(),
-            )
-            .await?;
         let journal_path =
             artifacts.prepare_path(format!("cases/{case_id}/observations.ndjson"))?;
-        let outcome = supervise_execution(
-            config.case_timeout(),
+        let (fresh_baseline, execution) = execute_configured_case_attempt(
+            config,
+            configured_probe,
+            configured_quiescence,
+            configured_snapshot,
+            baseline,
+            case.plan(),
+            run_id,
+            &case_id,
+            journal_path,
             cancellation,
-            run_configured_planned_case_with_process(
-                run_id.to_owned(),
-                case_id.clone(),
-                case.plan(),
-                journal_path,
-                run_config,
-                &mut process,
-                Some(&mut sql_probe as &mut dyn CaseSqlProbe),
-                &mut quiescence,
-            ),
         )
-        .await;
-        let supervised = complete_supervision(&mut process, outcome).await;
-        let probe_close = sql_probe.close().await;
-        let quiescence_close = quiescence.close().await;
-        let (outcome, process_recovery) = supervised.into_parts();
-        let primary = match outcome {
-            SupervisedCaseOutcome::Completed(result) => {
-                result.map_err(ConfiguredCampaignError::CaseRun)
-            }
-            SupervisedCaseOutcome::TimedOut => Err(ConfiguredCampaignError::CaseTimedOut {
-                case_id: case_id.clone(),
-            }),
-            SupervisedCaseOutcome::Cancelled => Err(ConfiguredCampaignError::Interrupted {
-                case_id: Some(case_id.clone()),
-            }),
-        };
-        let cleanup =
-            configured_case_cleanup_error(process_recovery, probe_close, quiescence_close);
-        let receipt = match (primary, cleanup) {
-            (Ok(receipt), None) => receipt,
-            (Err(cause), None) => return Err(cause),
-            (Ok(_), Some(recovery)) => {
-                return Err(ConfiguredCampaignError::RecoveryFailed {
-                    cause: None,
-                    recovery,
-                });
-            }
-            (Err(cause), Some(recovery)) => {
-                return Err(ConfiguredCampaignError::RecoveryFailed {
-                    cause: Some(Box::new(cause)),
-                    recovery,
-                });
-            }
-        };
-        if cancellation.is_cancelled() {
-            return Err(ConfiguredCampaignError::Interrupted {
-                case_id: Some(case_id),
-            });
-        }
-        let (executed, checkpoint) = receipt.into_parts();
-        artifacts.write_json(format!("cases/{case_id}/trace.json"), executed.trace())?;
-        let action_count = executed.trace().action_count();
-        let journal_record_count = executed.journal_summary().record_count();
-        let journal_last_record_hash = executed
-            .journal_summary()
-            .last_record_hash()
-            .map(str::to_owned);
-        let (provider_objects, quiescence_permit) = checkpoint.into_oracle_parts();
-        let snapshot = database
-            .open_snapshot(configured_snapshot.clone())
-            .await?
-            .run(&provider_objects, quiescence_permit)
-            .await?;
-        let invariants = snapshot
-            .outcomes()
+        .await?;
+        baseline = fresh_baseline;
+        artifacts.write_json(format!("cases/{case_id}/trace.json"), execution.trace())?;
+        let invariants = execution
+            .invariants()
             .iter()
             .map(|outcome| {
-                let (verdict, witness_count) = match outcome.verdict() {
-                    InvariantVerdict::Held => (ConfiguredCampaignVerdict::Held, 0),
-                    InvariantVerdict::Violated(witnesses) => {
-                        campaign_verdict = ConfiguredCampaignVerdict::Violated;
-                        (ConfiguredCampaignVerdict::Violated, witnesses.len())
-                    }
+                let verdict = if outcome.violated() {
+                    campaign_verdict = ConfiguredCampaignVerdict::Violated;
+                    ConfiguredCampaignVerdict::Violated
+                } else {
+                    ConfiguredCampaignVerdict::Held
                 };
                 InvariantArtifact {
-                    invariant_id: outcome.id().to_owned(),
+                    invariant_id: outcome.identity().invariant().as_str().to_owned(),
                     checkpoint_id: outcome.identity().checkpoint().as_str().to_owned(),
                     verdict,
-                    witness_count,
+                    witness_count: outcome.witness_count(),
                 }
             })
             .collect::<Vec<_>>();
@@ -454,14 +566,14 @@ async fn execute_staged_campaign(
             case_id: case_id.clone(),
             seed: case.plan().seed().value(),
             planned_action_count: case.plan().actions().len(),
-            executed_action_count: action_count,
-            journal_record_count,
-            journal_last_record_hash,
-            before_database_oid: reset.before_database_oid(),
-            after_database_oid: reset.after_database_oid(),
-            before_marker_uuid: reset.before_marker_uuid().to_owned(),
-            after_marker_uuid: reset.after_marker_uuid().to_owned(),
-            provider_object_count: provider_objects.len(),
+            executed_action_count: execution.trace().action_count(),
+            journal_record_count: execution.journal_record_count(),
+            journal_last_record_hash: execution.journal_last_record_hash().map(str::to_owned),
+            before_database_oid: execution.reset().before_database_oid(),
+            after_database_oid: execution.reset().after_database_oid(),
+            before_marker_uuid: execution.reset().before_marker_uuid().to_owned(),
+            after_marker_uuid: execution.reset().after_marker_uuid().to_owned(),
+            provider_object_count: execution.provider_object_count(),
             invariants,
         };
         artifacts.write_json(format!("cases/{case_id}/result.json"), &result)?;
@@ -965,6 +1077,79 @@ mod tests {
             .expect("the bounded corpus contains an adapter-supported one-case campaign");
 
         assert_eq!(seed, 4);
+    }
+
+    #[test]
+    fn full_configured_fault_model_reaches_two_persisted_provider_objects() {
+        let process_faults = ProcessFaultSpec::new(
+            [
+                ProcessCutPoint::ClientRequestForwarded,
+                ProcessCutPoint::ClientResponseObserved,
+                ProcessCutPoint::WebhookRequestForwarded,
+                ProcessCutPoint::WebhookResponseObserved,
+                ProcessCutPoint::SqlProbe,
+            ],
+            1,
+        )
+        .unwrap();
+        let seed = (0..4_096)
+            .find(|seed| {
+                let spec = CampaignSpec::new_payment_intent_v1(
+                    Seed::new(*seed),
+                    CaseCount::new(1).unwrap(),
+                    ActionBudget::new(40).unwrap(),
+                    [
+                        ProviderOutcome::Normal,
+                        ProviderOutcome::PreExecute429,
+                        ProviderOutcome::PreExecute500,
+                        ProviderOutcome::PostExecute500,
+                        ProviderOutcome::CommitThenClose,
+                        ProviderOutcome::CommitThenDelay,
+                    ],
+                    WebhookFaultSpec::new(3, [0, 10, 100, 1_000, 5_000], true, true).unwrap(),
+                    process_faults.clone(),
+                )
+                .unwrap();
+                CampaignPlanner::compile(&spec).is_ok_and(|campaign| {
+                    let plan = campaign.cases()[0].plan();
+                    if preflight_reference_planned_case(plan, true, true).is_err() {
+                        return false;
+                    }
+                    let actions = plan.actions();
+                    let committed = actions
+                        .iter()
+                        .filter_map(|action| match action.kind() {
+                            tiv_core::plan::PlanActionKind::DriveCheckout { provider_script }
+                            | tiv_core::plan::PlanActionKind::RetryBusinessRequest {
+                                provider_script,
+                            } => Some(usize::from(provider_script.committed_count())),
+                            _ => None,
+                        })
+                        .sum::<usize>();
+                    let persisted_deliveries = actions
+                        .iter()
+                        .enumerate()
+                        .filter(|(index, action)| {
+                            matches!(
+                                action.kind(),
+                                tiv_core::plan::PlanActionKind::DeliverWebhook
+                                    | tiv_core::plan::PlanActionKind::DuplicateWebhook
+                            ) && !actions.get(index + 1).is_some_and(|next| {
+                                matches!(
+                                    next.kind(),
+                                    tiv_core::plan::PlanActionKind::KillApplication {
+                                        cut_point: ProcessCutPoint::WebhookRequestForwarded
+                                    }
+                                )
+                            })
+                        })
+                        .count();
+                    committed >= 2 && persisted_deliveries >= 2
+                })
+            })
+            .expect("the bounded corpus reaches two persisted provider objects");
+
+        assert_eq!(seed, 8);
     }
 
     #[test]
