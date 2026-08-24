@@ -30,6 +30,7 @@ use crate::{
     configured_campaign::{
         ConfiguredCampaignError, ConfiguredCampaignFailureClass, ConfiguredCaseExecution,
         ConfiguredInvariantOutcome, RunCancellation, execute_configured_case_attempt,
+        witness_projection_policy, write_invariant_witness_artifacts,
     },
     configured_process::{
         ConfiguredProcessControl, ConfiguredProcessError, attest_configured_service_images,
@@ -653,6 +654,13 @@ async fn execute_replay_attempts(
                 execution.trace(),
             )
             .map_err(ConfiguredReplayError::EvidenceArtifact)?;
+        write_invariant_witness_artifacts(
+            artifacts,
+            format!("attempts/{attempt_id}/invariants"),
+            execution.invariants(),
+            witness_projection_policy(config),
+        )
+        .map_err(ConfiguredReplayError::EvidenceArtifact)?;
         artifacts
             .write_json(
                 format!("attempts/{attempt_id}/result.json"),

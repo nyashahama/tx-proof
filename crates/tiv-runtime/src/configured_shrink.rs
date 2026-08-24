@@ -28,7 +28,8 @@ use crate::{
     configured_campaign::{
         ConfiguredCampaignError, ConfiguredCampaignFailureClass, ConfiguredInvariantOutcome,
         RunCancellation, execute_configured_case_attempt_with_timeout,
-        execute_configured_shrink_attempt_with_timeout,
+        execute_configured_shrink_attempt_with_timeout, witness_projection_policy,
+        write_invariant_witness_artifacts,
     },
     configured_replay::{
         ATTEMPT_COUNT, ConfiguredReplayArtifactError, ConfiguredReplayError,
@@ -623,6 +624,12 @@ async fn evaluate_original(
             format!("original/attempts/{attempt_id}/trace.json"),
             execution.trace(),
         )?;
+        write_invariant_witness_artifacts(
+            artifacts,
+            format!("original/attempts/{attempt_id}/invariants"),
+            execution.invariants(),
+            witness_projection_policy(config),
+        )?;
         artifacts.write_json(
             format!("original/attempts/{attempt_id}/result.json"),
             &evidence,
@@ -718,6 +725,12 @@ async fn evaluate_candidate(
         artifacts.write_json(
             format!("candidates/{candidate_id}/attempts/{attempt_id}/trace.json"),
             execution.trace(),
+        )?;
+        write_invariant_witness_artifacts(
+            artifacts,
+            format!("candidates/{candidate_id}/attempts/{attempt_id}/invariants"),
+            execution.invariants(),
+            witness_projection_policy(config),
         )?;
         artifacts.write_json(
             format!("candidates/{candidate_id}/attempts/{attempt_id}/result.json"),

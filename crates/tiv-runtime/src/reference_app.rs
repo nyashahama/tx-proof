@@ -211,7 +211,7 @@ async fn attest_reference_stack(
     let postgres_container_id = attest_reference_service(&postgres_service(postgres_port)).await?;
     let reference_app_container_id =
         attest_reference_service(&reference_app_service(reference_app_port)).await?;
-    attest_faulty_reference_app_retry_mode(&reference_app_container_id).await?;
+    attest_reference_app_evidence_modes(&reference_app_container_id).await?;
     let fixture_container_id =
         attest_reference_service(&fixture_service(fixture_control_port)).await?;
     if postgres_container_id == reference_app_container_id
@@ -227,7 +227,7 @@ async fn attest_reference_stack(
     })
 }
 
-async fn attest_faulty_reference_app_retry_mode(
+async fn attest_reference_app_evidence_modes(
     container_id: &str,
 ) -> Result<(), ReferenceAppEvidenceConfigError> {
     let inspection = docker_output(&[
@@ -236,20 +236,37 @@ async fn attest_faulty_reference_app_retry_mode(
         concat!(
             "{{range .Config.Env}}",
             "{{if eq . \"TIV_REFERENCE_APP_RETRY_KEY_MODE=faulty_changed_key\"}}",
-            "true",
+            "retry ",
+            "{{end}}",
+            "{{if eq . \"TIV_REFERENCE_APP_RETRY_KEY_MODE=repaired_same_key\"}}",
+            "retry_conflict ",
+            "{{end}}",
+            "{{if eq . \"TIV_REFERENCE_APP_WEBHOOK_EFFECT_MODE=repaired_deduplicate\"}}",
+            "webhook ",
+            "{{end}}",
+            "{{if eq . \"TIV_REFERENCE_APP_WEBHOOK_EFFECT_MODE=faulty_duplicate_effect\"}}",
+            "webhook_conflict ",
+            "{{end}}",
+            "{{if eq . \"TIV_REFERENCE_APP_LEDGER_MODE=repaired_balanced_once\"}}",
+            "ledger ",
+            "{{end}}",
+            "{{if eq . \"TIV_REFERENCE_APP_LEDGER_MODE=faulty_one_sided_duplicate\"}}",
+            "ledger_conflict ",
             "{{end}}",
             "{{end}}"
         ),
         container_id,
     ])
     .await?;
-    validate_faulty_retry_mode_inspection(&inspection)
+    validate_reference_app_evidence_mode_inspection(&inspection)
 }
 
-fn validate_faulty_retry_mode_inspection(
+fn validate_reference_app_evidence_mode_inspection(
     inspection: &str,
 ) -> Result<(), ReferenceAppEvidenceConfigError> {
-    if inspection == "true\n" {
+    let mut markers = inspection.split_whitespace().collect::<Vec<_>>();
+    markers.sort_unstable();
+    if markers == ["ledger", "retry", "webhook"] {
         Ok(())
     } else {
         Err(ReferenceAppEvidenceConfigError::ReferenceStackMismatch)
@@ -1181,11 +1198,21 @@ mod tests {
     }
 
     #[test]
-    fn direct_fault_evidence_accepts_only_the_faulty_reference_app_retry_mode() {
-        assert!(validate_faulty_retry_mode_inspection("true\n").is_ok());
-        for mismatched in ["", "false\n", "true\ntrue\n", "repaired_same_key\n"] {
+    fn direct_fault_evidence_accepts_only_the_intended_reference_app_mode_set() {
+        assert!(validate_reference_app_evidence_mode_inspection("retry webhook ledger\n").is_ok());
+        assert!(validate_reference_app_evidence_mode_inspection("ledger retry webhook\n").is_ok());
+        for mismatched in [
+            "",
+            "retry\n",
+            "retry webhook\n",
+            "retry ledger\n",
+            "webhook ledger\n",
+            "retry retry webhook ledger\n",
+            "retry webhook ledger ledger_conflict\n",
+            "retry webhook ledger extra\n",
+        ] {
             assert!(matches!(
-                validate_faulty_retry_mode_inspection(mismatched),
+                validate_reference_app_evidence_mode_inspection(mismatched),
                 Err(ReferenceAppEvidenceConfigError::ReferenceStackMismatch)
             ));
         }

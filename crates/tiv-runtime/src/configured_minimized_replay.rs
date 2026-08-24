@@ -25,6 +25,7 @@ use crate::{
     configured_campaign::{
         ConfiguredCampaignError, ConfiguredCampaignFailureClass, ConfiguredInvariantOutcome,
         ConfiguredShrinkExecution, RunCancellation, execute_configured_shrink_attempt_with_timeout,
+        witness_projection_policy, write_invariant_witness_artifacts,
     },
     configured_replay::{
         ATTEMPT_COUNT, ConfiguredReplayClassification, ConfiguredReplayError, attempt_result,
@@ -992,6 +993,12 @@ async fn execute_minimized_replay_attempts(
         artifacts.write_json(
             format!("attempts/{attempt_id}/trace.json"),
             execution.trace(),
+        )?;
+        write_invariant_witness_artifacts(
+            artifacts,
+            format!("attempts/{attempt_id}/invariants"),
+            execution.invariants(),
+            witness_projection_policy(config),
         )?;
         artifacts.write_json(format!("attempts/{attempt_id}/result.json"), &evidence)?;
         attempt_artifacts.push(evidence);

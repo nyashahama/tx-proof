@@ -143,7 +143,7 @@ jobs:
   reference-app-spike:
     name: Real reference application truth spike
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 40
     steps:
       - name: Check out the repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -168,6 +168,7 @@ jobs:
             config --hash '*' > ci-evidence/reference-app.compose.hash
           TIV_REFERENCE_APP_RETRY_KEY_MODE=faulty_changed_key \
           TIV_REFERENCE_APP_WEBHOOK_EFFECT_MODE=repaired_deduplicate \
+          TIV_REFERENCE_APP_LEDGER_MODE=repaired_balanced_once \
             docker compose \
             --project-name tiv-reference-app-spike \
             --project-directory "$PWD" \
@@ -175,6 +176,7 @@ jobs:
             config --hash reference-app > ci-evidence/reference-app.retry-faulty.hash
           TIV_REFERENCE_APP_RETRY_KEY_MODE=repaired_same_key \
           TIV_REFERENCE_APP_WEBHOOK_EFFECT_MODE=repaired_deduplicate \
+          TIV_REFERENCE_APP_LEDGER_MODE=repaired_balanced_once \
             docker compose \
             --project-name tiv-reference-app-spike \
             --project-directory "$PWD" \
@@ -188,6 +190,7 @@ jobs:
           fi
           TIV_REFERENCE_APP_RETRY_KEY_MODE=repaired_same_key \
           TIV_REFERENCE_APP_WEBHOOK_EFFECT_MODE=faulty_duplicate_effect \
+          TIV_REFERENCE_APP_LEDGER_MODE=repaired_balanced_once \
             docker compose \
             --project-name tiv-reference-app-spike \
             --project-directory "$PWD" \
@@ -197,6 +200,20 @@ jobs:
               ci-evidence/reference-app.webhook-faulty.hash \
               ci-evidence/reference-app.retry-repaired.hash; then
             echo "webhook-effect modes resolved to the same reference-app image" >&2
+            exit 1
+          fi
+          TIV_REFERENCE_APP_RETRY_KEY_MODE=repaired_same_key \
+          TIV_REFERENCE_APP_WEBHOOK_EFFECT_MODE=repaired_deduplicate \
+          TIV_REFERENCE_APP_LEDGER_MODE=faulty_one_sided_duplicate \
+            docker compose \
+            --project-name tiv-reference-app-spike \
+            --project-directory "$PWD" \
+            --file spike/reference-app.compose.yaml \
+            config --hash reference-app > ci-evidence/reference-app.ledger-faulty.hash
+          if cmp --silent \
+              ci-evidence/reference-app.ledger-faulty.hash \
+              ci-evidence/reference-app.retry-repaired.hash; then
+            echo "ledger modes resolved to the same reference-app image" >&2
             exit 1
           fi
 
@@ -218,11 +235,12 @@ jobs:
           cargo test -p tiv-cli --test configured_run \
             -- --ignored --nocapture --test-threads=1
 
-      - name: Restore and attest the default paired reference modes
+      - name: Restore and attest the default reference modes
         if: always()
         run: |
           TIV_REFERENCE_APP_RETRY_KEY_MODE=faulty_changed_key \
           TIV_REFERENCE_APP_WEBHOOK_EFFECT_MODE=repaired_deduplicate \
+          TIV_REFERENCE_APP_LEDGER_MODE=repaired_balanced_once \
             docker compose \
             --project-name tiv-reference-app-spike \
             --project-directory "$PWD" \
@@ -238,6 +256,11 @@ jobs:
             tiv-reference-app-spike-reference-app-1 \
             | grep --fixed-strings --line-regexp \
               'TIV_REFERENCE_APP_WEBHOOK_EFFECT_MODE=repaired_deduplicate'
+          docker inspect \
+            --format '{{range .Config.Env}}{{println .}}{{end}}' \
+            tiv-reference-app-spike-reference-app-1 \
+            | grep --fixed-strings --line-regexp \
+              'TIV_REFERENCE_APP_LEDGER_MODE=repaired_balanced_once'
 
       - name: Prove three fresh-baseline reference application attempts
         env:

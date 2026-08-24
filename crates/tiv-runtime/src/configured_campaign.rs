@@ -1,12 +1,14 @@
 //! Configured serial campaign preparation and execution.
 
 use std::{
+    collections::BTreeSet,
     path::{Path, PathBuf},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use reqwest::{StatusCode, redirect::Policy};
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 use thiserror::Error;
 use tiv_core::{
     decision::Seed,
@@ -56,6 +58,7 @@ use crate::{
 pub use crate::run_supervisor::RunCancellation;
 
 const MAX_FIXTURE_STATE_BYTES: usize = 16 * 1024;
+const MAX_PERSISTED_WITNESS_BYTES_PER_ATTEMPT: usize = 8 * 1024;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ConfiguredCampaignOptions {
@@ -193,7 +196,7 @@ impl<T> ConfiguredAttemptExecution<T> {
 
 pub(crate) struct ConfiguredInvariantOutcome {
     identity: FailureIdentity,
-    witness_count: usize,
+    witnesses: Vec<Map<String, Value>>,
 }
 
 impl ConfiguredInvariantOutcome {
@@ -201,13 +204,188 @@ impl ConfiguredInvariantOutcome {
         &self.identity
     }
 
-    pub(crate) const fn witness_count(&self) -> usize {
-        self.witness_count
+    pub(crate) fn witness_count(&self) -> usize {
+        self.witnesses.len()
     }
 
-    pub(crate) const fn violated(&self) -> bool {
-        self.witness_count > 0
+    pub(crate) fn violated(&self) -> bool {
+        !self.witnesses.is_empty()
     }
+
+    pub(crate) fn witnesses(&self) -> &[Map<String, Value>] {
+        &self.witnesses
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum WitnessProjectionPolicy {
+    DigestOnly,
+    ReferenceLedgerAllowlist,
+}
+
+#[derive(Serialize)]
+struct InvariantWitnessArtifact {
+    invariant_id: String,
+    checkpoint_id: String,
+    witness_count: usize,
+    witness_digest: String,
+    projection: WitnessProjectionPolicy,
+    retained_row_count: usize,
+    omitted_row_count: usize,
+    rows_truncated: bool,
+    rows: Vec<Map<String, Value>>,
+}
+
+#[derive(Serialize)]
+struct InvariantWitnessBundle {
+    schema_version: u16,
+    invariants: Vec<InvariantWitnessArtifact>,
+}
+
+pub(crate) fn witness_projection_policy(config: &ResolvedConfig) -> WitnessProjectionPolicy {
+    if config.compose_project() == "tiv-reference-app-spike"
+        && config.case_database() == "tiv_case_deadbeef"
+        && config.baseline_database() == "tiv_base_deadbeef"
+        && config.application_service() == "reference-app"
+        && config.postgres_service() == "postgres"
+    {
+        WitnessProjectionPolicy::ReferenceLedgerAllowlist
+    } else {
+        WitnessProjectionPolicy::DigestOnly
+    }
+}
+
+pub(crate) fn write_invariant_witness_artifacts(
+    artifacts: &mut RunArtifactStaging,
+    relative_directory: impl AsRef<Path>,
+    outcomes: &[ConfiguredInvariantOutcome],
+    policy: WitnessProjectionPolicy,
+) -> Result<(), ArtifactError> {
+    let relative_directory = relative_directory.as_ref();
+    let mut retained_bytes = 0_usize;
+    let mut invariants = Vec::new();
+    for outcome in outcomes.iter().filter(|outcome| outcome.violated()) {
+        let rows = outcome.witnesses();
+        let encoded = serde_json::to_vec(rows).map_err(ArtifactError::Serialize)?;
+        let reference_rows_allowed = policy == WitnessProjectionPolicy::ReferenceLedgerAllowlist
+            && outcome.identity().invariant().as_str() == "balanced-ledger"
+            && rows.iter().all(reference_ledger_witness_row);
+        let projection = if reference_rows_allowed {
+            WitnessProjectionPolicy::ReferenceLedgerAllowlist
+        } else {
+            WitnessProjectionPolicy::DigestOnly
+        };
+        let mut retained_rows = Vec::new();
+        if reference_rows_allowed {
+            for row in rows {
+                let row_bytes = serde_json::to_vec(row)
+                    .map_err(ArtifactError::Serialize)?
+                    .len();
+                if retained_bytes.saturating_add(row_bytes)
+                    > MAX_PERSISTED_WITNESS_BYTES_PER_ATTEMPT
+                {
+                    break;
+                }
+                retained_bytes = retained_bytes.saturating_add(row_bytes);
+                retained_rows.push(row.clone());
+            }
+        }
+        let retained_row_count = retained_rows.len();
+        invariants.push(InvariantWitnessArtifact {
+            invariant_id: outcome.identity().invariant().as_str().to_owned(),
+            checkpoint_id: outcome.identity().checkpoint().as_str().to_owned(),
+            witness_count: rows.len(),
+            witness_digest: blake3::hash(&encoded).to_hex().to_string(),
+            projection,
+            retained_row_count,
+            omitted_row_count: rows.len().saturating_sub(retained_row_count),
+            rows_truncated: retained_row_count != rows.len(),
+            rows: retained_rows,
+        });
+    }
+    if !invariants.is_empty() {
+        artifacts.write_json(
+            relative_directory.join("witnesses.json"),
+            &InvariantWitnessBundle {
+                schema_version: 1,
+                invariants,
+            },
+        )?;
+    }
+    Ok(())
+}
+
+fn reference_ledger_witness_row(row: &Map<String, Value>) -> bool {
+    const EXPECTED_COLUMNS: [&str; 10] = [
+        "credit_posting_count",
+        "credit_total_minor",
+        "currency",
+        "debit_posting_count",
+        "debit_total_minor",
+        "entry_id",
+        "imbalance_minor",
+        "operation_id",
+        "posting_count",
+        "provider_event_id",
+    ];
+    let columns = row.keys().map(String::as_str).collect::<BTreeSet<_>>();
+    if columns != BTreeSet::from(EXPECTED_COLUMNS) {
+        return false;
+    }
+    let Some(provider_event_id) = row["provider_event_id"].as_str() else {
+        return false;
+    };
+    let Some(operation_id) = row["operation_id"].as_str() else {
+        return false;
+    };
+    let Some(entry_id) = row["entry_id"].as_str() else {
+        return false;
+    };
+    let Some(currency) = row["currency"].as_str() else {
+        return false;
+    };
+    let Some(posting_count) = row["posting_count"].as_i64() else {
+        return false;
+    };
+    let Some(debit_count) = row["debit_posting_count"].as_i64() else {
+        return false;
+    };
+    let Some(credit_count) = row["credit_posting_count"].as_i64() else {
+        return false;
+    };
+    let Some(debit_total) = row["debit_total_minor"].as_i64() else {
+        return false;
+    };
+    let Some(credit_total) = row["credit_total_minor"].as_i64() else {
+        return false;
+    };
+    let Some(imbalance) = row["imbalance_minor"].as_i64() else {
+        return false;
+    };
+    valid_reference_identifier(provider_event_id, "evt_tiv_")
+        && valid_reference_identifier(operation_id, "op_")
+        && uuid::Uuid::parse_str(entry_id).is_ok()
+        && currency.len() == 3
+        && currency.bytes().all(|byte| byte.is_ascii_lowercase())
+        && (0..=2).contains(&posting_count)
+        && (0..=1).contains(&debit_count)
+        && (0..=1).contains(&credit_count)
+        && debit_count + credit_count == posting_count
+        && debit_total >= 0
+        && credit_total >= 0
+        && debit_total.checked_sub(credit_total) == Some(imbalance)
+}
+
+fn valid_reference_identifier(value: &str, prefix: &str) -> bool {
+    let Some(suffix) = value.strip_prefix(prefix) else {
+        return false;
+    };
+    !suffix.is_empty()
+        && value.len() <= 255
+        && suffix
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
 }
 
 impl ConfiguredCampaignOutput {
@@ -730,9 +908,12 @@ async fn execute_configured_attempt(
         .iter()
         .map(|outcome| ConfiguredInvariantOutcome {
             identity: outcome.identity().clone(),
-            witness_count: match outcome.verdict() {
-                InvariantVerdict::Held => 0,
-                InvariantVerdict::Violated(witnesses) => witnesses.len(),
+            witnesses: match outcome.verdict() {
+                InvariantVerdict::Held => Vec::new(),
+                InvariantVerdict::Violated(witnesses) => witnesses
+                    .iter()
+                    .map(|witness| witness.columns().clone())
+                    .collect(),
             },
         })
         .collect();
@@ -805,6 +986,12 @@ async fn execute_staged_campaign(
         .await?;
         baseline = fresh_baseline;
         artifacts.write_json(format!("cases/{case_id}/trace.json"), execution.trace())?;
+        write_invariant_witness_artifacts(
+            artifacts,
+            format!("cases/{case_id}/invariants"),
+            execution.invariants(),
+            witness_projection_policy(config),
+        )?;
         let invariants = execution
             .invariants()
             .iter()
@@ -1330,8 +1517,43 @@ mod tests {
     use super::{
         CampaignSummary, CaseArtifact, ConfiguredCampaignError, ConfiguredCampaignFailureClass,
         ConfiguredCampaignOptions, ConfiguredCampaignOptionsError, ConfiguredCampaignVerdict,
-        InvariantArtifact, completed_campaign_report,
+        InvariantArtifact, MAX_PERSISTED_WITNESS_BYTES_PER_ATTEMPT, completed_campaign_report,
+        reference_ledger_witness_row,
     };
+
+    #[test]
+    fn reference_ledger_witness_allowlist_is_exact_and_budgeted() {
+        let valid = serde_json::json!({
+            "provider_event_id": "evt_tiv_contract",
+            "operation_id": "op_deadbeef",
+            "entry_id": "10000000-0000-4000-8000-000000000001",
+            "currency": "usd",
+            "posting_count": 1,
+            "debit_posting_count": 1,
+            "credit_posting_count": 0,
+            "debit_total_minor": 2500,
+            "credit_total_minor": 0,
+            "imbalance_minor": 2500
+        });
+        let valid = valid.as_object().unwrap();
+        assert!(reference_ledger_witness_row(valid));
+
+        let mut unexpected = valid.clone();
+        unexpected.insert(
+            "secret".to_owned(),
+            serde_json::Value::String("must-not-persist".to_owned()),
+        );
+        assert!(!reference_ledger_witness_row(&unexpected));
+
+        let mut incoherent = valid.clone();
+        incoherent.insert("imbalance_minor".to_owned(), serde_json::json!(1));
+        assert!(!reference_ledger_witness_row(&incoherent));
+
+        const {
+            assert!(MAX_PERSISTED_WITNESS_BYTES_PER_ATTEMPT * 500 < 5 * 1024 * 1024);
+            assert!(MAX_PERSISTED_WITNESS_BYTES_PER_ATTEMPT * 183 < 2 * 1024 * 1024);
+        }
+    }
     use crate::{
         compatibility::{CompatibilityCaptureError, CompatibilityError},
         doctor::DoctorError,

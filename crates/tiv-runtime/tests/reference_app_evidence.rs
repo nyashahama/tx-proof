@@ -18,6 +18,9 @@ fn reference_stack_routes_fixture_webhooks_only_over_the_shared_data_network() {
     assert!(compose.contains(
         "TIV_REFERENCE_APP_WEBHOOK_EFFECT_MODE: ${TIV_REFERENCE_APP_WEBHOOK_EFFECT_MODE:-repaired_deduplicate}"
     ));
+    assert!(compose.contains(
+        "TIV_REFERENCE_APP_LEDGER_MODE: ${TIV_REFERENCE_APP_LEDGER_MODE:-repaired_balanced_once}"
+    ));
     assert!(compose.contains("127.0.0.1:18080:18080"));
     assert!(!compose.contains("TIV_REFERENCE_APP_BIND: reference-app-host:18080"));
 }
@@ -41,6 +44,30 @@ fn webhook_identity_is_validated_before_any_payment_mutation() {
         identity_validation < payment_mutation,
         "an event/operation collision must fail before payment state can change"
     );
+}
+
+#[test]
+fn reference_workflow_fingerprints_and_restores_the_ledger_mode() {
+    let workflow = include_str!("../../../.github/workflows/rust.yml");
+
+    assert!(workflow.contains("reference-app.ledger-faulty.hash"));
+    assert!(workflow.contains("TIV_REFERENCE_APP_LEDGER_MODE=faulty_one_sided_duplicate"));
+    assert!(workflow.contains("TIV_REFERENCE_APP_LEDGER_MODE=repaired_balanced_once"));
+    assert!(workflow.contains("'TIV_REFERENCE_APP_LEDGER_MODE=repaired_balanced_once'"));
+}
+
+#[test]
+fn configured_witness_persistence_is_reference_scoped_and_budgeted() {
+    let source = include_str!("../src/configured_campaign.rs");
+
+    assert!(source.contains("MAX_PERSISTED_WITNESS_BYTES_PER_ATTEMPT"));
+    assert!(source.contains("ReferenceLedgerAllowlist"));
+    assert!(source.contains("DigestOnly"));
+    assert!(source.contains("retained_row_count"));
+    assert!(source.contains("omitted_row_count"));
+    assert!(source.contains("rows_truncated"));
+    assert!(source.contains("tiv-reference-app-spike"));
+    assert!(source.contains("tiv_case_deadbeef"));
 }
 
 #[tokio::test]

@@ -75,8 +75,14 @@ The v1 implementation rejects expansion beyond these constants:
 | Encoded witness bytes across the snapshot | 256 KiB |
 
 Witnesses remain typed, in-memory values that intentionally implement neither
-`Debug` nor `Serialize`. A later artifact boundary must redact them before any
-persistence or standard output.
+`Debug` nor `Serialize`. The configured artifact boundary writes one private,
+violation-only `invariants/witnesses.json` bundle per attempt. Generic
+repository witnesses retain identity, count, and a BLAKE3 digest only. Exact
+rows are retained only for the strict synthetic reference-ledger column/type
+allowlist, under an 8 KiB per-attempt projection cap with explicit retained,
+omitted, and truncation fields. The manifest independently binds the bundle
+checksum. Held attempts write no witness bundle, and Markdown/JUnit/stdout
+retain counts and identity but never copy raw witness values.
 
 ## Current proof and remaining boundary
 

@@ -117,6 +117,26 @@ fn configured_snapshot_loads_the_same_five_files_and_budgets_doctor_approved() {
     );
 }
 
+#[test]
+fn configured_balanced_ledger_query_is_entry_scoped_and_scalar_bounded() {
+    let query =
+        include_str!("../../../tests/configured-run-project/invariants/05_balanced_ledger.sql");
+
+    InvariantQuery::new("balanced-ledger", query)
+        .expect("the real ledger witness remains within the read-only query contract");
+    assert!(query.contains("FROM ledger_entries AS entries"));
+    assert!(query.contains("LEFT JOIN ledger_postings AS postings"));
+    assert!(query.contains("posting_count"));
+    assert!(query.contains("debit_total_minor"));
+    assert!(query.contains("credit_total_minor"));
+    assert!(query.contains("imbalance_minor"));
+    assert!(query.contains("HAVING"));
+    assert!(
+        !query.contains("ARRAY_AGG"),
+        "one witness value cannot grow with posting cardinality"
+    );
+}
+
 fn valid_queries() -> Vec<InvariantQuery> {
     V1_INVARIANT_IDS
         .into_iter()

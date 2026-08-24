@@ -1284,6 +1284,7 @@ dependencies = [
  "tiv-stripe-pi",
  "tokio",
  "tokio-postgres",
+ "uuid",
 ]
 
 [[package]]

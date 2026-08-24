@@ -35,6 +35,9 @@ const REPAIRED_RETRY_KEY_MODE: &str = "repaired_same_key";
 const WEBHOOK_EFFECT_MODE_ENV: &str = "TIV_REFERENCE_APP_WEBHOOK_EFFECT_MODE";
 const FAULTY_WEBHOOK_EFFECT_MODE: &str = "faulty_duplicate_effect";
 const REPAIRED_WEBHOOK_EFFECT_MODE: &str = "repaired_deduplicate";
+const LEDGER_BALANCE_MODE_ENV: &str = "TIV_REFERENCE_APP_LEDGER_MODE";
+const FAULTY_LEDGER_BALANCE_MODE: &str = "faulty_one_sided_duplicate";
+const REPAIRED_LEDGER_BALANCE_MODE: &str = "repaired_balanced_once";
 
 #[tokio::test]
 #[ignore = "requires the isolated reference-app Compose project"]
@@ -456,6 +459,122 @@ async fn row_one_duplicate_webhook_fault_violates_and_deduplicated_repair_holds(
 
 #[tokio::test]
 #[ignore = "requires the isolated reference-app Compose project"]
+#[allow(clippy::too_many_lines)]
+async fn row_six_one_sided_ledger_fault_violates_and_balanced_repair_holds() {
+    let _guard = E2E_LOCK.lock().await;
+    let mut restore = ReferenceAppModeRestore::armed();
+    let _ = fs::remove_dir_all(ARTIFACT_ROOT);
+    let faulty_modes = (
+        REPAIRED_RETRY_KEY_MODE,
+        REPAIRED_WEBHOOK_EFFECT_MODE,
+        FAULTY_LEDGER_BALANCE_MODE,
+    );
+
+    recreate_reference_app_in_all_modes(faulty_modes.0, faulty_modes.1, faulty_modes.2);
+    prepare_reference_baseline().await;
+    reset_fixture_process().await;
+    let faulty_output =
+        run_configured_command_in_all_modes(1_792, faulty_modes.0, faulty_modes.1, faulty_modes.2);
+    assert_eq!(
+        faulty_output.status.code(),
+        Some(10),
+        "the one-sided ledger fault must violate: {}",
+        String::from_utf8_lossy(&faulty_output.stderr)
+    );
+    let faulty_receipt: serde_json::Value =
+        serde_json::from_slice(&faulty_output.stdout).expect("faulty stdout is JSON");
+    assert_eq!(faulty_receipt["verdict"], "violated");
+    let faulty_path = Path::new(faulty_receipt["artifact_path"].as_str().unwrap());
+    verify_complete_run_artifact(faulty_path).expect("the faulty artifact verifies");
+    let faulty_summary: serde_json::Value =
+        serde_json::from_slice(&fs::read(faulty_path.join("summary.json")).unwrap()).unwrap();
+    assert_eq!(faulty_summary["cases"][0]["provider_object_count"], 1);
+    assert!(
+        faulty_summary["cases"][0]["invariants"]
+            .as_array()
+            .is_some_and(|invariants| {
+                invariants.len() == 5
+                    && invariants.iter().all(|invariant| {
+                        if invariant["invariant_id"] == "balanced-ledger" {
+                            invariant["verdict"] == "violated" && invariant["witness_count"] == 1
+                        } else {
+                            invariant["verdict"] == "held" && invariant["witness_count"] == 0
+                        }
+                    })
+            }),
+        "balanced-ledger must be the only source failure"
+    );
+    assert_row_one_trace(faulty_path);
+    assert_reference_webhook_delivery_count(2).await;
+    assert_reference_webhook_effect_count(1).await;
+    assert_reference_ledger_state((2, 3, 5_000, 2_500, 1, 2_500)).await;
+    assert_balanced_ledger_witness_artifact(
+        &faulty_path.join("cases/case_0001/invariants/witnesses.json"),
+        2_500,
+    );
+
+    prove_duplicate_fault_replay_shrink(faulty_path, faulty_modes, "balanced-ledger");
+
+    recreate_reference_app_in_all_modes(
+        REPAIRED_RETRY_KEY_MODE,
+        REPAIRED_WEBHOOK_EFFECT_MODE,
+        REPAIRED_LEDGER_BALANCE_MODE,
+    );
+    prepare_reference_baseline().await;
+    reset_fixture_process().await;
+    let repaired_output = run_configured_command_in_all_modes(
+        1_792,
+        REPAIRED_RETRY_KEY_MODE,
+        REPAIRED_WEBHOOK_EFFECT_MODE,
+        REPAIRED_LEDGER_BALANCE_MODE,
+    );
+    assert_eq!(
+        repaired_output.status.code(),
+        Some(0),
+        "the balanced ledger control must hold: {}",
+        String::from_utf8_lossy(&repaired_output.stderr)
+    );
+    let repaired_receipt: serde_json::Value =
+        serde_json::from_slice(&repaired_output.stdout).expect("repaired stdout is JSON");
+    assert_eq!(repaired_receipt["verdict"], "held");
+    let repaired_path = Path::new(repaired_receipt["artifact_path"].as_str().unwrap());
+    verify_complete_run_artifact(repaired_path).expect("the repaired artifact verifies");
+    let repaired_summary: serde_json::Value =
+        serde_json::from_slice(&fs::read(repaired_path.join("summary.json")).unwrap()).unwrap();
+    assert_eq!(repaired_summary["cases"][0]["provider_object_count"], 1);
+    assert!(
+        repaired_summary["cases"][0]["invariants"]
+            .as_array()
+            .is_some_and(|invariants| {
+                invariants.len() == 5
+                    && invariants
+                        .iter()
+                        .all(|invariant| invariant["verdict"] == "held")
+            })
+    );
+    assert_row_one_trace(repaired_path);
+    assert_reference_webhook_delivery_count(2).await;
+    assert_reference_webhook_effect_count(1).await;
+    assert_reference_ledger_state((1, 2, 2_500, 2_500, 0, 0)).await;
+    assert!(
+        !repaired_path
+            .join("cases/case_0001/invariants/witnesses.json")
+            .exists(),
+        "a held invariant does not emit a violation witness artifact"
+    );
+
+    cleanup_reference_databases().await;
+    fs::remove_dir_all(ARTIFACT_ROOT).unwrap();
+    recreate_reference_app_in_all_modes(
+        FAULTY_RETRY_KEY_MODE,
+        REPAIRED_WEBHOOK_EFFECT_MODE,
+        REPAIRED_LEDGER_BALANCE_MODE,
+    );
+    restore.disarm();
+}
+
+#[tokio::test]
+#[ignore = "requires the isolated reference-app Compose project"]
 async fn webhook_event_identity_collision_returns_conflict_before_business_mutation() {
     let _guard = E2E_LOCK.lock().await;
     let mut restore = ReferenceAppModeRestore::armed();
@@ -530,7 +649,13 @@ async fn webhook_event_identity_collision_returns_conflict_before_business_mutat
                  (SELECT COUNT(*)::bigint FROM webhook_deliveries \
                   WHERE provider_event_id = $1 AND operation_id = 'op_deadbeef'), \
                  (SELECT COUNT(*)::bigint FROM webhook_effects \
-                  WHERE provider_event_id = $1 AND operation_id = 'op_deadbeef')",
+                  WHERE provider_event_id = $1 AND operation_id = 'op_deadbeef'), \
+                 (SELECT COUNT(*)::bigint FROM ledger_entries \
+                  WHERE provider_event_id = $1 AND operation_id = 'op_deadbeef'), \
+                 (SELECT COUNT(*)::bigint FROM ledger_postings AS postings \
+                  JOIN ledger_entries AS entries USING (entry_id) \
+                  WHERE entries.provider_event_id = $1 \
+                    AND entries.operation_id = 'op_deadbeef')",
             &[&event_id],
         )
         .await
@@ -538,11 +663,199 @@ async fn webhook_event_identity_collision_returns_conflict_before_business_mutat
     assert_eq!(state.get::<_, i64>(0), 0);
     assert_eq!(state.get::<_, i64>(1), 0);
     assert_eq!(state.get::<_, i64>(2), 0);
+    assert_eq!(state.get::<_, i64>(3), 0);
+    assert_eq!(state.get::<_, i64>(4), 0);
     drop(admin);
     connection.await.unwrap().unwrap();
 
     cleanup_reference_databases().await;
     recreate_reference_app_in_modes(FAULTY_RETRY_KEY_MODE, REPAIRED_WEBHOOK_EFFECT_MODE);
+    restore.disarm();
+}
+
+#[tokio::test]
+#[ignore = "requires the isolated reference-app Compose project"]
+async fn faulty_ledger_mode_records_one_sided_duplicate_after_a_balanced_effect() {
+    let _guard = E2E_LOCK.lock().await;
+    let mut restore = ReferenceAppModeRestore::armed();
+    recreate_reference_app_in_all_modes(
+        REPAIRED_RETRY_KEY_MODE,
+        REPAIRED_WEBHOOK_EFFECT_MODE,
+        FAULTY_LEDGER_BALANCE_MODE,
+    );
+    prepare_reference_baseline().await;
+
+    let mut fixture = PaymentIntentFixture::new(Seed::new(6_171));
+    let payment_intent = fixture
+        .create(
+            IdempotencyKey::new("ledger-duplicate-contract").unwrap(),
+            CreatePaymentIntent::new(2_500, "usd")
+                .unwrap()
+                .with_operation_id(OperationId::new("op_deadbeef").unwrap()),
+            FaultOutcome::Normal,
+        )
+        .expect("the ledger contract creates one provider object");
+    fixture
+        .confirm(payment_intent.id())
+        .expect("the provider object reaches succeeded");
+    let event = fixture
+        .events()
+        .first()
+        .expect("confirmation creates one event");
+    let attempt = event
+        .webhook_attempt(current_unix_timestamp(), b"whsec_test_secret")
+        .expect("the immutable event is signed for delivery");
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let send = || {
+        client
+            .post("http://127.0.0.1:18080/webhooks/stripe")
+            .header("Stripe-Signature", attempt.signature_header())
+            .header("Connection", "close")
+            .body(attempt.raw_body().to_vec())
+            .send()
+    };
+    let (first, second) = tokio::join!(send(), send());
+    for (delivery, response) in [first, second].into_iter().enumerate() {
+        let response = response.expect("the signed webhook receives an application response");
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::OK,
+            "delivery {} must be accepted",
+            delivery + 1
+        );
+    }
+
+    let case_url = ADMIN_URL.replace("/postgres", "/tiv_case_deadbeef");
+    let (admin, connection) = tokio_postgres::connect(&case_url, NoTls)
+        .await
+        .expect("the isolated admin connects to the generated case");
+    let connection = tokio::spawn(connection);
+    let state = admin
+        .query_one(
+            "SELECT \
+                 (SELECT COUNT(*)::bigint FROM webhook_deliveries), \
+                 (SELECT COUNT(*)::bigint FROM webhook_effects), \
+                 (SELECT COUNT(*)::bigint FROM ledger_entries), \
+                 (SELECT COUNT(*)::bigint FROM ledger_postings), \
+                 (SELECT COALESCE(SUM(amount_minor), 0)::bigint \
+                    FROM ledger_postings WHERE entry_side = 'debit'), \
+                 (SELECT COALESCE(SUM(amount_minor), 0)::bigint \
+                    FROM ledger_postings WHERE entry_side = 'credit')",
+            &[],
+        )
+        .await
+        .expect("the faulty ledger projection is inspectable");
+    assert_eq!(state.get::<_, i64>(0), 2);
+    assert_eq!(state.get::<_, i64>(1), 1);
+    assert_eq!(state.get::<_, i64>(2), 2);
+    assert_eq!(state.get::<_, i64>(3), 3);
+    assert_eq!(state.get::<_, i64>(4), 5_000);
+    assert_eq!(state.get::<_, i64>(5), 2_500);
+    drop(admin);
+    connection.await.unwrap().unwrap();
+
+    cleanup_reference_databases().await;
+    recreate_reference_app_in_all_modes(
+        FAULTY_RETRY_KEY_MODE,
+        REPAIRED_WEBHOOK_EFFECT_MODE,
+        REPAIRED_LEDGER_BALANCE_MODE,
+    );
+    restore.disarm();
+}
+
+#[tokio::test]
+#[ignore = "requires the isolated reference-app Compose project"]
+async fn rejected_credit_posting_rolls_back_the_entire_webhook_transaction() {
+    let _guard = E2E_LOCK.lock().await;
+    let mut restore = ReferenceAppModeRestore::armed();
+    recreate_reference_app_in_all_modes(
+        REPAIRED_RETRY_KEY_MODE,
+        REPAIRED_WEBHOOK_EFFECT_MODE,
+        REPAIRED_LEDGER_BALANCE_MODE,
+    );
+    prepare_reference_baseline().await;
+
+    let case_url = ADMIN_URL.replace("/postgres", "/tiv_case_deadbeef");
+    let (admin, connection) = tokio_postgres::connect(&case_url, NoTls)
+        .await
+        .expect("the isolated admin connects to the generated case");
+    let connection = tokio::spawn(connection);
+    admin
+        .batch_execute(
+            "CREATE FUNCTION tiv_reject_credit_posting() RETURNS trigger \
+                 LANGUAGE plpgsql AS $$ \
+                 BEGIN \
+                   IF NEW.entry_side = 'credit' THEN \
+                     RAISE EXCEPTION 'injected credit-posting rejection'; \
+                   END IF; \
+                   RETURN NEW; \
+                 END \
+                 $$; \
+             CREATE TRIGGER tiv_reject_credit_posting \
+                 BEFORE INSERT ON ledger_postings \
+                 FOR EACH ROW EXECUTE FUNCTION tiv_reject_credit_posting()",
+        )
+        .await
+        .expect("the isolated case installs the second-leg rejection");
+
+    let mut fixture = PaymentIntentFixture::new(Seed::new(6_172));
+    let payment_intent = fixture
+        .create(
+            IdempotencyKey::new("ledger-rollback-contract").unwrap(),
+            CreatePaymentIntent::new(2_500, "usd")
+                .unwrap()
+                .with_operation_id(OperationId::new("op_deadbeef").unwrap()),
+            FaultOutcome::Normal,
+        )
+        .expect("the rollback contract creates one provider object");
+    fixture
+        .confirm(payment_intent.id())
+        .expect("the provider object reaches succeeded");
+    let attempt = fixture.events()[0]
+        .webhook_attempt(current_unix_timestamp(), b"whsec_test_secret")
+        .expect("the immutable event is signed for delivery");
+    let response = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap()
+        .post("http://127.0.0.1:18080/webhooks/stripe")
+        .header("Stripe-Signature", attempt.signature_header())
+        .header("Connection", "close")
+        .body(attempt.raw_body().to_vec())
+        .send()
+        .await
+        .expect("the rejected ledger write receives an application response");
+    assert_eq!(
+        response.status(),
+        reqwest::StatusCode::INTERNAL_SERVER_ERROR
+    );
+    assert_eq!(response.text().await.unwrap(), "database failure");
+
+    let state = admin
+        .query_one(
+            "SELECT \
+                 (SELECT COUNT(*)::bigint FROM processed_webhook_events), \
+                 (SELECT COUNT(*)::bigint FROM webhook_deliveries), \
+                 (SELECT COUNT(*)::bigint FROM payments), \
+                 (SELECT COUNT(*)::bigint FROM webhook_effects), \
+                 (SELECT COUNT(*)::bigint FROM ledger_entries), \
+                 (SELECT COUNT(*)::bigint FROM ledger_postings)",
+            &[],
+        )
+        .await
+        .expect("the rollback state is observable");
+    for column in 0..6 {
+        assert_eq!(state.get::<_, i64>(column), 0);
+    }
+    drop(admin);
+    connection.await.unwrap().unwrap();
+
+    cleanup_reference_databases().await;
+    recreate_reference_app_in_all_modes(
+        FAULTY_RETRY_KEY_MODE,
+        REPAIRED_WEBHOOK_EFFECT_MODE,
+        REPAIRED_LEDGER_BALANCE_MODE,
+    );
     restore.disarm();
 }
 
@@ -1308,10 +1621,25 @@ fn run_configured_command_in_modes(
     retry_key_mode: &str,
     webhook_effect_mode: &str,
 ) -> std::process::Output {
-    require_reference_app_modes(retry_key_mode, webhook_effect_mode);
+    run_configured_command_in_all_modes(
+        seed,
+        retry_key_mode,
+        webhook_effect_mode,
+        REPAIRED_LEDGER_BALANCE_MODE,
+    )
+}
+
+fn run_configured_command_in_all_modes(
+    seed: u64,
+    retry_key_mode: &str,
+    webhook_effect_mode: &str,
+    ledger_balance_mode: &str,
+) -> std::process::Output {
+    require_reference_app_all_modes(retry_key_mode, webhook_effect_mode, ledger_balance_mode);
     configured_command(seed, 1)
         .env(RETRY_KEY_MODE_ENV, retry_key_mode)
         .env(WEBHOOK_EFFECT_MODE_ENV, webhook_effect_mode)
+        .env(LEDGER_BALANCE_MODE_ENV, ledger_balance_mode)
         .output()
         .expect("the mode-bound configured campaign command executes")
 }
@@ -1352,11 +1680,26 @@ fn configured_replay_command_in_modes(
     retry_key_mode: &str,
     webhook_effect_mode: &str,
 ) -> Command {
-    require_reference_app_modes(retry_key_mode, webhook_effect_mode);
+    configured_replay_command_in_all_modes(
+        artifact,
+        retry_key_mode,
+        webhook_effect_mode,
+        REPAIRED_LEDGER_BALANCE_MODE,
+    )
+}
+
+fn configured_replay_command_in_all_modes(
+    artifact: &Path,
+    retry_key_mode: &str,
+    webhook_effect_mode: &str,
+    ledger_balance_mode: &str,
+) -> Command {
+    require_reference_app_all_modes(retry_key_mode, webhook_effect_mode, ledger_balance_mode);
     let mut command = configured_replay_command(artifact);
     command
         .env(RETRY_KEY_MODE_ENV, retry_key_mode)
-        .env(WEBHOOK_EFFECT_MODE_ENV, webhook_effect_mode);
+        .env(WEBHOOK_EFFECT_MODE_ENV, webhook_effect_mode)
+        .env(LEDGER_BALANCE_MODE_ENV, ledger_balance_mode);
     command
 }
 
@@ -1392,11 +1735,26 @@ fn configured_shrink_command_in_modes(
     retry_key_mode: &str,
     webhook_effect_mode: &str,
 ) -> Command {
-    require_reference_app_modes(retry_key_mode, webhook_effect_mode);
+    configured_shrink_command_in_all_modes(
+        artifact,
+        retry_key_mode,
+        webhook_effect_mode,
+        REPAIRED_LEDGER_BALANCE_MODE,
+    )
+}
+
+fn configured_shrink_command_in_all_modes(
+    artifact: &Path,
+    retry_key_mode: &str,
+    webhook_effect_mode: &str,
+    ledger_balance_mode: &str,
+) -> Command {
+    require_reference_app_all_modes(retry_key_mode, webhook_effect_mode, ledger_balance_mode);
     let mut command = configured_shrink_command_with_limit(artifact, 3);
     command
         .env(RETRY_KEY_MODE_ENV, retry_key_mode)
-        .env(WEBHOOK_EFFECT_MODE_ENV, webhook_effect_mode);
+        .env(WEBHOOK_EFFECT_MODE_ENV, webhook_effect_mode)
+        .env(LEDGER_BALANCE_MODE_ENV, ledger_balance_mode);
     command
 }
 
@@ -1425,11 +1783,26 @@ fn configured_minimized_replay_command_in_modes(
     retry_key_mode: &str,
     webhook_effect_mode: &str,
 ) -> Command {
-    require_reference_app_modes(retry_key_mode, webhook_effect_mode);
+    configured_minimized_replay_command_in_all_modes(
+        artifact,
+        retry_key_mode,
+        webhook_effect_mode,
+        REPAIRED_LEDGER_BALANCE_MODE,
+    )
+}
+
+fn configured_minimized_replay_command_in_all_modes(
+    artifact: &Path,
+    retry_key_mode: &str,
+    webhook_effect_mode: &str,
+    ledger_balance_mode: &str,
+) -> Command {
+    require_reference_app_all_modes(retry_key_mode, webhook_effect_mode, ledger_balance_mode);
     let mut command = configured_minimized_replay_command(artifact);
     command
         .env(RETRY_KEY_MODE_ENV, retry_key_mode)
-        .env(WEBHOOK_EFFECT_MODE_ENV, webhook_effect_mode);
+        .env(WEBHOOK_EFFECT_MODE_ENV, webhook_effect_mode)
+        .env(LEDGER_BALANCE_MODE_ENV, ledger_balance_mode);
     command
 }
 
@@ -1529,6 +1902,186 @@ fn assert_row_one_trace(artifact: &Path) {
     assert!(deliver_index < duplicate_index);
 }
 
+#[allow(clippy::too_many_lines)]
+fn prove_duplicate_fault_replay_shrink(
+    source_path: &Path,
+    modes: (&str, &str, &str),
+    invariant_id: &str,
+) {
+    let replay_output =
+        configured_replay_command_in_all_modes(source_path, modes.0, modes.1, modes.2)
+            .output()
+            .expect("the duplicate-fault configured replay executes");
+    assert_eq!(
+        replay_output.status.code(),
+        Some(10),
+        "duplicate-fault replay failed: {}",
+        String::from_utf8_lossy(&replay_output.stderr)
+    );
+    let replay_receipt: serde_json::Value =
+        serde_json::from_slice(&replay_output.stdout).expect("replay stdout is JSON");
+    assert_eq!(replay_receipt["attempt_count"], 3);
+    assert_eq!(replay_receipt["matching_failure_count"], 3);
+    assert_eq!(replay_receipt["classification"], "stable");
+    let replay_path = Path::new(replay_receipt["artifact_path"].as_str().unwrap());
+    verify_complete_run_artifact(replay_path).expect("the replay artifact verifies");
+    let replay_summary: serde_json::Value =
+        serde_json::from_slice(&fs::read(replay_path.join("summary.json")).unwrap()).unwrap();
+    assert!(
+        replay_summary["attempts"]
+            .as_array()
+            .is_some_and(|attempts| {
+                attempts.len() == 3
+                    && attempts.iter().all(|attempt| {
+                        attempt["verdict"] == "expected_violation"
+                            && exact_invariant_vector(attempt, invariant_id, true)
+                    })
+            })
+    );
+    for attempt in 1..=3 {
+        assert_balanced_ledger_witness_artifact(
+            &replay_path.join(format!(
+                "attempts/attempt_{attempt:04}/invariants/witnesses.json"
+            )),
+            2_500,
+        );
+    }
+
+    let shrink_output =
+        configured_shrink_command_in_all_modes(replay_path, modes.0, modes.1, modes.2)
+            .output()
+            .expect("the duplicate-fault configured shrink executes");
+    assert!(
+        matches!(shrink_output.status.code(), Some(10 | 11)),
+        "duplicate-fault shrink failed: {}",
+        String::from_utf8_lossy(&shrink_output.stderr)
+    );
+    let shrink_receipt: serde_json::Value =
+        serde_json::from_slice(&shrink_output.stdout).expect("shrink stdout is JSON");
+    assert_eq!(shrink_receipt["evaluated_candidates"], 3);
+    assert_eq!(shrink_receipt["accepted_candidates"], 1);
+    assert_eq!(shrink_receipt["original_action_count"], 8);
+    assert_eq!(shrink_receipt["best_action_count"], 7);
+    let shrink_path = Path::new(shrink_receipt["artifact_path"].as_str().unwrap());
+    verify_complete_run_artifact(shrink_path).expect("the shrink artifact verifies");
+    let shrink_summary: serde_json::Value =
+        serde_json::from_slice(&fs::read(shrink_path.join("summary.json")).unwrap()).unwrap();
+    let candidates = shrink_summary["candidates"]
+        .as_array()
+        .expect("the bounded candidates are recorded");
+    assert_eq!(candidates.len(), 3);
+    assert!(
+        candidates
+            .iter()
+            .any(|candidate| candidate["accepted"] == true && candidate["action_count"] == 7)
+    );
+    assert!(
+        candidates
+            .iter()
+            .filter(|candidate| candidate["accepted"] == false)
+            .any(|candidate| {
+                let Some(candidate_id) = candidate["candidate_id"].as_str() else {
+                    return false;
+                };
+                let candidate: serde_json::Value = serde_json::from_slice(
+                    &fs::read(
+                        shrink_path
+                            .join("candidates")
+                            .join(candidate_id)
+                            .join("candidate.json"),
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+                candidate["schedule"].as_array().is_some_and(|schedule| {
+                    schedule
+                        .iter()
+                        .all(|action| action["kind"]["kind"] != "duplicate_webhook")
+                })
+            }),
+        "removing the causal duplicate must be evaluated and rejected"
+    );
+    for attempt in 1..=3 {
+        assert_balanced_ledger_witness_artifact(
+            &shrink_path.join(format!(
+                "original/attempts/attempt_{attempt:04}/invariants/witnesses.json"
+            )),
+            2_500,
+        );
+    }
+    for candidate in candidates {
+        let candidate_id = candidate["candidate_id"].as_str().unwrap();
+        for attempt in candidate["attempts"].as_array().unwrap() {
+            let attempt_number = attempt["attempt"].as_u64().unwrap();
+            let expected_violation = attempt["verdict"] == "expected_violation";
+            assert!(exact_invariant_vector(
+                attempt,
+                invariant_id,
+                expected_violation
+            ));
+            let witness_path = shrink_path.join(format!(
+                "candidates/{candidate_id}/attempts/attempt_{attempt_number:04}/invariants/witnesses.json"
+            ));
+            if expected_violation {
+                assert_balanced_ledger_witness_artifact(&witness_path, 2_500);
+            } else {
+                assert!(!witness_path.exists());
+            }
+        }
+    }
+    let minimized_authority: serde_json::Value =
+        serde_json::from_slice(&fs::read(shrink_path.join("trace.minimized.json")).unwrap())
+            .unwrap();
+    let minimized_schedule = minimized_authority["candidate"]["schedule"]
+        .as_array()
+        .expect("the minimized authority retains its schedule");
+    assert_eq!(minimized_schedule.len(), 7);
+    assert!(
+        minimized_schedule
+            .iter()
+            .any(|action| action["kind"]["kind"] == "duplicate_webhook"),
+        "the minimized authority must retain the causal duplicate"
+    );
+
+    let minimized_output =
+        configured_minimized_replay_command_in_all_modes(shrink_path, modes.0, modes.1, modes.2)
+            .output()
+            .expect("the duplicate-fault minimized replay executes");
+    assert_eq!(
+        minimized_output.status.code(),
+        Some(10),
+        "duplicate-fault minimized replay failed: {}",
+        String::from_utf8_lossy(&minimized_output.stderr)
+    );
+    let minimized_receipt: serde_json::Value =
+        serde_json::from_slice(&minimized_output.stdout).expect("minimized stdout is JSON");
+    assert_eq!(minimized_receipt["attempt_count"], 3);
+    assert_eq!(minimized_receipt["matching_failure_count"], 3);
+    assert_eq!(minimized_receipt["classification"], "stable");
+    let minimized_path = Path::new(minimized_receipt["artifact_path"].as_str().unwrap());
+    verify_complete_run_artifact(minimized_path).expect("the minimized artifact verifies");
+    let minimized_summary: serde_json::Value =
+        serde_json::from_slice(&fs::read(minimized_path.join("summary.json")).unwrap()).unwrap();
+    assert!(
+        minimized_summary["attempts"]
+            .as_array()
+            .is_some_and(|attempts| {
+                attempts.len() == 3
+                    && attempts
+                        .iter()
+                        .all(|attempt| exact_invariant_vector(attempt, invariant_id, true))
+            })
+    );
+    for attempt in 1..=3 {
+        assert_balanced_ledger_witness_artifact(
+            &minimized_path.join(format!(
+                "attempts/attempt_{attempt:04}/invariants/witnesses.json"
+            )),
+            2_500,
+        );
+    }
+}
+
 fn recorded_invariant(
     record: &serde_json::Value,
     invariant_id: &str,
@@ -1547,6 +2100,26 @@ fn recorded_invariant(
                 && recorded_verdict
                 && invariant["witness_count"] == witness_count
         })
+    })
+}
+
+fn exact_invariant_vector(
+    record: &serde_json::Value,
+    expected_invariant_id: &str,
+    expected_violation: bool,
+) -> bool {
+    record["invariants"].as_array().is_some_and(|invariants| {
+        invariants.len() == 5
+            && invariants.iter().all(|invariant| {
+                let Some(invariant_id) = invariant["invariant_id"].as_str() else {
+                    return false;
+                };
+                if invariant_id == expected_invariant_id && expected_violation {
+                    recorded_invariant(record, invariant_id, "violated", 1)
+                } else {
+                    recorded_invariant(record, invariant_id, "held", 0)
+                }
+            })
     })
 }
 
@@ -1580,6 +2153,112 @@ async fn assert_reference_webhook_delivery_count(expected: i64) {
     drop(client);
     connection.await.unwrap().unwrap();
     assert_eq!(observed, expected);
+}
+
+async fn assert_reference_ledger_state(expected: (i64, i64, i64, i64, i64, i64)) {
+    let case_url = ADMIN_URL.replace("/postgres", "/tiv_case_deadbeef");
+    let (client, connection) = tokio_postgres::connect(&case_url, NoTls)
+        .await
+        .expect("the test admin connects to the generated case");
+    let connection = tokio::spawn(connection);
+    let state = client
+        .query_one(
+            "WITH balances AS ( \
+                 SELECT entries.entry_id, \
+                        COALESCE(SUM(postings.amount_minor) \
+                            FILTER (WHERE postings.entry_side = 'debit'), 0)::bigint \
+                            AS debit_total, \
+                        COALESCE(SUM(postings.amount_minor) \
+                            FILTER (WHERE postings.entry_side = 'credit'), 0)::bigint \
+                            AS credit_total \
+                 FROM ledger_entries AS entries \
+                 LEFT JOIN ledger_postings AS postings USING (entry_id) \
+                 GROUP BY entries.entry_id \
+             ) \
+             SELECT \
+                 (SELECT COUNT(*)::bigint FROM ledger_entries), \
+                 (SELECT COUNT(*)::bigint FROM ledger_postings), \
+                 (SELECT COALESCE(SUM(amount_minor), 0)::bigint \
+                    FROM ledger_postings WHERE entry_side = 'debit'), \
+                 (SELECT COALESCE(SUM(amount_minor), 0)::bigint \
+                    FROM ledger_postings WHERE entry_side = 'credit'), \
+                 (SELECT COUNT(*)::bigint FROM balances \
+                    WHERE debit_total <> credit_total), \
+                 (SELECT COALESCE(MAX(debit_total - credit_total), 0)::bigint \
+                    FROM balances WHERE debit_total <> credit_total)",
+            &[],
+        )
+        .await
+        .expect("the ledger state is readable");
+    drop(client);
+    connection.await.unwrap().unwrap();
+    assert_eq!(
+        (
+            state.get::<_, i64>(0),
+            state.get::<_, i64>(1),
+            state.get::<_, i64>(2),
+            state.get::<_, i64>(3),
+            state.get::<_, i64>(4),
+            state.get::<_, i64>(5),
+        ),
+        expected
+    );
+}
+
+fn assert_balanced_ledger_witness_artifact(path: &Path, expected_imbalance: i64) {
+    let bundle: serde_json::Value = serde_json::from_slice(
+        &fs::read(path).expect("the balanced-ledger witness artifact is retained"),
+    )
+    .expect("the balanced-ledger witness artifact is JSON");
+    assert_eq!(bundle["schema_version"], 1);
+    let witness = bundle["invariants"]
+        .as_array()
+        .and_then(|invariants| {
+            invariants
+                .iter()
+                .find(|invariant| invariant["invariant_id"] == "balanced-ledger")
+        })
+        .expect("the bundle retains the balanced-ledger violation");
+    assert_eq!(witness["invariant_id"], "balanced-ledger");
+    assert_eq!(witness["checkpoint_id"], "checkout-quiescent");
+    assert_eq!(witness["witness_count"], 1);
+    assert_eq!(witness["projection"], "reference_ledger_allowlist");
+    assert_eq!(witness["retained_row_count"], 1);
+    assert_eq!(witness["omitted_row_count"], 0);
+    assert_eq!(witness["rows_truncated"], false);
+    let rows = witness["rows"]
+        .as_array()
+        .expect("the bounded witness rows are an array");
+    assert_eq!(rows.len(), 1);
+    let digest = witness["witness_digest"]
+        .as_str()
+        .expect("a violation witness has a digest");
+    assert_eq!(digest.len(), 64);
+    assert_eq!(
+        digest,
+        blake3::hash(&serde_json::to_vec(rows).unwrap())
+            .to_hex()
+            .as_str()
+    );
+    let row = &rows[0];
+    assert!(
+        row["provider_event_id"]
+            .as_str()
+            .is_some_and(|value| value.starts_with("evt_tiv_"))
+    );
+    assert_eq!(row["operation_id"], "op_deadbeef");
+    assert!(
+        row["entry_id"]
+            .as_str()
+            .is_some_and(|value| Uuid::parse_str(value).is_ok())
+    );
+    assert_eq!(row["currency"], "usd");
+    assert_eq!(row["posting_count"], 1);
+    assert_eq!(row["debit_posting_count"], 1);
+    assert_eq!(row["credit_posting_count"], 0);
+    assert_eq!(row["debit_total_minor"], 2_500);
+    assert_eq!(row["credit_total_minor"], 0);
+    assert_eq!(row["imbalance_minor"], expected_imbalance);
 }
 
 fn current_unix_timestamp() -> i64 {
@@ -1738,9 +2417,25 @@ fn recreate_reference_app_in_retry_mode(retry_key_mode: &str) {
 }
 
 fn recreate_reference_app_in_modes(retry_key_mode: &str, webhook_effect_mode: &str) {
-    let output = reference_app_recreate_command(retry_key_mode, webhook_effect_mode)
-        .output()
-        .expect("Docker Compose recreates the reference application");
+    recreate_reference_app_in_all_modes(
+        retry_key_mode,
+        webhook_effect_mode,
+        REPAIRED_LEDGER_BALANCE_MODE,
+    );
+}
+
+fn recreate_reference_app_in_all_modes(
+    retry_key_mode: &str,
+    webhook_effect_mode: &str,
+    ledger_balance_mode: &str,
+) {
+    let output = reference_app_recreate_command_in_all_modes(
+        retry_key_mode,
+        webhook_effect_mode,
+        ledger_balance_mode,
+    )
+    .output()
+    .expect("Docker Compose recreates the reference application");
     assert!(
         output.status.success(),
         "reference app recreation failed: {}",
@@ -1750,8 +2445,33 @@ fn recreate_reference_app_in_modes(retry_key_mode: &str, webhook_effect_mode: &s
 
     let expected_retry = format!("{RETRY_KEY_MODE_ENV}={retry_key_mode}");
     let expected_webhook = format!("{WEBHOOK_EFFECT_MODE_ENV}={webhook_effect_mode}");
+    let expected_ledger = format!("{LEDGER_BALANCE_MODE_ENV}={ledger_balance_mode}");
+    let conflicting_retry = format!(
+        "{RETRY_KEY_MODE_ENV}={}",
+        if retry_key_mode == FAULTY_RETRY_KEY_MODE {
+            REPAIRED_RETRY_KEY_MODE
+        } else {
+            FAULTY_RETRY_KEY_MODE
+        }
+    );
+    let conflicting_webhook = format!(
+        "{WEBHOOK_EFFECT_MODE_ENV}={}",
+        if webhook_effect_mode == FAULTY_WEBHOOK_EFFECT_MODE {
+            REPAIRED_WEBHOOK_EFFECT_MODE
+        } else {
+            FAULTY_WEBHOOK_EFFECT_MODE
+        }
+    );
+    let conflicting_ledger = format!(
+        "{LEDGER_BALANCE_MODE_ENV}={}",
+        if ledger_balance_mode == FAULTY_LEDGER_BALANCE_MODE {
+            REPAIRED_LEDGER_BALANCE_MODE
+        } else {
+            FAULTY_LEDGER_BALANCE_MODE
+        }
+    );
     let template = format!(
-        "{{{{range .Config.Env}}}}{{{{if eq . \"{expected_retry}\"}}}}retry {{{{end}}}}{{{{if eq . \"{expected_webhook}\"}}}}webhook {{{{end}}}}{{{{end}}}}"
+        "{{{{range .Config.Env}}}}{{{{if eq . \"{expected_retry}\"}}}}retry {{{{end}}}}{{{{if eq . \"{conflicting_retry}\"}}}}retry_conflict {{{{end}}}}{{{{if eq . \"{expected_webhook}\"}}}}webhook {{{{end}}}}{{{{if eq . \"{conflicting_webhook}\"}}}}webhook_conflict {{{{end}}}}{{{{if eq . \"{expected_ledger}\"}}}}ledger {{{{end}}}}{{{{if eq . \"{conflicting_ledger}\"}}}}ledger_conflict {{{{end}}}}{{{{end}}}}"
     );
     let inspection = Command::new("docker")
         .args([
@@ -1766,18 +2486,29 @@ fn recreate_reference_app_in_modes(retry_key_mode: &str, webhook_effect_mode: &s
         .expect("Docker inspects the selected non-secret reference-app modes");
     assert!(inspection.status.success());
     let inspection_stdout = String::from_utf8_lossy(&inspection.stdout);
-    let observed = inspection_stdout
-        .split_whitespace()
-        .collect::<BTreeSet<_>>();
+    let mut observed = inspection_stdout.split_whitespace().collect::<Vec<_>>();
+    observed.sort_unstable();
     assert_eq!(
         observed,
-        BTreeSet::from(["retry", "webhook"]),
-        "both selected reference-app modes must be present"
+        ["ledger", "retry", "webhook"],
+        "all selected reference-app modes must be present"
     );
 }
 
 fn reference_app_recreate_command(retry_key_mode: &str, webhook_effect_mode: &str) -> Command {
-    require_reference_app_modes(retry_key_mode, webhook_effect_mode);
+    reference_app_recreate_command_in_all_modes(
+        retry_key_mode,
+        webhook_effect_mode,
+        REPAIRED_LEDGER_BALANCE_MODE,
+    )
+}
+
+fn reference_app_recreate_command_in_all_modes(
+    retry_key_mode: &str,
+    webhook_effect_mode: &str,
+    ledger_balance_mode: &str,
+) -> Command {
+    require_reference_app_all_modes(retry_key_mode, webhook_effect_mode, ledger_balance_mode);
     let repository_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let compose_file = repository_root.join("spike/reference-app.compose.yaml");
     let mut command = Command::new("docker");
@@ -1806,6 +2537,7 @@ fn reference_app_recreate_command(retry_key_mode: &str, webhook_effect_mode: &st
         ])
         .env(RETRY_KEY_MODE_ENV, retry_key_mode)
         .env(WEBHOOK_EFFECT_MODE_ENV, webhook_effect_mode)
+        .env(LEDGER_BALANCE_MODE_ENV, ledger_balance_mode)
         .env_remove("DOCKER_HOST")
         .env_remove("DOCKER_CONTEXT")
         .env_remove("DOCKER_TLS_VERIFY")
@@ -1813,7 +2545,11 @@ fn reference_app_recreate_command(retry_key_mode: &str, webhook_effect_mode: &st
     command
 }
 
-fn require_reference_app_modes(retry_key_mode: &str, webhook_effect_mode: &str) {
+fn require_reference_app_all_modes(
+    retry_key_mode: &str,
+    webhook_effect_mode: &str,
+    ledger_balance_mode: &str,
+) {
     assert!(matches!(
         retry_key_mode,
         "faulty_changed_key" | "repaired_same_key"
@@ -1822,6 +2558,15 @@ fn require_reference_app_modes(retry_key_mode: &str, webhook_effect_mode: &str) 
         webhook_effect_mode,
         "faulty_duplicate_effect" | "repaired_deduplicate"
     ));
+    assert!(matches!(
+        ledger_balance_mode,
+        "faulty_one_sided_duplicate" | "repaired_balanced_once"
+    ));
+    assert!(
+        webhook_effect_mode != FAULTY_WEBHOOK_EFFECT_MODE
+            || ledger_balance_mode != FAULTY_LEDGER_BALANCE_MODE,
+        "effect-duplication and one-sided-ledger faults are mutually exclusive"
+    );
 }
 
 async fn reset_fixture_process() {
@@ -1908,7 +2653,8 @@ async fn prepare_reference_baseline() {
                  operation_id text NOT NULL UNIQUE, \
                  amount_minor bigint NOT NULL CHECK (amount_minor > 0), \
                  currency text NOT NULL CHECK (currency ~ '^[a-z]{3}$'), \
-                 status text NOT NULL CHECK (status IN ('pending', 'paid')) \
+                 status text NOT NULL CHECK (status IN ('pending', 'paid')), \
+                 UNIQUE (operation_id, amount_minor, currency) \
              ); \
              CREATE TABLE payments ( \
                  id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, \
@@ -1925,13 +2671,53 @@ async fn prepare_reference_baseline() {
                  UNIQUE (provider_event_id, operation_id) \
              ); \
              CREATE TABLE webhook_deliveries ( \
-                 id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, \
+                 delivery_id uuid PRIMARY KEY, \
                  provider_event_id text NOT NULL, \
                  operation_id text NOT NULL, \
+                 UNIQUE (delivery_id, provider_event_id, operation_id), \
                  CONSTRAINT webhook_deliveries_event_identity_fkey \
                      FOREIGN KEY (provider_event_id, operation_id) \
                      REFERENCES processed_webhook_events \
                          (provider_event_id, operation_id) \
+             ); \
+             CREATE TABLE ledger_entries ( \
+                 entry_id uuid PRIMARY KEY, \
+                 delivery_id uuid NOT NULL, \
+                 provider_event_id text NOT NULL, \
+                 operation_id text NOT NULL, \
+                 amount_minor bigint NOT NULL CHECK (amount_minor > 0), \
+                 currency text NOT NULL CHECK (currency ~ '^[a-z]{3}$'), \
+                 entry_kind text NOT NULL CHECK (entry_kind = 'payment_succeeded'), \
+                 UNIQUE (delivery_id), \
+                 UNIQUE (entry_id, amount_minor, currency), \
+                 CONSTRAINT ledger_entries_delivery_identity_fkey \
+                     FOREIGN KEY (delivery_id, provider_event_id, operation_id) \
+                     REFERENCES webhook_deliveries \
+                         (delivery_id, provider_event_id, operation_id), \
+                 CONSTRAINT ledger_entries_order_value_fkey \
+                     FOREIGN KEY (operation_id, amount_minor, currency) \
+                     REFERENCES orders (operation_id, amount_minor, currency) \
+             ); \
+             CREATE TABLE ledger_postings ( \
+                 posting_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, \
+                 entry_id uuid NOT NULL, \
+                 account_code text NOT NULL, \
+                 entry_side text NOT NULL CHECK (entry_side IN ('debit', 'credit')), \
+                 amount_minor bigint NOT NULL CHECK (amount_minor > 0), \
+                 currency text NOT NULL CHECK (currency ~ '^[a-z]{3}$'), \
+                 UNIQUE (entry_id, account_code), \
+                 CONSTRAINT ledger_postings_account_side_check CHECK ( \
+                     ( \
+                         account_code = 'processor_clearing' \
+                         AND entry_side = 'debit' \
+                     ) OR ( \
+                         account_code = 'order_payment_liability' \
+                         AND entry_side = 'credit' \
+                     ) \
+                 ), \
+                 CONSTRAINT ledger_postings_entry_value_fkey \
+                     FOREIGN KEY (entry_id, amount_minor, currency) \
+                     REFERENCES ledger_entries (entry_id, amount_minor, currency) \
              ); \
              CREATE TABLE webhook_effects ( \
                  id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, \
@@ -1945,24 +2731,28 @@ async fn prepare_reference_baseline() {
              CREATE INDEX payments_provider_id_idx ON payments (stripe_payment_intent_id); \
              CREATE INDEX webhook_effects_event_idx \
                  ON webhook_effects (provider_event_id); \
+             CREATE INDEX ledger_entries_event_idx \
+                 ON ledger_entries (provider_event_id); \
              REVOKE ALL ON SCHEMA public FROM PUBLIC; \
              GRANT USAGE ON SCHEMA public TO tiv_app, tiv_invariant; \
              REVOKE ALL ON TABLE tiv_verifier_marker, orders, payments, \
-                 processed_webhook_events, webhook_deliveries, webhook_effects \
+                 processed_webhook_events, webhook_deliveries, webhook_effects, \
+                 ledger_entries, ledger_postings \
                  FROM PUBLIC, tiv_app, tiv_invariant; \
              REVOKE ALL ON SEQUENCE orders_id_seq, payments_id_seq, \
-                 webhook_deliveries_id_seq, webhook_effects_id_seq \
+                 webhook_effects_id_seq, ledger_postings_posting_id_seq \
                  FROM PUBLIC, tiv_app, tiv_invariant; \
              GRANT SELECT (operation_id, amount_minor, currency) ON TABLE orders TO tiv_app; \
              GRANT INSERT ON TABLE payments TO tiv_app; \
              GRANT SELECT (operation_id, stripe_payment_intent_id), \
                    UPDATE (status) ON TABLE payments TO tiv_app; \
              GRANT INSERT ON TABLE processed_webhook_events, webhook_deliveries, \
-                 webhook_effects TO tiv_app; \
-             GRANT USAGE ON SEQUENCE payments_id_seq, webhook_deliveries_id_seq, \
-                 webhook_effects_id_seq TO tiv_app; \
+                 webhook_effects, ledger_entries, ledger_postings TO tiv_app; \
+             GRANT USAGE ON SEQUENCE payments_id_seq, webhook_effects_id_seq, \
+                 ledger_postings_posting_id_seq TO tiv_app; \
              GRANT SELECT ON TABLE orders, payments, processed_webhook_events, \
-                 webhook_deliveries, webhook_effects TO tiv_invariant; \
+                 webhook_deliveries, webhook_effects, ledger_entries, ledger_postings \
+                 TO tiv_invariant; \
              INSERT INTO orders (operation_id, amount_minor, currency, status) \
                  VALUES ('op_deadbeef', 2500, 'usd', 'pending')",
         )

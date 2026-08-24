@@ -605,6 +605,7 @@ impl TruthSpikePostgres {
         result
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn initialize_reference_baseline(
         &self,
         baseline_name: &DatabaseName,
@@ -629,7 +630,8 @@ impl TruthSpikePostgres {
                          operation_id text NOT NULL UNIQUE, \
                          amount_minor bigint NOT NULL CHECK (amount_minor > 0), \
                          currency text NOT NULL CHECK (currency ~ '^[a-z]{3}$'), \
-                         status text NOT NULL CHECK (status IN ('pending', 'paid')) \
+                         status text NOT NULL CHECK (status IN ('pending', 'paid')), \
+                         UNIQUE (operation_id, amount_minor, currency) \
                      ); \
                      CREATE TABLE payments ( \
                          id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, \
@@ -646,13 +648,53 @@ impl TruthSpikePostgres {
                          UNIQUE (provider_event_id, operation_id) \
                      ); \
                      CREATE TABLE webhook_deliveries ( \
-                         id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, \
+                         delivery_id uuid PRIMARY KEY, \
                          provider_event_id text NOT NULL, \
                          operation_id text NOT NULL, \
+                         UNIQUE (delivery_id, provider_event_id, operation_id), \
                          CONSTRAINT webhook_deliveries_event_identity_fkey \
                              FOREIGN KEY (provider_event_id, operation_id) \
                              REFERENCES processed_webhook_events \
                                  (provider_event_id, operation_id) \
+                     ); \
+                     CREATE TABLE ledger_entries ( \
+                         entry_id uuid PRIMARY KEY, \
+                         delivery_id uuid NOT NULL, \
+                         provider_event_id text NOT NULL, \
+                         operation_id text NOT NULL, \
+                         amount_minor bigint NOT NULL CHECK (amount_minor > 0), \
+                         currency text NOT NULL CHECK (currency ~ '^[a-z]{3}$'), \
+                         entry_kind text NOT NULL CHECK (entry_kind = 'payment_succeeded'), \
+                         UNIQUE (delivery_id), \
+                         UNIQUE (entry_id, amount_minor, currency), \
+                         CONSTRAINT ledger_entries_delivery_identity_fkey \
+                             FOREIGN KEY (delivery_id, provider_event_id, operation_id) \
+                             REFERENCES webhook_deliveries \
+                                 (delivery_id, provider_event_id, operation_id), \
+                         CONSTRAINT ledger_entries_order_value_fkey \
+                             FOREIGN KEY (operation_id, amount_minor, currency) \
+                             REFERENCES orders (operation_id, amount_minor, currency) \
+                     ); \
+                     CREATE TABLE ledger_postings ( \
+                         posting_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, \
+                         entry_id uuid NOT NULL, \
+                         account_code text NOT NULL, \
+                         entry_side text NOT NULL CHECK (entry_side IN ('debit', 'credit')), \
+                         amount_minor bigint NOT NULL CHECK (amount_minor > 0), \
+                         currency text NOT NULL CHECK (currency ~ '^[a-z]{3}$'), \
+                         UNIQUE (entry_id, account_code), \
+                         CONSTRAINT ledger_postings_account_side_check CHECK ( \
+                             ( \
+                                 account_code = 'processor_clearing' \
+                                 AND entry_side = 'debit' \
+                             ) OR ( \
+                                 account_code = 'order_payment_liability' \
+                                 AND entry_side = 'credit' \
+                             ) \
+                         ), \
+                         CONSTRAINT ledger_postings_entry_value_fkey \
+                             FOREIGN KEY (entry_id, amount_minor, currency) \
+                             REFERENCES ledger_entries (entry_id, amount_minor, currency) \
                      ); \
                      CREATE TABLE webhook_effects ( \
                          id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, \
@@ -666,24 +708,28 @@ impl TruthSpikePostgres {
                      CREATE INDEX payments_provider_id_idx ON payments (stripe_payment_intent_id); \
                      CREATE INDEX webhook_effects_event_idx \
                          ON webhook_effects (provider_event_id); \
+                     CREATE INDEX ledger_entries_event_idx \
+                         ON ledger_entries (provider_event_id); \
                      REVOKE ALL ON SCHEMA public FROM PUBLIC; \
                      GRANT USAGE ON SCHEMA public TO tiv_app, tiv_invariant; \
                      REVOKE ALL ON TABLE tiv_verifier_marker, orders, payments, \
-                         processed_webhook_events, webhook_deliveries, webhook_effects \
+                         processed_webhook_events, webhook_deliveries, webhook_effects, \
+                         ledger_entries, ledger_postings \
                          FROM PUBLIC, tiv_app, tiv_invariant; \
                      REVOKE ALL ON SEQUENCE orders_id_seq, payments_id_seq, \
-                         webhook_deliveries_id_seq, webhook_effects_id_seq \
+                         webhook_effects_id_seq, ledger_postings_posting_id_seq \
                          FROM PUBLIC, tiv_app, tiv_invariant; \
                      GRANT SELECT (operation_id, amount_minor, currency) ON TABLE orders TO tiv_app; \
                      GRANT INSERT ON TABLE payments TO tiv_app; \
                      GRANT SELECT (operation_id, stripe_payment_intent_id), \
                            UPDATE (status) ON TABLE payments TO tiv_app; \
                      GRANT INSERT ON TABLE processed_webhook_events, webhook_deliveries, \
-                         webhook_effects TO tiv_app; \
-                     GRANT USAGE ON SEQUENCE payments_id_seq, webhook_deliveries_id_seq, \
-                         webhook_effects_id_seq TO tiv_app; \
+                         webhook_effects, ledger_entries, ledger_postings TO tiv_app; \
+                     GRANT USAGE ON SEQUENCE payments_id_seq, webhook_effects_id_seq, \
+                         ledger_postings_posting_id_seq TO tiv_app; \
                      GRANT SELECT ON TABLE orders, payments, processed_webhook_events, \
-                         webhook_deliveries, webhook_effects TO tiv_invariant;",
+                         webhook_deliveries, webhook_effects, ledger_entries, ledger_postings \
+                         TO tiv_invariant;",
                 )
                 .await?;
             session
@@ -1945,6 +1991,20 @@ mod tests {
             )
             .await
             .expect("the app can claim one immutable provider event");
+        let delivery = app
+            .client()
+            .execute(
+                "INSERT INTO webhook_deliveries \
+                     (delivery_id, provider_event_id, operation_id) \
+                 VALUES ( \
+                     '00000000-0000-4000-8000-000000000001', \
+                     'evt_tiv_role_test', \
+                     $1 \
+                 )",
+                &[&operation_id],
+            )
+            .await
+            .expect("the app can persist one authenticated delivery identity");
         let effect = app
             .client()
             .execute(
@@ -1954,6 +2014,72 @@ mod tests {
             )
             .await
             .expect("the app can persist the event business effect");
+        let ledger_entry = app
+            .client()
+            .execute(
+                "INSERT INTO ledger_entries \
+                     (entry_id, delivery_id, provider_event_id, operation_id, \
+                      amount_minor, currency, entry_kind) \
+                 VALUES ( \
+                     '10000000-0000-4000-8000-000000000001', \
+                     '00000000-0000-4000-8000-000000000001', \
+                     'evt_tiv_role_test', $1, 2500, 'usd', 'payment_succeeded' \
+                 )",
+                &[&operation_id],
+            )
+            .await
+            .expect("the app can persist one journal entry header");
+        let debit_posting = app
+            .client()
+            .execute(
+                "INSERT INTO ledger_postings \
+                     (entry_id, account_code, entry_side, amount_minor, currency) \
+                 VALUES ( \
+                     '10000000-0000-4000-8000-000000000001', \
+                     'processor_clearing', 'debit', 2500, 'usd' \
+                 )",
+                &[],
+            )
+            .await
+            .expect("the app can persist the debit posting");
+        let credit_posting = app
+            .client()
+            .execute(
+                "INSERT INTO ledger_postings \
+                     (entry_id, account_code, entry_side, amount_minor, currency) \
+                 VALUES ( \
+                     '10000000-0000-4000-8000-000000000001', \
+                     'order_payment_liability', 'credit', 2500, 'usd' \
+                 )",
+                &[],
+            )
+            .await
+            .expect("the app can persist the credit posting");
+        let duplicate_delivery_entry = {
+            let transaction = app
+                .client()
+                .transaction()
+                .await
+                .expect("the duplicate-delivery entry probe starts");
+            let result = transaction
+                .execute(
+                    "INSERT INTO ledger_entries \
+                         (entry_id, delivery_id, provider_event_id, operation_id, \
+                          amount_minor, currency, entry_kind) \
+                     VALUES ( \
+                         '10000000-0000-4000-8000-000000000099', \
+                         '00000000-0000-4000-8000-000000000001', \
+                         'evt_tiv_role_test', $1, 2500, 'usd', 'payment_succeeded' \
+                     )",
+                    &[&operation_id],
+                )
+                .await;
+            transaction
+                .rollback()
+                .await
+                .expect("the duplicate-delivery entry probe rolls back");
+            result
+        };
         let repeated_event = app
             .client()
             .execute(
@@ -2014,6 +2140,14 @@ mod tests {
             .client()
             .query("SELECT provider_event_id FROM webhook_deliveries", &[])
             .await;
+        let ungranted_ledger_read = app
+            .client()
+            .query("SELECT entry_id FROM ledger_entries", &[])
+            .await;
+        let ledger_update = app
+            .client()
+            .execute("UPDATE ledger_postings SET amount_minor = 1", &[])
+            .await;
         let effect_update = app
             .client()
             .execute(
@@ -2028,7 +2162,15 @@ mod tests {
         assert_eq!(current_user, APPLICATION_ROLE);
         assert_eq!(inserted, 1);
         assert_eq!(processed_event, 1);
+        assert_eq!(delivery, 1);
         assert_eq!(effect, 1);
+        assert_eq!(ledger_entry, 1);
+        assert_eq!(debit_posting, 1);
+        assert_eq!(credit_posting, 1);
+        assert!(
+            duplicate_delivery_entry.is_err(),
+            "one authenticated delivery can own only one ledger entry"
+        );
         assert_eq!(repeated_event, 0);
         assert_eq!(reconciled, 1);
         assert!(
@@ -2065,12 +2207,21 @@ mod tests {
             "the app cannot enumerate authenticated webhook deliveries"
         );
         assert!(
+            ungranted_ledger_read.is_err(),
+            "the app cannot enumerate ledger entries"
+        );
+        assert!(
+            ledger_update.is_err(),
+            "the app cannot rewrite ledger postings"
+        );
+        assert!(
             effect_update.is_err(),
             "the app cannot rewrite a recorded business effect"
         );
         assert_webhook_identity_collision_contract(postgres, case_name, &operation_id).await;
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn assert_webhook_identity_collision_contract(
         postgres: &TruthSpikePostgres,
         case_name: &DatabaseName,
@@ -2094,8 +2245,12 @@ mod tests {
         let first_delivery = app
             .client()
             .execute(
-                "INSERT INTO webhook_deliveries (provider_event_id, operation_id) \
-                 VALUES ('evt_tiv_identity_contract', $1)",
+                "INSERT INTO webhook_deliveries \
+                     (delivery_id, provider_event_id, operation_id) \
+                 VALUES ( \
+                     '00000000-0000-4000-8000-000000000003', \
+                     'evt_tiv_identity_contract', $1 \
+                 )",
                 &[&operation_id],
             )
             .await
@@ -2103,8 +2258,12 @@ mod tests {
         let repeated_delivery = app
             .client()
             .execute(
-                "INSERT INTO webhook_deliveries (provider_event_id, operation_id) \
-                 VALUES ('evt_tiv_identity_contract', $1)",
+                "INSERT INTO webhook_deliveries \
+                     (delivery_id, provider_event_id, operation_id) \
+                 VALUES ( \
+                     '00000000-0000-4000-8000-000000000004', \
+                     'evt_tiv_identity_contract', $1 \
+                 )",
                 &[&operation_id],
             )
             .await
@@ -2124,8 +2283,12 @@ mod tests {
             .expect("the global event ID is already claimed");
         let colliding_delivery = transaction
             .execute(
-                "INSERT INTO webhook_deliveries (provider_event_id, operation_id) \
-                 VALUES ('evt_tiv_identity_contract', $1)",
+                "INSERT INTO webhook_deliveries \
+                         (delivery_id, provider_event_id, operation_id) \
+                     VALUES ( \
+                         '00000000-0000-4000-8000-000000000005', \
+                         'evt_tiv_identity_contract', $1 \
+                     )",
                 &[&colliding_operation_id],
             )
             .await;
@@ -2270,8 +2433,12 @@ mod tests {
         let reset_delivery = reset_app
             .client()
             .execute(
-                "INSERT INTO webhook_deliveries (provider_event_id, operation_id) \
-                 VALUES ('evt_tiv_role_test_after_reset', $1)",
+                "INSERT INTO webhook_deliveries \
+                     (delivery_id, provider_event_id, operation_id) \
+                 VALUES ( \
+                     '00000000-0000-4000-8000-000000000002', \
+                     'evt_tiv_role_test_after_reset', $1 \
+                 )",
                 &[&operation_id],
             )
             .await
@@ -2285,6 +2452,40 @@ mod tests {
             )
             .await
             .expect("the effect grant survives a template reset");
+        let reset_ledger_entry = reset_app
+            .client()
+            .execute(
+                "INSERT INTO ledger_entries \
+                     (entry_id, delivery_id, provider_event_id, operation_id, \
+                      amount_minor, currency, entry_kind) \
+                 VALUES ( \
+                     '10000000-0000-4000-8000-000000000002', \
+                     '00000000-0000-4000-8000-000000000002', \
+                     'evt_tiv_role_test_after_reset', $1, \
+                     2500, 'usd', 'payment_succeeded' \
+                 )",
+                &[&operation_id],
+            )
+            .await
+            .expect("the ledger-entry grant survives a template reset");
+        let reset_postings = reset_app
+            .client()
+            .execute(
+                "INSERT INTO ledger_postings \
+                     (entry_id, account_code, entry_side, amount_minor, currency) \
+                 VALUES \
+                     ( \
+                         '10000000-0000-4000-8000-000000000002', \
+                         'processor_clearing', 'debit', 2500, 'usd' \
+                     ), \
+                     ( \
+                         '10000000-0000-4000-8000-000000000002', \
+                         'order_payment_liability', 'credit', 2500, 'usd' \
+                     )",
+                &[],
+            )
+            .await
+            .expect("the ledger-posting grant survives a template reset");
         reset_app
             .close()
             .await
@@ -2293,6 +2494,8 @@ mod tests {
         assert_eq!(reset_processed_event, 1);
         assert_eq!(reset_delivery, 1);
         assert_eq!(reset_effect, 1);
+        assert_eq!(reset_ledger_entry, 1);
+        assert_eq!(reset_postings, 2);
     }
 
     fn reference_operation_id(case_name: &DatabaseName) -> String {
@@ -2337,6 +2540,8 @@ mod tests {
                             'tiv_invariant', 'webhook_deliveries', 'SELECT' \
                         ), \
                         has_table_privilege('tiv_invariant', 'webhook_effects', 'SELECT'), \
+                        has_table_privilege('tiv_invariant', 'ledger_entries', 'SELECT'), \
+                        has_table_privilege('tiv_invariant', 'ledger_postings', 'SELECT'), \
                         has_table_privilege( \
                             'tiv_invariant', 'tiv_verifier_marker', 'SELECT' \
                         ), \
@@ -2355,9 +2560,11 @@ mod tests {
         assert!(grants.get::<_, bool>(4));
         assert!(grants.get::<_, bool>(5));
         assert!(grants.get::<_, bool>(6));
-        assert!(!grants.get::<_, bool>(7));
-        assert!(!grants.get::<_, bool>(8));
+        assert!(grants.get::<_, bool>(7));
+        assert!(grants.get::<_, bool>(8));
         assert!(!grants.get::<_, bool>(9));
+        assert!(!grants.get::<_, bool>(10));
+        assert!(!grants.get::<_, bool>(11));
 
         let transaction = admin
             .client()

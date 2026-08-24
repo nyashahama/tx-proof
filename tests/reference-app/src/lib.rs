@@ -21,7 +21,8 @@ use hyper_util::rt::TokioIo;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use tokio::{net::TcpStream, sync::Mutex, time::timeout};
-use tokio_postgres::{Client, NoTls};
+use tokio_postgres::{Client, NoTls, Transaction};
+use uuid::Uuid;
 
 const DRIVER_ACTION_ID_HEADER: &str = "X-Tiv-Action-Id";
 const WEBHOOK_INGRESS_CAPABILITY_HEADER: &str = "X-Tiv-Webhook-Ingress-Capability";
@@ -223,6 +224,49 @@ impl fmt::Display for InvalidWebhookEffectMode {
 }
 
 impl Error for InvalidWebhookEffectMode {}
+
+/// Controls how the reference application posts its double-entry ledger.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum LedgerBalanceMode {
+    /// Reproduces a partial repeated-effect write with only the debit side.
+    FaultyOneSidedOnDuplicate,
+    /// Posts one balanced debit/credit pair for the first accepted effect.
+    #[default]
+    RepairedBalancedOnce,
+}
+
+impl LedgerBalanceMode {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::FaultyOneSidedOnDuplicate => "faulty_one_sided_duplicate",
+            Self::RepairedBalancedOnce => "repaired_balanced_once",
+        }
+    }
+}
+
+impl FromStr for LedgerBalanceMode {
+    type Err = InvalidLedgerBalanceMode;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "faulty_one_sided_duplicate" => Ok(Self::FaultyOneSidedOnDuplicate),
+            "repaired_balanced_once" => Ok(Self::RepairedBalancedOnce),
+            _ => Err(InvalidLedgerBalanceMode),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InvalidLedgerBalanceMode;
+
+impl fmt::Display for InvalidLedgerBalanceMode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("invalid reference-app ledger-balance mode")
+    }
+}
+
+impl Error for InvalidLedgerBalanceMode {}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ObservedPaymentIntent {
@@ -624,6 +668,7 @@ pub struct ReferenceAppConfig {
     control_probe_address: String,
     retry_key_mode: RetryKeyMode,
     webhook_effect_mode: WebhookEffectMode,
+    ledger_balance_mode: LedgerBalanceMode,
 }
 
 impl ReferenceAppConfig {
@@ -669,6 +714,7 @@ impl ReferenceAppConfig {
             control_probe_address,
             retry_key_mode: RetryKeyMode::default(),
             webhook_effect_mode: WebhookEffectMode::default(),
+            ledger_balance_mode: LedgerBalanceMode::default(),
         })
     }
 
@@ -695,6 +741,37 @@ impl ReferenceAppConfig {
     #[must_use]
     pub const fn webhook_effect_mode(&self) -> WebhookEffectMode {
         self.webhook_effect_mode
+    }
+
+    #[must_use]
+    pub const fn with_ledger_balance_mode(
+        mut self,
+        ledger_balance_mode: LedgerBalanceMode,
+    ) -> Self {
+        self.ledger_balance_mode = ledger_balance_mode;
+        self
+    }
+
+    #[must_use]
+    pub const fn ledger_balance_mode(&self) -> LedgerBalanceMode {
+        self.ledger_balance_mode
+    }
+
+    /// Rejects a mode tuple whose duplicate-delivery faults have contradictory
+    /// precedence.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReferenceAppError::IncompatibleFaultModes`] when both the
+    /// duplicate-effect and one-sided-ledger faults are selected.
+    pub fn validate_modes(&self) -> Result<(), ReferenceAppError> {
+        if self.webhook_effect_mode == WebhookEffectMode::FaultyDuplicateEffect
+            && self.ledger_balance_mode == LedgerBalanceMode::FaultyOneSidedOnDuplicate
+        {
+            Err(ReferenceAppError::IncompatibleFaultModes)
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -832,6 +909,7 @@ impl ReferenceApp {
         event: &ObservedWebhookEvent,
     ) -> Result<(), ReferenceAppError> {
         let payment_intent = event.payment_intent();
+        let delivery_id = Uuid::new_v4();
         let (mut client, connection) = self.connect_database(database).await?;
         let result = async {
             let transaction = client.transaction().await?;
@@ -847,9 +925,14 @@ impl ReferenceApp {
                 == 1;
             transaction
                 .execute(
-                    "INSERT INTO webhook_deliveries (provider_event_id, operation_id) \
-                     VALUES ($1, $2)",
-                    &[&event.id(), &payment_intent.operation_id()],
+                    "INSERT INTO webhook_deliveries \
+                         (delivery_id, provider_event_id, operation_id) \
+                     VALUES ($1, $2, $3)",
+                    &[
+                        &delivery_id,
+                        &event.id(),
+                        &payment_intent.operation_id(),
+                    ],
                 )
                 .await?;
             if first_processing {
@@ -876,9 +959,9 @@ impl ReferenceApp {
                         .await?;
                 }
             }
-            if first_processing
-                || self.config.webhook_effect_mode == WebhookEffectMode::FaultyDuplicateEffect
-            {
+            let applies_effect = first_processing
+                || self.config.webhook_effect_mode == WebhookEffectMode::FaultyDuplicateEffect;
+            if applies_effect {
                 transaction
                     .execute(
                         "INSERT INTO webhook_effects (provider_event_id, operation_id) \
@@ -886,6 +969,11 @@ impl ReferenceApp {
                         &[&event.id(), &payment_intent.operation_id()],
                     )
                     .await?;
+                persist_ledger_entry(&transaction, delivery_id, event, true).await?;
+            } else if self.config.ledger_balance_mode
+                == LedgerBalanceMode::FaultyOneSidedOnDuplicate
+            {
+                persist_ledger_entry(&transaction, delivery_id, event, false).await?;
             }
             transaction.commit().await
         }
@@ -927,6 +1015,59 @@ impl ReferenceApp {
     }
 }
 
+async fn persist_ledger_entry(
+    transaction: &Transaction<'_>,
+    delivery_id: Uuid,
+    event: &ObservedWebhookEvent,
+    include_credit: bool,
+) -> Result<(), tokio_postgres::Error> {
+    let entry_id = Uuid::new_v4();
+    let payment_intent = event.payment_intent();
+    transaction
+        .execute(
+            "INSERT INTO ledger_entries \
+                 (entry_id, delivery_id, provider_event_id, operation_id, \
+                  amount_minor, currency, entry_kind) \
+             VALUES ($1, $2, $3, $4, $5, $6, 'payment_succeeded')",
+            &[
+                &entry_id,
+                &delivery_id,
+                &event.id(),
+                &payment_intent.operation_id(),
+                &payment_intent.amount_minor(),
+                &payment_intent.currency(),
+            ],
+        )
+        .await?;
+    transaction
+        .execute(
+            "INSERT INTO ledger_postings \
+                 (entry_id, account_code, entry_side, amount_minor, currency) \
+             VALUES ($1, 'processor_clearing', 'debit', $2, $3)",
+            &[
+                &entry_id,
+                &payment_intent.amount_minor(),
+                &payment_intent.currency(),
+            ],
+        )
+        .await?;
+    if include_credit {
+        transaction
+            .execute(
+                "INSERT INTO ledger_postings \
+                     (entry_id, account_code, entry_side, amount_minor, currency) \
+                 VALUES ($1, 'order_payment_liability', 'credit', $2, $3)",
+                &[
+                    &entry_id,
+                    &payment_intent.amount_minor(),
+                    &payment_intent.currency(),
+                ],
+            )
+            .await?;
+    }
+    Ok(())
+}
+
 type DatabaseConnection = (
     Client,
     tokio::task::JoinHandle<Result<(), tokio_postgres::Error>>,
@@ -962,6 +1103,7 @@ async fn handle_app_request(
                 "status": "ok",
                 "retry_key_mode": app.config.retry_key_mode.as_str(),
                 "webhook_effect_mode": app.config.webhook_effect_mode.as_str(),
+                "ledger_balance_mode": app.config.ledger_balance_mode.as_str(),
             }),
         ),
         (&Method::GET, "/probe-fixture-control") => {
@@ -1335,6 +1477,7 @@ impl Error for AppHttpError {}
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReferenceAppError {
     Database,
+    IncompatibleFaultModes,
     InvalidDatabaseName,
     InvalidConfiguration,
     InvalidOperation,
@@ -1351,6 +1494,7 @@ impl fmt::Display for ReferenceAppError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let message = match self {
             Self::Database => "reference database operation failed",
+            Self::IncompatibleFaultModes => "reference application fault modes are incompatible",
             Self::InvalidDatabaseName => "invalid generated reference database name",
             Self::InvalidConfiguration => "invalid reference application configuration",
             Self::InvalidOperation => "invalid checkout operation",
@@ -1391,14 +1535,23 @@ mod tests {
             config.webhook_effect_mode(),
             WebhookEffectMode::RepairedDeduplicate
         );
+        assert_eq!(
+            config.ledger_balance_mode(),
+            LedgerBalanceMode::RepairedBalancedOnce
+        );
 
         let repaired = config
             .with_retry_key_mode(RetryKeyMode::RepairedSameKey)
-            .with_webhook_effect_mode(WebhookEffectMode::FaultyDuplicateEffect);
+            .with_webhook_effect_mode(WebhookEffectMode::FaultyDuplicateEffect)
+            .with_ledger_balance_mode(LedgerBalanceMode::FaultyOneSidedOnDuplicate);
         assert_eq!(repaired.retry_key_mode(), RetryKeyMode::RepairedSameKey);
         assert_eq!(
             repaired.webhook_effect_mode(),
             WebhookEffectMode::FaultyDuplicateEffect
+        );
+        assert_eq!(
+            repaired.ledger_balance_mode(),
+            LedgerBalanceMode::FaultyOneSidedOnDuplicate
         );
     }
 

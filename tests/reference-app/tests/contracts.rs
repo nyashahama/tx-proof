@@ -13,7 +13,7 @@ use tiv_core::{
     },
 };
 use tiv_reference_app::{
-    CheckoutOperation, ReferenceDatabaseName, RetryKeyMode, WebhookEffectMode,
+    CheckoutOperation, LedgerBalanceMode, ReferenceDatabaseName, RetryKeyMode, WebhookEffectMode,
     create_with_changed_retry_key, create_with_changed_retry_key_for_business_request,
     create_with_retry_key_mode, parse_succeeded_webhook_event, verify_webhook_signature,
 };
@@ -113,6 +113,30 @@ fn webhook_effect_mode_accepts_only_the_fault_and_repaired_contract_values() {
         assert!(
             invalid.parse::<WebhookEffectMode>().is_err(),
             "{invalid:?} must not select a webhook-effect mode"
+        );
+    }
+}
+
+#[test]
+fn ledger_balance_mode_accepts_only_the_fault_and_repaired_contract_values() {
+    assert_eq!(
+        "faulty_one_sided_duplicate".parse::<LedgerBalanceMode>(),
+        Ok(LedgerBalanceMode::FaultyOneSidedOnDuplicate)
+    );
+    assert_eq!(
+        "repaired_balanced_once".parse::<LedgerBalanceMode>(),
+        Ok(LedgerBalanceMode::RepairedBalancedOnce)
+    );
+    for invalid in [
+        "",
+        "faulty_one_sided",
+        "repaired_balanced",
+        "FAULTY_ONE_SIDED_DUPLICATE",
+        "repaired_balanced_once ",
+    ] {
+        assert!(
+            invalid.parse::<LedgerBalanceMode>().is_err(),
+            "{invalid:?} must not select a ledger-balance mode"
         );
     }
 }

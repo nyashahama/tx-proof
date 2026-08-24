@@ -373,9 +373,19 @@ durable `processed_webhook_events` relation, records authenticated attempts in
 event/operation composite foreign key. A colliding event ID for another
 operation therefore aborts before payment state can change. The repaired row-1
 mode applies the effect only when the event claim succeeds; the faulty mode
-applies it on every identity-valid delivery. All writes share one transaction,
-and the application role has insert-only access to these relations; the
-read-only invariant role alone can enumerate them.
+applies it on every identity-valid delivery. Each delivery has an
+application-generated UUID. Applied effects create a delivery-bound
+`ledger_entries` header and fixed `ledger_postings`: a
+`processor_clearing` debit and `order_payment_liability` credit for the exact
+positive amount and currency. Composite foreign keys bind the journal header
+to the authenticated delivery and order value, and postings back to the header
+value. Faulty row-6 mode writes a new debit-only header on a duplicate whose
+effect is already deduplicated; repaired mode writes nothing for that
+duplicate. All writes share one transaction, and the application role has
+insert-only access to these relations; the read-only invariant role alone can
+enumerate them. Duplicate-effect and one-sided-ledger faults are mutually
+exclusive at process startup, so health never advertises a fault hidden by
+branch precedence.
 
 The implemented action-level control slice uses two exact, sequenced commands:
 `generate-event` confirms the PaymentIntent resolved from the compiled trace and
@@ -635,6 +645,11 @@ Redaction is structural:
 - authorization values, keys, passwords, run tokens, and webhook secrets have non-serializable types;
 - raw customer request/response bodies are hashed by default;
 - exact fixture-generated webhook bytes may be stored because the test-data contract is synthetic, but secret-bearing metadata is excluded;
+- configured attempts persist one private violation-only witness bundle;
+  generic repository rows are digest/count-only, while exact rows require the
+  strict synthetic reference-ledger allowlist and share an 8 KiB per-attempt
+  cap with explicit omission/truncation metadata; reports expose only identity
+  and count;
 - truncation is explicit and hashed; silent truncation is prohibited.
 
 ### Error, classification, and exit contracts
@@ -940,7 +955,7 @@ One small synthetic checkout application exposes feature flags for these bugs:
 
 Each has a paired corrected mode. Acceptance requires the faulty mode to produce the named invariant and checkpoint, the minimized trace to reproduce at least 2/3, and the corrected mode to pass the same compiled regression.
 
-Current implementation status (2026-08-24): rows 1 and 3 have explicit
+Current implementation status (2026-08-24): rows 1, 3, and 6 have explicit
 startup-only faulty/repaired pairs. Row 1 uses campaign seed `1792` to deliver
 and duplicate one immutable event. Its faulty mode records two durable effect
 applications and violates `webhook-effect-at-most-once`; its repaired mode
@@ -953,7 +968,14 @@ Row 3 uses campaign seed `69` for one checkout script (`commit_then_close`, then
 `provider-object-unique`; its repaired mode preserves both planned attempt
 outputs while aliasing them to one provider object and immutable event. Each
 repaired execution finalizes a verified artifact with all five configured
-invariants held. Rows 2, 4, 5, and 6 remain unimplemented, so the six-row
+invariants held. Row 6 reuses seed `1792` with repaired retry/effect modes. Its
+faulty ledger mode records a balanced first entry and a debit-only duplicate,
+violating only `balanced-ledger`; its repaired mode records one balanced entry.
+The source, replay, shrink, minimized replay, and repaired artifacts are
+verified; each violation artifact retains the exact bounded ledger row plus its
+witness digest. Both replay forms are stable 3/3, the actual seven-action
+minimized authority retains the duplicate, and the duplicate-removal candidate
+is rejected. Rows 2, 4, and 5 remain unimplemented, so the six-row
 reference-app release gate is not closed.
 
 ## Implementation sequence

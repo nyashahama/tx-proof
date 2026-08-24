@@ -99,15 +99,21 @@ through `TIV_REFERENCE_APP_RETRY_KEY_MODE`. The only accepted values are
 mode. Webhook business-effect behavior is likewise startup-only through
 `TIV_REFERENCE_APP_WEBHOOK_EFFECT_MODE`, with exact values
 `faulty_duplicate_effect` and `repaired_deduplicate`; the repaired mode is the
-default. There is no request header or route parameter that can switch either
-behavior inside a run. `/health` reports both non-secret modes, and the direct
-`reference-app-evidence` command additionally attests the container is in the
-faulty retry-key mode before it labels a changed-key counterexample.
+default. Ledger posting behavior is startup-only through
+`TIV_REFERENCE_APP_LEDGER_MODE`, with exact values
+`faulty_one_sided_duplicate` and `repaired_balanced_once`; the repaired mode is
+the default. There is no request header or route parameter that can switch any
+behavior inside a run. `/health` reports all three non-secret modes, and the
+direct `reference-app-evidence` command additionally attests the exact
+faulty-retry, repaired-effect, repaired-ledger mode set before it labels a
+changed-key counterexample. The duplicate-effect and one-sided-ledger faults
+are mutually exclusive; selecting both fails process startup rather than
+reporting a mode whose behavior is hidden by branch precedence.
 
 The resolved Compose configuration, and therefore its configuration hash,
-includes both modes. A command inspecting a non-default stack must receive the
-same environment values; evidence from one mode pair is intentionally not
-compatible with a stack resolved under another pair.
+includes all three modes. A command inspecting a non-default stack must receive
+the same environment values; evidence from one mode set is intentionally not
+compatible with a stack resolved under another set.
 
 The row-one pair uses campaign seed `1792`, which compiles one provider object,
 one immutable event, one original delivery, and one duplicate delivery without
@@ -124,11 +130,27 @@ CARGO_INCREMENTAL=0 cargo test -p tiv-cli --test configured_run \
   -- --ignored --exact --nocapture
 ```
 
+The row-six pair reuses seed `1792` with repaired retry and effect modes. The
+first accepted effect writes one delivery-bound journal header with a balanced
+`processor_clearing` debit and `order_payment_liability` credit. Faulty ledger
+mode writes a second header with only the debit when the same event is
+delivered again, producing exactly one `balanced-ledger` witness while the
+other four invariants hold. The faulty artifact and seven-action minimized
+authority reproduce 3/3. Source, replay, shrink, and minimized artifacts retain
+the exact bounded ledger witness with its BLAKE3 digest. Repaired ledger mode
+records one header, two postings, and all five invariants hold:
+
+```sh
+CARGO_INCREMENTAL=0 cargo test -p tiv-cli --test configured_run \
+  row_six_one_sided_ledger_fault_violates_and_balanced_repair_holds \
+  -- --ignored --exact --nocapture
+```
+
 The paired row-three acceptance test owns both mode changes, executes campaign
 seed `69` against a fresh baseline in each mode, verifies both finalized
 artifacts, requires a verified default-mode restore on normal completion, and
 makes a best-effort default-mode restore if an assertion unwinds the test. CI
-also recreates and attests the default pair in an unconditional follow-up step
+also recreates and attests the default mode set in an unconditional follow-up step
 before any later reference evidence can run:
 
 ```sh
@@ -243,6 +265,6 @@ docker compose \
 
 This remains bounded truth-spike evidence. It proves one synthetic application,
 the five-query configured oracle, and faulty/corrected execution pairs for
-reference fault rows 1 and 3. It does not yet prove arbitrary customer
-repositories, the other four reference fault variants, exhaustive schedule
+reference fault rows 1, 3, and 6. It does not yet prove arbitrary customer
+repositories, the other three reference fault variants, exhaustive schedule
 coverage, production secret management, or distributed image provenance.
