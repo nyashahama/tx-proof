@@ -1243,11 +1243,13 @@ version = "0.0.0"
 dependencies = [
  "blake3",
  "clap",
+ "reqwest",
  "serde",
  "serde_json",
  "thiserror",
  "tiv-core",
  "tiv-runtime",
+ "tiv-stripe-pi",
  "tokio",
  "tokio-postgres",
  "uuid",

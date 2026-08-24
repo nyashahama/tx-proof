@@ -639,20 +639,51 @@ impl TruthSpikePostgres {
                          currency text NOT NULL CHECK (currency ~ '^[a-z]{3}$'), \
                          status text NOT NULL CHECK (status IN ('pending', 'succeeded')) \
                      ); \
+                     CREATE TABLE processed_webhook_events ( \
+                         provider_event_id text PRIMARY KEY \
+                             CHECK (provider_event_id ~ '^evt_tiv_[A-Za-z0-9_-]+$'), \
+                         operation_id text NOT NULL REFERENCES orders(operation_id), \
+                         UNIQUE (provider_event_id, operation_id) \
+                     ); \
+                     CREATE TABLE webhook_deliveries ( \
+                         id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, \
+                         provider_event_id text NOT NULL, \
+                         operation_id text NOT NULL, \
+                         CONSTRAINT webhook_deliveries_event_identity_fkey \
+                             FOREIGN KEY (provider_event_id, operation_id) \
+                             REFERENCES processed_webhook_events \
+                                 (provider_event_id, operation_id) \
+                     ); \
+                     CREATE TABLE webhook_effects ( \
+                         id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, \
+                         provider_event_id text NOT NULL, \
+                         operation_id text NOT NULL, \
+                         FOREIGN KEY (provider_event_id, operation_id) \
+                             REFERENCES processed_webhook_events \
+                                 (provider_event_id, operation_id) \
+                     ); \
                      CREATE INDEX payments_operation_id_idx ON payments (operation_id); \
-                    CREATE INDEX payments_provider_id_idx ON payments (stripe_payment_intent_id); \
+                     CREATE INDEX payments_provider_id_idx ON payments (stripe_payment_intent_id); \
+                     CREATE INDEX webhook_effects_event_idx \
+                         ON webhook_effects (provider_event_id); \
                      REVOKE ALL ON SCHEMA public FROM PUBLIC; \
                      GRANT USAGE ON SCHEMA public TO tiv_app, tiv_invariant; \
-                     REVOKE ALL ON TABLE tiv_verifier_marker, orders, payments \
+                     REVOKE ALL ON TABLE tiv_verifier_marker, orders, payments, \
+                         processed_webhook_events, webhook_deliveries, webhook_effects \
                          FROM PUBLIC, tiv_app, tiv_invariant; \
-                     REVOKE ALL ON SEQUENCE orders_id_seq, payments_id_seq \
+                     REVOKE ALL ON SEQUENCE orders_id_seq, payments_id_seq, \
+                         webhook_deliveries_id_seq, webhook_effects_id_seq \
                          FROM PUBLIC, tiv_app, tiv_invariant; \
                      GRANT SELECT (operation_id, amount_minor, currency) ON TABLE orders TO tiv_app; \
                      GRANT INSERT ON TABLE payments TO tiv_app; \
                      GRANT SELECT (operation_id, stripe_payment_intent_id), \
                            UPDATE (status) ON TABLE payments TO tiv_app; \
-                     GRANT USAGE ON SEQUENCE payments_id_seq TO tiv_app; \
-                     GRANT SELECT ON TABLE orders, payments TO tiv_invariant;",
+                     GRANT INSERT ON TABLE processed_webhook_events, webhook_deliveries, \
+                         webhook_effects TO tiv_app; \
+                     GRANT USAGE ON SEQUENCE payments_id_seq, webhook_deliveries_id_seq, \
+                         webhook_effects_id_seq TO tiv_app; \
+                     GRANT SELECT ON TABLE orders, payments, processed_webhook_events, \
+                         webhook_deliveries, webhook_effects TO tiv_invariant;",
                 )
                 .await?;
             session
@@ -1878,6 +1909,7 @@ mod tests {
         ));
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn assert_application_role_contract(
         postgres: &TruthSpikePostgres,
         case_name: &DatabaseName,
@@ -1903,7 +1935,34 @@ mod tests {
                 &[&operation_id],
             )
             .await
-            .expect("the app can persist its one required relation");
+            .expect("the app can persist its payment relation");
+        let processed_event = app
+            .client()
+            .execute(
+                "INSERT INTO processed_webhook_events (provider_event_id, operation_id) \
+                 VALUES ('evt_tiv_role_test', $1) ON CONFLICT DO NOTHING",
+                &[&operation_id],
+            )
+            .await
+            .expect("the app can claim one immutable provider event");
+        let effect = app
+            .client()
+            .execute(
+                "INSERT INTO webhook_effects (provider_event_id, operation_id) \
+                 VALUES ('evt_tiv_role_test', $1)",
+                &[&operation_id],
+            )
+            .await
+            .expect("the app can persist the event business effect");
+        let repeated_event = app
+            .client()
+            .execute(
+                "INSERT INTO processed_webhook_events (provider_event_id, operation_id) \
+                 VALUES ('evt_tiv_role_test', $1) ON CONFLICT DO NOTHING",
+                &[&operation_id],
+            )
+            .await
+            .expect("the app can deduplicate without table read privilege");
         assert_durable_operation_read(app.client(), &operation_id).await;
         let marker_read = app
             .client()
@@ -1944,12 +2003,33 @@ mod tests {
             .await;
         let ungranted_payment_read = app.client().query("SELECT status FROM payments", &[]).await;
         let ungranted_order_read = app.client().query("SELECT status FROM orders", &[]).await;
+        let ungranted_event_read = app
+            .client()
+            .query(
+                "SELECT provider_event_id FROM processed_webhook_events",
+                &[],
+            )
+            .await;
+        let ungranted_delivery_read = app
+            .client()
+            .query("SELECT provider_event_id FROM webhook_deliveries", &[])
+            .await;
+        let effect_update = app
+            .client()
+            .execute(
+                "UPDATE webhook_effects SET operation_id = 'op_tampered'",
+                &[],
+            )
+            .await;
         app.close()
             .await
             .expect("the application connection closes cleanly");
 
         assert_eq!(current_user, APPLICATION_ROLE);
         assert_eq!(inserted, 1);
+        assert_eq!(processed_event, 1);
+        assert_eq!(effect, 1);
+        assert_eq!(repeated_event, 0);
         assert_eq!(reconciled, 1);
         assert!(
             marker_read.is_err(),
@@ -1976,6 +2056,174 @@ mod tests {
             ungranted_order_read.is_err(),
             "the app cannot read mutable order state while recovering routing"
         );
+        assert!(
+            ungranted_event_read.is_err(),
+            "the app cannot enumerate processed event identities"
+        );
+        assert!(
+            ungranted_delivery_read.is_err(),
+            "the app cannot enumerate authenticated webhook deliveries"
+        );
+        assert!(
+            effect_update.is_err(),
+            "the app cannot rewrite a recorded business effect"
+        );
+        assert_webhook_identity_collision_contract(postgres, case_name, &operation_id).await;
+    }
+
+    async fn assert_webhook_identity_collision_contract(
+        postgres: &TruthSpikePostgres,
+        case_name: &DatabaseName,
+        operation_id: &str,
+    ) {
+        let colliding_operation_id = format!("{operation_id}_collision");
+        prepare_collision_probe_order(postgres, case_name, &colliding_operation_id).await;
+        let mut app = postgres
+            .connect_application_database(case_name)
+            .await
+            .expect("the app role can exercise the webhook identity boundary");
+        let processed_event = app
+            .client()
+            .execute(
+                "INSERT INTO processed_webhook_events (provider_event_id, operation_id) \
+                 VALUES ('evt_tiv_identity_contract', $1) ON CONFLICT DO NOTHING",
+                &[&operation_id],
+            )
+            .await
+            .expect("the app can claim the immutable event identity");
+        let first_delivery = app
+            .client()
+            .execute(
+                "INSERT INTO webhook_deliveries (provider_event_id, operation_id) \
+                 VALUES ('evt_tiv_identity_contract', $1)",
+                &[&operation_id],
+            )
+            .await
+            .expect("the first authenticated delivery keeps the claimed identity");
+        let repeated_delivery = app
+            .client()
+            .execute(
+                "INSERT INTO webhook_deliveries (provider_event_id, operation_id) \
+                 VALUES ('evt_tiv_identity_contract', $1)",
+                &[&operation_id],
+            )
+            .await
+            .expect("an exact duplicate keeps the claimed identity");
+        let transaction = app
+            .client()
+            .transaction()
+            .await
+            .expect("the collision probe transaction starts");
+        let colliding_claim = transaction
+            .execute(
+                "INSERT INTO processed_webhook_events (provider_event_id, operation_id) \
+                 VALUES ('evt_tiv_identity_contract', $1) ON CONFLICT DO NOTHING",
+                &[&colliding_operation_id],
+            )
+            .await
+            .expect("the global event ID is already claimed");
+        let colliding_delivery = transaction
+            .execute(
+                "INSERT INTO webhook_deliveries (provider_event_id, operation_id) \
+                 VALUES ('evt_tiv_identity_contract', $1)",
+                &[&colliding_operation_id],
+            )
+            .await;
+        let payment_after_collision = transaction
+            .execute(
+                "INSERT INTO payments \
+                     (operation_id, stripe_payment_intent_id, amount_minor, currency, status) \
+                 VALUES ($1, 'pi_tiv_collision', 2500, 'usd', 'succeeded')",
+                &[&colliding_operation_id],
+            )
+            .await;
+        transaction
+            .rollback()
+            .await
+            .expect("the rejected collision transaction rolls back");
+        app.close()
+            .await
+            .expect("the identity-contract app session closes cleanly");
+
+        assert_eq!(processed_event, 1);
+        assert_eq!(first_delivery, 1);
+        assert_eq!(repeated_delivery, 1);
+        assert_eq!(colliding_claim, 0);
+        let collision_error =
+            colliding_delivery.expect_err("one event ID cannot be reassigned to another operation");
+        assert_eq!(
+            collision_error
+                .as_db_error()
+                .and_then(tokio_postgres::error::DbError::constraint),
+            Some("webhook_deliveries_event_identity_fkey")
+        );
+        assert!(
+            payment_after_collision.is_err(),
+            "identity rejection aborts the transaction before a payment mutation"
+        );
+        let collision_state =
+            inspect_and_remove_collision_probe_order(postgres, case_name, &colliding_operation_id)
+                .await;
+        assert_eq!(collision_state, (0, 0));
+    }
+
+    async fn prepare_collision_probe_order(
+        postgres: &TruthSpikePostgres,
+        case_name: &DatabaseName,
+        operation_id: &str,
+    ) {
+        let mut admin = postgres
+            .connect_database(case_name.as_str())
+            .await
+            .expect("the case accepts its isolated admin role");
+        admin
+            .client()
+            .execute(
+                "INSERT INTO orders (operation_id, amount_minor, currency, status) \
+                 VALUES ($1, 2500, 'usd', 'pending')",
+                &[&operation_id],
+            )
+            .await
+            .expect("the collision probe has a second valid operation");
+        admin
+            .close()
+            .await
+            .expect("the collision-probe admin session closes");
+    }
+
+    async fn inspect_and_remove_collision_probe_order(
+        postgres: &TruthSpikePostgres,
+        case_name: &DatabaseName,
+        operation_id: &str,
+    ) -> (i64, i64) {
+        let mut admin = postgres
+            .connect_database(case_name.as_str())
+            .await
+            .expect("the collision result is inspectable by the isolated admin");
+        let state = admin
+            .client()
+            .query_one(
+                "SELECT \
+                     (SELECT COUNT(*)::bigint FROM payments WHERE operation_id = $1), \
+                     (SELECT COUNT(*)::bigint FROM webhook_deliveries WHERE operation_id = $1)",
+                &[&operation_id],
+            )
+            .await
+            .expect("the rejected collision leaves no durable application state");
+        let state = (state.get::<_, i64>(0), state.get::<_, i64>(1));
+        admin
+            .client()
+            .execute(
+                "DELETE FROM orders WHERE operation_id = $1",
+                &[&operation_id],
+            )
+            .await
+            .expect("the isolated collision-probe order is removed");
+        admin
+            .close()
+            .await
+            .expect("the collision-result admin session closes");
+        state
     }
 
     async fn assert_durable_operation_read(client: &Client, operation_id: &str) {
@@ -2010,11 +2258,41 @@ mod tests {
             )
             .await
             .expect("the narrow grant survives a template reset");
+        let reset_processed_event = reset_app
+            .client()
+            .execute(
+                "INSERT INTO processed_webhook_events (provider_event_id, operation_id) \
+                 VALUES ('evt_tiv_role_test_after_reset', $1) ON CONFLICT DO NOTHING",
+                &[&operation_id],
+            )
+            .await
+            .expect("the event grant survives a template reset");
+        let reset_delivery = reset_app
+            .client()
+            .execute(
+                "INSERT INTO webhook_deliveries (provider_event_id, operation_id) \
+                 VALUES ('evt_tiv_role_test_after_reset', $1)",
+                &[&operation_id],
+            )
+            .await
+            .expect("the delivery grant survives a template reset");
+        let reset_effect = reset_app
+            .client()
+            .execute(
+                "INSERT INTO webhook_effects (provider_event_id, operation_id) \
+                 VALUES ('evt_tiv_role_test_after_reset', $1)",
+                &[&operation_id],
+            )
+            .await
+            .expect("the effect grant survives a template reset");
         reset_app
             .close()
             .await
             .expect("the reset application connection closes cleanly");
         assert_eq!(reset_insert, 1);
+        assert_eq!(reset_processed_event, 1);
+        assert_eq!(reset_delivery, 1);
+        assert_eq!(reset_effect, 1);
     }
 
     fn reference_operation_id(case_name: &DatabaseName) -> String {
@@ -2053,6 +2331,13 @@ mod tests {
                         has_table_privilege('tiv_invariant', 'orders', 'SELECT'), \
                         has_table_privilege('tiv_invariant', 'payments', 'SELECT'), \
                         has_table_privilege( \
+                            'tiv_invariant', 'processed_webhook_events', 'SELECT' \
+                        ), \
+                        has_table_privilege( \
+                            'tiv_invariant', 'webhook_deliveries', 'SELECT' \
+                        ), \
+                        has_table_privilege('tiv_invariant', 'webhook_effects', 'SELECT'), \
+                        has_table_privilege( \
                             'tiv_invariant', 'tiv_verifier_marker', 'SELECT' \
                         ), \
                         has_table_privilege('tiv_invariant', 'payments', 'INSERT'), \
@@ -2067,9 +2352,12 @@ mod tests {
         assert!(!grants.get::<_, bool>(1));
         assert!(grants.get::<_, bool>(2));
         assert!(grants.get::<_, bool>(3));
-        assert!(!grants.get::<_, bool>(4));
-        assert!(!grants.get::<_, bool>(5));
-        assert!(!grants.get::<_, bool>(6));
+        assert!(grants.get::<_, bool>(4));
+        assert!(grants.get::<_, bool>(5));
+        assert!(grants.get::<_, bool>(6));
+        assert!(!grants.get::<_, bool>(7));
+        assert!(!grants.get::<_, bool>(8));
+        assert!(!grants.get::<_, bool>(9));
 
         let transaction = admin
             .client()

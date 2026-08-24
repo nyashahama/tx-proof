@@ -13,9 +13,9 @@ use tiv_core::{
     },
 };
 use tiv_reference_app::{
-    CheckoutOperation, ReferenceDatabaseName, RetryKeyMode, create_with_changed_retry_key,
-    create_with_changed_retry_key_for_business_request, create_with_retry_key_mode,
-    parse_succeeded_webhook, verify_webhook_signature,
+    CheckoutOperation, ReferenceDatabaseName, RetryKeyMode, WebhookEffectMode,
+    create_with_changed_retry_key, create_with_changed_retry_key_for_business_request,
+    create_with_retry_key_mode, parse_succeeded_webhook_event, verify_webhook_signature,
 };
 use tiv_stripe_pi::{
     CreatePaymentIntent, FaultOutcome, IdempotencyKey, ManagedFixture, OperationId,
@@ -94,6 +94,30 @@ fn retry_key_mode_accepts_only_the_two_explicit_contract_values() {
 }
 
 #[test]
+fn webhook_effect_mode_accepts_only_the_fault_and_repaired_contract_values() {
+    assert_eq!(
+        "faulty_duplicate_effect".parse::<WebhookEffectMode>(),
+        Ok(WebhookEffectMode::FaultyDuplicateEffect)
+    );
+    assert_eq!(
+        "repaired_deduplicate".parse::<WebhookEffectMode>(),
+        Ok(WebhookEffectMode::RepairedDeduplicate)
+    );
+    for invalid in [
+        "",
+        "faulty_duplicate",
+        "repaired",
+        "FAULTY_DUPLICATE_EFFECT",
+        "repaired_deduplicate ",
+    ] {
+        assert!(
+            invalid.parse::<WebhookEffectMode>().is_err(),
+            "{invalid:?} must not select a webhook-effect mode"
+        );
+    }
+}
+
+#[test]
 fn webhook_verification_covers_the_exact_raw_bytes_and_rejects_stale_signatures() {
     let secret = b"whsec_test_secret";
     let timestamp = current_unix_timestamp();
@@ -137,13 +161,15 @@ fn signed_fixture_webhook_is_decoded_into_the_same_operation_relation() {
         .webhook_attempt(current_unix_timestamp(), b"whsec_test_secret")
         .expect("the event is signed");
 
-    let observed = parse_succeeded_webhook(
+    let event = parse_succeeded_webhook_event(
         attempt.raw_body(),
         attempt.signature_header(),
         b"whsec_test_secret",
     )
     .expect("the exact signed event is accepted");
+    let observed = event.payment_intent();
 
+    assert_eq!(event.id(), fixture.events()[0].id());
     assert_eq!(observed.id(), created.id());
     assert_eq!(observed.operation_id(), "op_1");
     assert_eq!(observed.amount_minor(), 2_500);

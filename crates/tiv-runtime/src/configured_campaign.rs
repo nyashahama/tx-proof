@@ -1548,6 +1548,78 @@ mod tests {
     }
 
     #[test]
+    fn row_one_campaign_seed_isolates_one_duplicated_immutable_event() {
+        let process_faults = ProcessFaultSpec::new(
+            [
+                ProcessCutPoint::ClientRequestForwarded,
+                ProcessCutPoint::ClientResponseObserved,
+                ProcessCutPoint::WebhookRequestForwarded,
+                ProcessCutPoint::WebhookResponseObserved,
+                ProcessCutPoint::SqlProbe,
+            ],
+            1,
+        )
+        .unwrap();
+        let spec = CampaignSpec::new_payment_intent_v1(
+            Seed::new(1_792),
+            CaseCount::new(1).unwrap(),
+            ActionBudget::new(40).unwrap(),
+            [
+                ProviderOutcome::Normal,
+                ProviderOutcome::PreExecute429,
+                ProviderOutcome::PreExecute500,
+                ProviderOutcome::PostExecute500,
+                ProviderOutcome::CommitThenClose,
+                ProviderOutcome::CommitThenDelay,
+            ],
+            WebhookFaultSpec::new(3, [0, 10, 100, 1_000, 5_000], true, true).unwrap(),
+            process_faults,
+        )
+        .unwrap();
+        let campaign = CampaignPlanner::compile(&spec).expect("the row-one campaign compiles");
+        let plan = campaign.cases()[0].plan();
+        preflight_reference_planned_case(plan, true, true)
+            .expect("the row-one campaign uses supported boundaries");
+        let actions = plan.actions();
+        let committed = actions
+            .iter()
+            .filter_map(|action| match action.kind() {
+                tiv_core::plan::PlanActionKind::DriveCheckout { provider_script }
+                | tiv_core::plan::PlanActionKind::RetryBusinessRequest { provider_script } => {
+                    Some(usize::from(provider_script.committed_count()))
+                }
+                _ => None,
+            })
+            .sum::<usize>();
+        let generated = actions
+            .iter()
+            .filter(|action| {
+                matches!(
+                    action.kind(),
+                    tiv_core::plan::PlanActionKind::GenerateProviderEvent
+                )
+            })
+            .count();
+        let duplicate_count = actions
+            .iter()
+            .filter(|action| {
+                matches!(
+                    action.kind(),
+                    tiv_core::plan::PlanActionKind::DuplicateWebhook
+                )
+            })
+            .count();
+
+        assert_eq!(committed, 1);
+        assert_eq!(generated, 1);
+        assert_eq!(duplicate_count, 1);
+        assert!(actions.iter().all(|action| !matches!(
+            action.kind(),
+            tiv_core::plan::PlanActionKind::KillApplication { .. }
+        )));
+    }
+
+    #[test]
     fn full_configured_fault_model_reaches_two_persisted_provider_objects() {
         let process_faults = ProcessFaultSpec::new(
             [

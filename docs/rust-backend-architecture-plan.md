@@ -365,6 +365,18 @@ Webhook behavior:
 - order is controlled at the event-attempt layer, not at packet level;
 - a drop means no delivery before the declared reconciliation horizon.
 
+The reference application preserves each authenticated provider event ID in a
+durable `processed_webhook_events` relation, records authenticated attempts in
+`webhook_deliveries`, and records business-effect applications separately in
+`webhook_effects`. Each attempt first claims the primary-key event ID with
+`INSERT ... ON CONFLICT DO NOTHING`, then inserts a delivery through the exact
+event/operation composite foreign key. A colliding event ID for another
+operation therefore aborts before payment state can change. The repaired row-1
+mode applies the effect only when the event claim succeeds; the faulty mode
+applies it on every identity-valid delivery. All writes share one transaction,
+and the application role has insert-only access to these relations; the
+read-only invariant role alone can enumerate them.
+
 The implemented action-level control slice uses two exact, sequenced commands:
 `generate-event` confirms the PaymentIntent resolved from the compiled trace and
 captures its immutable event ID; `deliver-event` signs that exact event with a
@@ -928,16 +940,21 @@ One small synthetic checkout application exposes feature flags for these bugs:
 
 Each has a paired corrected mode. Acceptance requires the faulty mode to produce the named invariant and checkpoint, the minimized trace to reproduce at least 2/3, and the corrected mode to pass the same compiled regression.
 
-Current implementation status (2026-08-24): row 3 has an explicit startup-only
-pair, `faulty_changed_key` and `repaired_same_key`. Campaign seed `69` compiles
-one supported checkout script (`commit_then_close`, then `normal`) and is used
-unchanged for both executions. The faulty execution finalizes a verified
-artifact with two provider objects and a `provider-object-unique` violation;
-the repaired execution finalizes a verified artifact with one provider object
-and all five configured invariants held. The runtime preserves the two planned
-attempt outputs while allowing them to alias the same provider object and its
-immutable event in the repaired execution. The other five application variants
-remain unimplemented, so the six-row reference-app release gate is not closed.
+Current implementation status (2026-08-24): rows 1 and 3 have explicit
+startup-only faulty/repaired pairs. Row 1 uses campaign seed `1792` to deliver
+and duplicate one immutable event. Its faulty mode records two durable effect
+applications and violates `webhook-effect-at-most-once`; its repaired mode
+atomically deduplicates through the provider event ID and records one effect.
+The faulty trace reproduces on 3/3 fresh baselines; bounded shrink rejects a
+candidate that removes the duplicate, accepts a seven-action trace within
+three candidates, and that minimized authority reproduces 3/3.
+Row 3 uses campaign seed `69` for one checkout script (`commit_then_close`, then
+`normal`). Its faulty mode creates two provider objects and violates
+`provider-object-unique`; its repaired mode preserves both planned attempt
+outputs while aliasing them to one provider object and immutable event. Each
+repaired execution finalizes a verified artifact with all five configured
+invariants held. Rows 2, 4, 5, and 6 remain unimplemented, so the six-row
+reference-app release gate is not closed.
 
 ## Implementation sequence
 

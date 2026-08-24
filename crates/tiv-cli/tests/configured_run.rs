@@ -5,9 +5,14 @@ use std::{
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::Command,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use tiv_core::decision::Seed;
 use tiv_runtime::{artifacts::verify_complete_run_artifact, compatibility::RunCompatibilityV1};
+use tiv_stripe_pi::{
+    CreatePaymentIntent, FaultOutcome, IdempotencyKey, OperationId, PaymentIntentFixture,
+};
 use tokio_postgres::NoTls;
 use uuid::Uuid;
 
@@ -26,6 +31,10 @@ const ARTIFACT_ROOT: &str = concat!(
 );
 const RETRY_KEY_MODE_ENV: &str = "TIV_REFERENCE_APP_RETRY_KEY_MODE";
 const FAULTY_RETRY_KEY_MODE: &str = "faulty_changed_key";
+const REPAIRED_RETRY_KEY_MODE: &str = "repaired_same_key";
+const WEBHOOK_EFFECT_MODE_ENV: &str = "TIV_REFERENCE_APP_WEBHOOK_EFFECT_MODE";
+const FAULTY_WEBHOOK_EFFECT_MODE: &str = "faulty_duplicate_effect";
+const REPAIRED_WEBHOOK_EFFECT_MODE: &str = "repaired_deduplicate";
 
 #[tokio::test]
 #[ignore = "requires the isolated reference-app Compose project"]
@@ -163,7 +172,7 @@ async fn configured_run_executes_a_real_case_and_finalizes_private_evidence() {
 #[allow(clippy::too_many_lines)]
 async fn row_three_changed_key_fault_violates_and_same_key_repair_holds() {
     let _guard = E2E_LOCK.lock().await;
-    let mut restore = FaultyRetryModeRestore::armed();
+    let mut restore = ReferenceAppModeRestore::armed();
     let _ = fs::remove_dir_all(ARTIFACT_ROOT);
 
     recreate_reference_app_in_retry_mode("faulty_changed_key");
@@ -228,6 +237,312 @@ async fn row_three_changed_key_fault_violates_and_same_key_repair_holds() {
     cleanup_reference_databases().await;
     fs::remove_dir_all(ARTIFACT_ROOT).unwrap();
     recreate_reference_app_in_retry_mode("faulty_changed_key");
+    restore.disarm();
+}
+
+#[tokio::test]
+#[ignore = "requires the isolated reference-app Compose project"]
+#[allow(clippy::too_many_lines)]
+async fn row_one_duplicate_webhook_fault_violates_and_deduplicated_repair_holds() {
+    let _guard = E2E_LOCK.lock().await;
+    let mut restore = ReferenceAppModeRestore::armed();
+    let _ = fs::remove_dir_all(ARTIFACT_ROOT);
+
+    recreate_reference_app_in_modes(REPAIRED_RETRY_KEY_MODE, FAULTY_WEBHOOK_EFFECT_MODE);
+    prepare_reference_baseline().await;
+    reset_fixture_process().await;
+    let faulty_output =
+        run_configured_command_in_modes(1_792, REPAIRED_RETRY_KEY_MODE, FAULTY_WEBHOOK_EFFECT_MODE);
+    assert_eq!(
+        faulty_output.status.code(),
+        Some(10),
+        "the duplicate-effect reference fault must violate: {}",
+        String::from_utf8_lossy(&faulty_output.stderr)
+    );
+    let faulty_receipt: serde_json::Value =
+        serde_json::from_slice(&faulty_output.stdout).expect("faulty stdout is JSON");
+    assert_eq!(faulty_receipt["verdict"], "violated");
+    let faulty_path = Path::new(faulty_receipt["artifact_path"].as_str().unwrap());
+    verify_complete_run_artifact(faulty_path).expect("the faulty artifact verifies");
+    let faulty_summary: serde_json::Value =
+        serde_json::from_slice(&fs::read(faulty_path.join("summary.json")).unwrap()).unwrap();
+    assert_eq!(faulty_summary["cases"][0]["provider_object_count"], 1);
+    let faulty_invariants = faulty_summary["cases"][0]["invariants"]
+        .as_array()
+        .expect("faulty invariants are recorded");
+    let at_most_once = faulty_invariants
+        .iter()
+        .find(|invariant| invariant["invariant_id"] == "webhook-effect-at-most-once")
+        .expect("webhook effect uniqueness is evaluated");
+    assert_eq!(at_most_once["verdict"], "violated");
+    assert_eq!(at_most_once["witness_count"], 1);
+    assert_row_one_trace(faulty_path);
+    assert_reference_webhook_delivery_count(2).await;
+    assert_reference_webhook_effect_count(2).await;
+
+    let replay_output = configured_replay_command_in_modes(
+        faulty_path,
+        REPAIRED_RETRY_KEY_MODE,
+        FAULTY_WEBHOOK_EFFECT_MODE,
+    )
+    .output()
+    .expect("the row-one configured replay executes");
+    assert_eq!(
+        replay_output.status.code(),
+        Some(10),
+        "row-one replay failed: {}",
+        String::from_utf8_lossy(&replay_output.stderr)
+    );
+    let replay_receipt: serde_json::Value =
+        serde_json::from_slice(&replay_output.stdout).expect("replay stdout is JSON");
+    assert_eq!(replay_receipt["attempt_count"], 3);
+    assert_eq!(replay_receipt["matching_failure_count"], 3);
+    assert_eq!(replay_receipt["classification"], "stable");
+    let replay_path = Path::new(replay_receipt["artifact_path"].as_str().unwrap());
+    verify_complete_run_artifact(replay_path).expect("the row-one replay artifact verifies");
+    let replay_summary: serde_json::Value =
+        serde_json::from_slice(&fs::read(replay_path.join("summary.json")).unwrap()).unwrap();
+    assert!(
+        replay_summary["attempts"]
+            .as_array()
+            .is_some_and(|attempts| {
+                attempts.len() == 3
+                    && attempts.iter().all(|attempt| {
+                        attempt["verdict"] == "expected_violation"
+                            && recorded_invariant(
+                                attempt,
+                                "webhook-effect-at-most-once",
+                                "violated",
+                                1,
+                            )
+                    })
+            })
+    );
+
+    let shrink_output = configured_shrink_command_in_modes(
+        replay_path,
+        REPAIRED_RETRY_KEY_MODE,
+        FAULTY_WEBHOOK_EFFECT_MODE,
+    )
+    .output()
+    .expect("the row-one configured shrink executes");
+    assert!(
+        matches!(shrink_output.status.code(), Some(10 | 11)),
+        "row-one shrink failed: {}",
+        String::from_utf8_lossy(&shrink_output.stderr)
+    );
+    let shrink_receipt: serde_json::Value =
+        serde_json::from_slice(&shrink_output.stdout).expect("shrink stdout is JSON");
+    assert_eq!(shrink_receipt["evaluated_candidates"], 3);
+    assert_eq!(shrink_receipt["accepted_candidates"], 1);
+    assert_eq!(shrink_receipt["original_action_count"], 8);
+    assert_eq!(shrink_receipt["best_action_count"], 7);
+    let shrink_path = Path::new(shrink_receipt["artifact_path"].as_str().unwrap());
+    verify_complete_run_artifact(shrink_path).expect("the row-one shrink artifact verifies");
+    assert!(shrink_path.join("trace.minimized.json").is_file());
+    let shrink_summary: serde_json::Value =
+        serde_json::from_slice(&fs::read(shrink_path.join("summary.json")).unwrap()).unwrap();
+    let shrink_candidates = shrink_summary["candidates"]
+        .as_array()
+        .expect("the bounded row-one candidates are recorded");
+    assert_eq!(shrink_candidates.len(), 3);
+    assert!(
+        shrink_candidates
+            .iter()
+            .any(|candidate| { candidate["accepted"] == true && candidate["action_count"] == 7 })
+    );
+    assert!(
+        shrink_candidates
+            .iter()
+            .filter(|candidate| candidate["accepted"] == false)
+            .any(|candidate| {
+                let Some(candidate_id) = candidate["candidate_id"].as_str() else {
+                    return false;
+                };
+                let candidate: serde_json::Value = serde_json::from_slice(
+                    &fs::read(
+                        shrink_path
+                            .join("candidates")
+                            .join(candidate_id)
+                            .join("candidate.json"),
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+                candidate["schedule"].as_array().is_some_and(|schedule| {
+                    schedule
+                        .iter()
+                        .all(|action| action["kind"]["kind"] != "duplicate_webhook")
+                })
+            }),
+        "removing the causal duplicate must be evaluated and rejected"
+    );
+
+    let minimized_output = configured_minimized_replay_command_in_modes(
+        shrink_path,
+        REPAIRED_RETRY_KEY_MODE,
+        FAULTY_WEBHOOK_EFFECT_MODE,
+    )
+    .output()
+    .expect("the row-one minimized replay executes");
+    assert_eq!(
+        minimized_output.status.code(),
+        Some(10),
+        "row-one minimized replay failed: {}",
+        String::from_utf8_lossy(&minimized_output.stderr)
+    );
+    let minimized_receipt: serde_json::Value =
+        serde_json::from_slice(&minimized_output.stdout).expect("minimized stdout is JSON");
+    assert_eq!(minimized_receipt["attempt_count"], 3);
+    assert_eq!(minimized_receipt["matching_failure_count"], 3);
+    assert_eq!(minimized_receipt["classification"], "stable");
+    let minimized_path = Path::new(minimized_receipt["artifact_path"].as_str().unwrap());
+    verify_complete_run_artifact(minimized_path)
+        .expect("the row-one minimized replay artifact verifies");
+    let minimized_summary: serde_json::Value =
+        serde_json::from_slice(&fs::read(minimized_path.join("summary.json")).unwrap()).unwrap();
+    assert!(
+        minimized_summary["attempts"]
+            .as_array()
+            .is_some_and(|attempts| {
+                attempts.len() == 3
+                    && attempts.iter().all(|attempt| {
+                        recorded_invariant(attempt, "webhook-effect-at-most-once", "violated", 1)
+                    })
+            })
+    );
+
+    recreate_reference_app_in_modes(REPAIRED_RETRY_KEY_MODE, REPAIRED_WEBHOOK_EFFECT_MODE);
+    prepare_reference_baseline().await;
+    reset_fixture_process().await;
+    let repaired_output = run_configured_command_in_modes(
+        1_792,
+        REPAIRED_RETRY_KEY_MODE,
+        REPAIRED_WEBHOOK_EFFECT_MODE,
+    );
+    assert_eq!(
+        repaired_output.status.code(),
+        Some(0),
+        "the deduplicated control must hold: {}",
+        String::from_utf8_lossy(&repaired_output.stderr)
+    );
+    let repaired_receipt: serde_json::Value =
+        serde_json::from_slice(&repaired_output.stdout).expect("repaired stdout is JSON");
+    assert_eq!(repaired_receipt["verdict"], "held");
+    let repaired_path = Path::new(repaired_receipt["artifact_path"].as_str().unwrap());
+    verify_complete_run_artifact(repaired_path).expect("the repaired artifact verifies");
+    let repaired_summary: serde_json::Value =
+        serde_json::from_slice(&fs::read(repaired_path.join("summary.json")).unwrap()).unwrap();
+    assert_eq!(repaired_summary["cases"][0]["provider_object_count"], 1);
+    assert!(
+        repaired_summary["cases"][0]["invariants"]
+            .as_array()
+            .is_some_and(|invariants| {
+                invariants.len() == 5
+                    && invariants
+                        .iter()
+                        .all(|invariant| invariant["verdict"] == "held")
+            })
+    );
+    assert_row_one_trace(repaired_path);
+    assert_reference_webhook_delivery_count(2).await;
+    assert_reference_webhook_effect_count(1).await;
+
+    cleanup_reference_databases().await;
+    fs::remove_dir_all(ARTIFACT_ROOT).unwrap();
+    recreate_reference_app_in_modes(FAULTY_RETRY_KEY_MODE, REPAIRED_WEBHOOK_EFFECT_MODE);
+    restore.disarm();
+}
+
+#[tokio::test]
+#[ignore = "requires the isolated reference-app Compose project"]
+async fn webhook_event_identity_collision_returns_conflict_before_business_mutation() {
+    let _guard = E2E_LOCK.lock().await;
+    let mut restore = ReferenceAppModeRestore::armed();
+    recreate_reference_app_in_modes(REPAIRED_RETRY_KEY_MODE, REPAIRED_WEBHOOK_EFFECT_MODE);
+    prepare_reference_baseline().await;
+
+    let mut fixture = PaymentIntentFixture::new(Seed::new(5_171));
+    let payment_intent = fixture
+        .create(
+            IdempotencyKey::new("identity-collision-contract").unwrap(),
+            CreatePaymentIntent::new(2_500, "usd")
+                .unwrap()
+                .with_operation_id(OperationId::new("op_deadbeef").unwrap()),
+            FaultOutcome::Normal,
+        )
+        .expect("the collision contract creates one provider object");
+    fixture
+        .confirm(payment_intent.id())
+        .expect("the provider object reaches succeeded");
+    let event = fixture
+        .events()
+        .first()
+        .expect("confirmation creates one immutable event");
+    let event_id = event.id().to_owned();
+    let attempt = event
+        .webhook_attempt(current_unix_timestamp(), b"whsec_test_secret")
+        .expect("the immutable event is signed for delivery");
+
+    let case_url = ADMIN_URL.replace("/postgres", "/tiv_case_deadbeef");
+    let (admin, connection) = tokio_postgres::connect(&case_url, NoTls)
+        .await
+        .expect("the isolated admin connects to the generated case");
+    let connection = tokio::spawn(connection);
+    admin
+        .execute(
+            "INSERT INTO orders (operation_id, amount_minor, currency, status) \
+             VALUES ('op_collision', 2500, 'usd', 'pending')",
+            &[],
+        )
+        .await
+        .expect("the collision probe has a second valid operation");
+    admin
+        .execute(
+            "INSERT INTO processed_webhook_events (provider_event_id, operation_id) \
+             VALUES ($1, 'op_collision')",
+            &[&event_id],
+        )
+        .await
+        .expect("the provider event ID is already claimed by another operation");
+
+    let response = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap()
+        .post("http://127.0.0.1:18080/webhooks/stripe")
+        .header("Stripe-Signature", attempt.signature_header())
+        .header("Connection", "close")
+        .body(attempt.raw_body().to_vec())
+        .send()
+        .await
+        .expect("the signed collision receives an application response");
+    assert_eq!(response.status(), reqwest::StatusCode::CONFLICT);
+    assert_eq!(response.text().await.unwrap(), "webhook identity conflict");
+
+    let state = admin
+        .query_one(
+            "SELECT \
+                 (SELECT COUNT(*)::bigint FROM payments \
+                  WHERE operation_id IN ('op_deadbeef', 'op_collision')), \
+                 (SELECT COUNT(*)::bigint FROM webhook_deliveries \
+                  WHERE provider_event_id = $1 AND operation_id = 'op_deadbeef'), \
+                 (SELECT COUNT(*)::bigint FROM webhook_effects \
+                  WHERE provider_event_id = $1 AND operation_id = 'op_deadbeef')",
+            &[&event_id],
+        )
+        .await
+        .expect("the collision rollback is observable");
+    assert_eq!(state.get::<_, i64>(0), 0);
+    assert_eq!(state.get::<_, i64>(1), 0);
+    assert_eq!(state.get::<_, i64>(2), 0);
+    drop(admin);
+    connection.await.unwrap().unwrap();
+
+    cleanup_reference_databases().await;
+    recreate_reference_app_in_modes(FAULTY_RETRY_KEY_MODE, REPAIRED_WEBHOOK_EFFECT_MODE);
     restore.disarm();
 }
 
@@ -985,9 +1300,18 @@ fn run_configured_command_with_cases(seed: u64, cases: u32) -> std::process::Out
 }
 
 fn run_configured_command_in_retry_mode(seed: u64, retry_key_mode: &str) -> std::process::Output {
-    require_retry_key_mode(retry_key_mode);
+    run_configured_command_in_modes(seed, retry_key_mode, REPAIRED_WEBHOOK_EFFECT_MODE)
+}
+
+fn run_configured_command_in_modes(
+    seed: u64,
+    retry_key_mode: &str,
+    webhook_effect_mode: &str,
+) -> std::process::Output {
+    require_reference_app_modes(retry_key_mode, webhook_effect_mode);
     configured_command(seed, 1)
         .env(RETRY_KEY_MODE_ENV, retry_key_mode)
+        .env(WEBHOOK_EFFECT_MODE_ENV, webhook_effect_mode)
         .output()
         .expect("the mode-bound configured campaign command executes")
 }
@@ -1023,14 +1347,32 @@ fn configured_replay_command(artifact: &Path) -> Command {
     configured_replay_command_with_config(artifact, Path::new(CONFIG))
 }
 
+fn configured_replay_command_in_modes(
+    artifact: &Path,
+    retry_key_mode: &str,
+    webhook_effect_mode: &str,
+) -> Command {
+    require_reference_app_modes(retry_key_mode, webhook_effect_mode);
+    let mut command = configured_replay_command(artifact);
+    command
+        .env(RETRY_KEY_MODE_ENV, retry_key_mode)
+        .env(WEBHOOK_EFFECT_MODE_ENV, webhook_effect_mode);
+    command
+}
+
 fn configured_shrink_command(artifact: &Path) -> Command {
+    configured_shrink_command_with_limit(artifact, 1)
+}
+
+fn configured_shrink_command_with_limit(artifact: &Path, max_candidates: u32) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_tiv"));
     command
         .args(["shrink", "configured", "--artifact"])
         .arg(artifact)
         .arg("--config")
         .arg(CONFIG)
-        .args(["--max-candidates", "1"])
+        .arg("--max-candidates")
+        .arg(max_candidates.to_string())
         .args(["--max-time", "10m"])
         .env("TIV_POSTGRES_ADMIN_URL", ADMIN_URL)
         .env("DATABASE_URL", CASE_URL)
@@ -1042,6 +1384,19 @@ fn configured_shrink_command(artifact: &Path) -> Command {
         .env("HTTPS_PROXY", "http://127.0.0.1:9")
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
+    command
+}
+
+fn configured_shrink_command_in_modes(
+    artifact: &Path,
+    retry_key_mode: &str,
+    webhook_effect_mode: &str,
+) -> Command {
+    require_reference_app_modes(retry_key_mode, webhook_effect_mode);
+    let mut command = configured_shrink_command_with_limit(artifact, 3);
+    command
+        .env(RETRY_KEY_MODE_ENV, retry_key_mode)
+        .env(WEBHOOK_EFFECT_MODE_ENV, webhook_effect_mode);
     command
 }
 
@@ -1062,6 +1417,19 @@ fn configured_minimized_replay_command(artifact: &Path) -> Command {
         .env("HTTPS_PROXY", "http://127.0.0.1:9")
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
+    command
+}
+
+fn configured_minimized_replay_command_in_modes(
+    artifact: &Path,
+    retry_key_mode: &str,
+    webhook_effect_mode: &str,
+) -> Command {
+    require_reference_app_modes(retry_key_mode, webhook_effect_mode);
+    let mut command = configured_minimized_replay_command(artifact);
+    command
+        .env(RETRY_KEY_MODE_ENV, retry_key_mode)
+        .env(WEBHOOK_EFFECT_MODE_ENV, webhook_effect_mode);
     command
 }
 
@@ -1113,6 +1481,115 @@ fn assert_row_three_trace(artifact: &Path) {
             "retry": "normal"
         })]
     );
+}
+
+fn assert_row_one_trace(artifact: &Path) {
+    let campaign: serde_json::Value =
+        serde_json::from_slice(&fs::read(artifact.join("campaign-plan.json")).unwrap())
+            .expect("the campaign plan is JSON");
+    assert_eq!(campaign["spec"]["campaign_seed"], 1_792);
+    let trace: serde_json::Value =
+        serde_json::from_slice(&fs::read(artifact.join("cases/case_0001/trace.json")).unwrap())
+            .expect("the configured case trace is JSON");
+    let action_kinds = trace["planned_case"]["actions"]
+        .as_array()
+        .expect("planned actions are recorded")
+        .iter()
+        .filter_map(|action| action["kind"]["kind"].as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        action_kinds
+            .iter()
+            .filter(|kind| **kind == "generate_provider_event")
+            .count(),
+        1
+    );
+    assert_eq!(
+        action_kinds
+            .iter()
+            .filter(|kind| **kind == "deliver_webhook")
+            .count(),
+        1
+    );
+    assert_eq!(
+        action_kinds
+            .iter()
+            .filter(|kind| **kind == "duplicate_webhook")
+            .count(),
+        1
+    );
+    let deliver_index = action_kinds
+        .iter()
+        .position(|kind| *kind == "deliver_webhook")
+        .expect("the original event is delivered");
+    let duplicate_index = action_kinds
+        .iter()
+        .position(|kind| *kind == "duplicate_webhook")
+        .expect("the same event is duplicated");
+    assert!(deliver_index < duplicate_index);
+}
+
+fn recorded_invariant(
+    record: &serde_json::Value,
+    invariant_id: &str,
+    verdict: &str,
+    witness_count: u64,
+) -> bool {
+    record["invariants"].as_array().is_some_and(|invariants| {
+        invariants.iter().any(|invariant| {
+            let recorded_verdict = invariant["verdict"]
+                .as_str()
+                .is_some_and(|value| value == verdict)
+                || invariant["violated"].as_bool().is_some_and(|violated| {
+                    (violated && verdict == "violated") || (!violated && verdict == "held")
+                });
+            invariant["invariant_id"] == invariant_id
+                && recorded_verdict
+                && invariant["witness_count"] == witness_count
+        })
+    })
+}
+
+async fn assert_reference_webhook_effect_count(expected: i64) {
+    let case_url = ADMIN_URL.replace("/postgres", "/tiv_case_deadbeef");
+    let (client, connection) = tokio_postgres::connect(&case_url, NoTls)
+        .await
+        .expect("the test admin connects to the generated case");
+    let connection = tokio::spawn(connection);
+    let observed = client
+        .query_one("SELECT COUNT(*)::bigint FROM webhook_effects", &[])
+        .await
+        .expect("the reference effect count is readable")
+        .get::<_, i64>(0);
+    drop(client);
+    connection.await.unwrap().unwrap();
+    assert_eq!(observed, expected);
+}
+
+async fn assert_reference_webhook_delivery_count(expected: i64) {
+    let case_url = ADMIN_URL.replace("/postgres", "/tiv_case_deadbeef");
+    let (client, connection) = tokio_postgres::connect(&case_url, NoTls)
+        .await
+        .expect("the test admin connects to the generated case");
+    let connection = tokio::spawn(connection);
+    let observed = client
+        .query_one("SELECT COUNT(*)::bigint FROM webhook_deliveries", &[])
+        .await
+        .expect("the reference delivery count is readable")
+        .get::<_, i64>(0);
+    drop(client);
+    connection.await.unwrap().unwrap();
+    assert_eq!(observed, expected);
+}
+
+fn current_unix_timestamp() -> i64 {
+    i64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("the system clock is after the Unix epoch")
+            .as_secs(),
+    )
+    .expect("the current Unix timestamp fits in i64")
 }
 
 async fn wait_for_observation(
@@ -1232,11 +1709,11 @@ fn assert_reference_app_healthy() {
     );
 }
 
-struct FaultyRetryModeRestore {
+struct ReferenceAppModeRestore {
     armed: bool,
 }
 
-impl FaultyRetryModeRestore {
+impl ReferenceAppModeRestore {
     const fn armed() -> Self {
         Self { armed: true }
     }
@@ -1246,16 +1723,22 @@ impl FaultyRetryModeRestore {
     }
 }
 
-impl Drop for FaultyRetryModeRestore {
+impl Drop for ReferenceAppModeRestore {
     fn drop(&mut self) {
         if self.armed {
-            let _ = reference_app_recreate_command(FAULTY_RETRY_KEY_MODE).status();
+            let _ =
+                reference_app_recreate_command(FAULTY_RETRY_KEY_MODE, REPAIRED_WEBHOOK_EFFECT_MODE)
+                    .status();
         }
     }
 }
 
 fn recreate_reference_app_in_retry_mode(retry_key_mode: &str) {
-    let output = reference_app_recreate_command(retry_key_mode)
+    recreate_reference_app_in_modes(retry_key_mode, REPAIRED_WEBHOOK_EFFECT_MODE);
+}
+
+fn recreate_reference_app_in_modes(retry_key_mode: &str, webhook_effect_mode: &str) {
+    let output = reference_app_recreate_command(retry_key_mode, webhook_effect_mode)
         .output()
         .expect("Docker Compose recreates the reference application");
     assert!(
@@ -1265,9 +1748,10 @@ fn recreate_reference_app_in_retry_mode(retry_key_mode: &str) {
     );
     assert_reference_app_healthy();
 
-    let expected = format!("{RETRY_KEY_MODE_ENV}={retry_key_mode}");
+    let expected_retry = format!("{RETRY_KEY_MODE_ENV}={retry_key_mode}");
+    let expected_webhook = format!("{WEBHOOK_EFFECT_MODE_ENV}={webhook_effect_mode}");
     let template = format!(
-        "{{{{range .Config.Env}}}}{{{{if eq . \"{expected}\"}}}}true{{{{end}}}}{{{{end}}}}"
+        "{{{{range .Config.Env}}}}{{{{if eq . \"{expected_retry}\"}}}}retry {{{{end}}}}{{{{if eq . \"{expected_webhook}\"}}}}webhook {{{{end}}}}{{{{end}}}}"
     );
     let inspection = Command::new("docker")
         .args([
@@ -1279,13 +1763,21 @@ fn recreate_reference_app_in_retry_mode(retry_key_mode: &str) {
             "tiv-reference-app-spike-reference-app-1",
         ])
         .output()
-        .expect("Docker inspects the selected non-secret retry mode");
+        .expect("Docker inspects the selected non-secret reference-app modes");
     assert!(inspection.status.success());
-    assert_eq!(String::from_utf8_lossy(&inspection.stdout).trim(), "true");
+    let inspection_stdout = String::from_utf8_lossy(&inspection.stdout);
+    let observed = inspection_stdout
+        .split_whitespace()
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        observed,
+        BTreeSet::from(["retry", "webhook"]),
+        "both selected reference-app modes must be present"
+    );
 }
 
-fn reference_app_recreate_command(retry_key_mode: &str) -> Command {
-    require_retry_key_mode(retry_key_mode);
+fn reference_app_recreate_command(retry_key_mode: &str, webhook_effect_mode: &str) -> Command {
+    require_reference_app_modes(retry_key_mode, webhook_effect_mode);
     let repository_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let compose_file = repository_root.join("spike/reference-app.compose.yaml");
     let mut command = Command::new("docker");
@@ -1313,6 +1805,7 @@ fn reference_app_recreate_command(retry_key_mode: &str) -> Command {
             "reference-app",
         ])
         .env(RETRY_KEY_MODE_ENV, retry_key_mode)
+        .env(WEBHOOK_EFFECT_MODE_ENV, webhook_effect_mode)
         .env_remove("DOCKER_HOST")
         .env_remove("DOCKER_CONTEXT")
         .env_remove("DOCKER_TLS_VERIFY")
@@ -1320,10 +1813,14 @@ fn reference_app_recreate_command(retry_key_mode: &str) -> Command {
     command
 }
 
-fn require_retry_key_mode(retry_key_mode: &str) {
+fn require_reference_app_modes(retry_key_mode: &str, webhook_effect_mode: &str) {
     assert!(matches!(
         retry_key_mode,
         "faulty_changed_key" | "repaired_same_key"
+    ));
+    assert!(matches!(
+        webhook_effect_mode,
+        "faulty_duplicate_effect" | "repaired_deduplicate"
     ));
 }
 
@@ -1421,20 +1918,51 @@ async fn prepare_reference_baseline() {
                  currency text NOT NULL CHECK (currency ~ '^[a-z]{3}$'), \
                  status text NOT NULL CHECK (status IN ('pending', 'succeeded')) \
              ); \
+             CREATE TABLE processed_webhook_events ( \
+                 provider_event_id text PRIMARY KEY \
+                     CHECK (provider_event_id ~ '^evt_tiv_[A-Za-z0-9_-]+$'), \
+                 operation_id text NOT NULL REFERENCES orders(operation_id), \
+                 UNIQUE (provider_event_id, operation_id) \
+             ); \
+             CREATE TABLE webhook_deliveries ( \
+                 id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, \
+                 provider_event_id text NOT NULL, \
+                 operation_id text NOT NULL, \
+                 CONSTRAINT webhook_deliveries_event_identity_fkey \
+                     FOREIGN KEY (provider_event_id, operation_id) \
+                     REFERENCES processed_webhook_events \
+                         (provider_event_id, operation_id) \
+             ); \
+             CREATE TABLE webhook_effects ( \
+                 id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, \
+                 provider_event_id text NOT NULL, \
+                 operation_id text NOT NULL, \
+                 FOREIGN KEY (provider_event_id, operation_id) \
+                     REFERENCES processed_webhook_events \
+                         (provider_event_id, operation_id) \
+             ); \
              CREATE INDEX payments_operation_id_idx ON payments (operation_id); \
              CREATE INDEX payments_provider_id_idx ON payments (stripe_payment_intent_id); \
+             CREATE INDEX webhook_effects_event_idx \
+                 ON webhook_effects (provider_event_id); \
              REVOKE ALL ON SCHEMA public FROM PUBLIC; \
              GRANT USAGE ON SCHEMA public TO tiv_app, tiv_invariant; \
-             REVOKE ALL ON TABLE tiv_verifier_marker, orders, payments \
+             REVOKE ALL ON TABLE tiv_verifier_marker, orders, payments, \
+                 processed_webhook_events, webhook_deliveries, webhook_effects \
                  FROM PUBLIC, tiv_app, tiv_invariant; \
-             REVOKE ALL ON SEQUENCE orders_id_seq, payments_id_seq \
+             REVOKE ALL ON SEQUENCE orders_id_seq, payments_id_seq, \
+                 webhook_deliveries_id_seq, webhook_effects_id_seq \
                  FROM PUBLIC, tiv_app, tiv_invariant; \
              GRANT SELECT (operation_id, amount_minor, currency) ON TABLE orders TO tiv_app; \
              GRANT INSERT ON TABLE payments TO tiv_app; \
              GRANT SELECT (operation_id, stripe_payment_intent_id), \
                    UPDATE (status) ON TABLE payments TO tiv_app; \
-             GRANT USAGE ON SEQUENCE payments_id_seq TO tiv_app; \
-             GRANT SELECT ON TABLE orders, payments TO tiv_invariant; \
+             GRANT INSERT ON TABLE processed_webhook_events, webhook_deliveries, \
+                 webhook_effects TO tiv_app; \
+             GRANT USAGE ON SEQUENCE payments_id_seq, webhook_deliveries_id_seq, \
+                 webhook_effects_id_seq TO tiv_app; \
+             GRANT SELECT ON TABLE orders, payments, processed_webhook_events, \
+                 webhook_deliveries, webhook_effects TO tiv_invariant; \
              INSERT INTO orders (operation_id, amount_minor, currency, status) \
                  VALUES ('op_deadbeef', 2500, 'usd', 'pending')",
         )

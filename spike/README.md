@@ -91,25 +91,45 @@ docker compose \
   up --detach --build --wait
 ```
 
-### Retry-key fault and repaired control
+### Reference fault modes and repaired controls
 
 The reference application selects its retry behavior once at process startup
 through `TIV_REFERENCE_APP_RETRY_KEY_MODE`. The only accepted values are
 `faulty_changed_key` and `repaired_same_key`; the Compose default is the faulty
-mode. There is no request header or route parameter that can switch behavior
-inside a run. `/health` reports the selected non-secret mode, and the direct
+mode. Webhook business-effect behavior is likewise startup-only through
+`TIV_REFERENCE_APP_WEBHOOK_EFFECT_MODE`, with exact values
+`faulty_duplicate_effect` and `repaired_deduplicate`; the repaired mode is the
+default. There is no request header or route parameter that can switch either
+behavior inside a run. `/health` reports both non-secret modes, and the direct
 `reference-app-evidence` command additionally attests the container is in the
-faulty mode before it labels a changed-key counterexample.
+faulty retry-key mode before it labels a changed-key counterexample.
 
 The resolved Compose configuration, and therefore its configuration hash,
-includes this mode. A command inspecting a stack started in repaired mode must
-receive the same environment value; evidence from one mode is intentionally
-not compatible with a stack resolved in the other mode.
+includes both modes. A command inspecting a non-default stack must receive the
+same environment values; evidence from one mode pair is intentionally not
+compatible with a stack resolved under another pair.
+
+The row-one pair uses campaign seed `1792`, which compiles one provider object,
+one immutable event, one original delivery, and one duplicate delivery without
+a process kill. Faulty mode records two effect applications and produces one
+`webhook-effect-at-most-once` witness. Repaired mode uses an atomic processed
+event key, records one effect, and all five configured invariants hold. The
+faulty artifact also reproduces the same identity in 3/3 fresh baselines; a
+three-candidate bounded shrink rejects removal of the causal duplicate, accepts
+a smaller seven-action trace, and the minimized trace reproduces 3/3:
+
+```sh
+CARGO_INCREMENTAL=0 cargo test -p tiv-cli --test configured_run \
+  row_one_duplicate_webhook_fault_violates_and_deduplicated_repair_holds \
+  -- --ignored --exact --nocapture
+```
 
 The paired row-three acceptance test owns both mode changes, executes campaign
 seed `69` against a fresh baseline in each mode, verifies both finalized
 artifacts, requires a verified default-mode restore on normal completion, and
-makes a best-effort default-mode restore if an assertion unwinds the test:
+makes a best-effort default-mode restore if an assertion unwinds the test. CI
+also recreates and attests the default pair in an unconditional follow-up step
+before any later reference evidence can run:
 
 ```sh
 CARGO_INCREMENTAL=0 cargo test -p tiv-cli --test configured_run \
@@ -221,9 +241,8 @@ docker compose \
   down --volumes --remove-orphans
 ```
 
-This remains bounded truth-spike evidence. It proves one synthetic known-bug
-application, the five-query configured oracle, and the faulty/corrected
-execution pair for reference fault row 3. It does not yet prove arbitrary
-customer repositories, the other five reference fault variants, exhaustive
-schedule coverage, production secret management, or distributed image
-provenance.
+This remains bounded truth-spike evidence. It proves one synthetic application,
+the five-query configured oracle, and faulty/corrected execution pairs for
+reference fault rows 1 and 3. It does not yet prove arbitrary customer
+repositories, the other four reference fault variants, exhaustive schedule
+coverage, production secret management, or distributed image provenance.

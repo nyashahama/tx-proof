@@ -180,6 +180,50 @@ impl fmt::Display for InvalidRetryKeyMode {
 
 impl Error for InvalidRetryKeyMode {}
 
+/// Controls whether repeated delivery of one authenticated provider event
+/// applies its business effect again or is durably deduplicated.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum WebhookEffectMode {
+    /// Reproduces the reference bug by applying the effect for every delivery.
+    FaultyDuplicateEffect,
+    /// Applies the effect only when the immutable provider event is first seen.
+    #[default]
+    RepairedDeduplicate,
+}
+
+impl WebhookEffectMode {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::FaultyDuplicateEffect => "faulty_duplicate_effect",
+            Self::RepairedDeduplicate => "repaired_deduplicate",
+        }
+    }
+}
+
+impl FromStr for WebhookEffectMode {
+    type Err = InvalidWebhookEffectMode;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "faulty_duplicate_effect" => Ok(Self::FaultyDuplicateEffect),
+            "repaired_deduplicate" => Ok(Self::RepairedDeduplicate),
+            _ => Err(InvalidWebhookEffectMode),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InvalidWebhookEffectMode;
+
+impl fmt::Display for InvalidWebhookEffectMode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("invalid reference-app webhook-effect mode")
+    }
+}
+
+impl Error for InvalidWebhookEffectMode {}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ObservedPaymentIntent {
     id: String,
@@ -213,6 +257,29 @@ impl ObservedPaymentIntent {
     #[must_use]
     pub fn status(&self) -> &str {
         &self.status
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ObservedWebhookEvent {
+    id: String,
+    payment_intent: ObservedPaymentIntent,
+}
+
+impl ObservedWebhookEvent {
+    #[must_use]
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    #[must_use]
+    pub const fn payment_intent(&self) -> &ObservedPaymentIntent {
+        &self.payment_intent
+    }
+
+    #[must_use]
+    pub fn into_payment_intent(self) -> ObservedPaymentIntent {
+        self.payment_intent
     }
 }
 
@@ -468,6 +535,23 @@ pub fn parse_succeeded_webhook(
     signature_header: &str,
     secret: &[u8],
 ) -> Result<ObservedPaymentIntent, ReferenceAppError> {
+    parse_succeeded_webhook_event(raw_body, signature_header, secret)
+        .map(ObservedWebhookEvent::into_payment_intent)
+}
+
+/// Verifies and decodes one supported event while preserving its immutable
+/// provider event identity for durable deduplication.
+///
+/// # Errors
+///
+/// Returns [`ReferenceAppError::InvalidWebhookSignature`] when authenticity
+/// fails, or [`ReferenceAppError::InvalidWebhookEvent`] when the signed bytes
+/// are outside the narrow reference contract.
+pub fn parse_succeeded_webhook_event(
+    raw_body: &[u8],
+    signature_header: &str,
+    secret: &[u8],
+) -> Result<ObservedWebhookEvent, ReferenceAppError> {
     verify_webhook_signature(raw_body, signature_header, secret)?;
     let event = serde_json::from_slice::<ProviderEventWire>(raw_body)
         .map_err(|_| ReferenceAppError::InvalidWebhookEvent)?;
@@ -493,12 +577,15 @@ pub fn parse_succeeded_webhook(
     {
         return Err(ReferenceAppError::InvalidWebhookEvent);
     }
-    Ok(ObservedPaymentIntent {
-        id: payment_intent.id,
-        operation_id: payment_intent.metadata.operation_id,
-        amount_minor: payment_intent.amount,
-        currency: payment_intent.currency,
-        status: payment_intent.status,
+    Ok(ObservedWebhookEvent {
+        id: event.id,
+        payment_intent: ObservedPaymentIntent {
+            id: payment_intent.id,
+            operation_id: payment_intent.metadata.operation_id,
+            amount_minor: payment_intent.amount,
+            currency: payment_intent.currency,
+            status: payment_intent.status,
+        },
     })
 }
 
@@ -521,6 +608,7 @@ struct ProviderEventDataWire {
 const MAX_APP_REQUEST_BODY_BYTES: usize = 16 * 1024;
 const CONTROL_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 const WEBHOOK_TIMESTAMP_TOLERANCE_SECONDS: u64 = 300;
+const WEBHOOK_DELIVERY_IDENTITY_CONSTRAINT: &str = "webhook_deliveries_event_identity_fkey";
 
 type AppResponseBody = Full<Bytes>;
 
@@ -535,6 +623,7 @@ pub struct ReferenceAppConfig {
     webhook_secret: Vec<u8>,
     control_probe_address: String,
     retry_key_mode: RetryKeyMode,
+    webhook_effect_mode: WebhookEffectMode,
 }
 
 impl ReferenceAppConfig {
@@ -579,6 +668,7 @@ impl ReferenceAppConfig {
             webhook_secret,
             control_probe_address,
             retry_key_mode: RetryKeyMode::default(),
+            webhook_effect_mode: WebhookEffectMode::default(),
         })
     }
 
@@ -591,6 +681,20 @@ impl ReferenceAppConfig {
     #[must_use]
     pub const fn retry_key_mode(&self) -> RetryKeyMode {
         self.retry_key_mode
+    }
+
+    #[must_use]
+    pub const fn with_webhook_effect_mode(
+        mut self,
+        webhook_effect_mode: WebhookEffectMode,
+    ) -> Self {
+        self.webhook_effect_mode = webhook_effect_mode;
+        self
+    }
+
+    #[must_use]
+    pub const fn webhook_effect_mode(&self) -> WebhookEffectMode {
+        self.webhook_effect_mode
     }
 }
 
@@ -725,30 +829,61 @@ impl ReferenceApp {
     async fn persist_webhook(
         &self,
         database: &ReferenceDatabaseName,
-        payment_intent: &ObservedPaymentIntent,
+        event: &ObservedWebhookEvent,
     ) -> Result<(), ReferenceAppError> {
+        let payment_intent = event.payment_intent();
         let (mut client, connection) = self.connect_database(database).await?;
         let result = async {
             let transaction = client.transaction().await?;
-            let updated = transaction
+            let first_processing = transaction
                 .execute(
-                    "UPDATE payments SET status = 'succeeded' \
-                     WHERE operation_id = $1 AND stripe_payment_intent_id = $2",
-                    &[&payment_intent.operation_id(), &payment_intent.id()],
+                    "INSERT INTO processed_webhook_events \
+                     (provider_event_id, operation_id) \
+                     VALUES ($1, $2) \
+                     ON CONFLICT DO NOTHING",
+                    &[&event.id(), &payment_intent.operation_id()],
+                )
+                .await?
+                == 1;
+            transaction
+                .execute(
+                    "INSERT INTO webhook_deliveries (provider_event_id, operation_id) \
+                     VALUES ($1, $2)",
+                    &[&event.id(), &payment_intent.operation_id()],
                 )
                 .await?;
-            if updated == 0 {
+            if first_processing {
+                let updated = transaction
+                    .execute(
+                        "UPDATE payments SET status = 'succeeded' \
+                         WHERE operation_id = $1 AND stripe_payment_intent_id = $2",
+                        &[&payment_intent.operation_id(), &payment_intent.id()],
+                    )
+                    .await?;
+                if updated == 0 {
+                    transaction
+                        .execute(
+                            "INSERT INTO payments \
+                                 (operation_id, stripe_payment_intent_id, amount_minor, currency, status) \
+                             VALUES ($1, $2, $3, $4, 'succeeded')",
+                            &[
+                                &payment_intent.operation_id(),
+                                &payment_intent.id(),
+                                &payment_intent.amount_minor(),
+                                &payment_intent.currency(),
+                            ],
+                        )
+                        .await?;
+                }
+            }
+            if first_processing
+                || self.config.webhook_effect_mode == WebhookEffectMode::FaultyDuplicateEffect
+            {
                 transaction
                     .execute(
-                        "INSERT INTO payments \
-                             (operation_id, stripe_payment_intent_id, amount_minor, currency, status) \
-                         VALUES ($1, $2, $3, $4, 'succeeded')",
-                        &[
-                            &payment_intent.operation_id(),
-                            &payment_intent.id(),
-                            &payment_intent.amount_minor(),
-                            &payment_intent.currency(),
-                        ],
+                        "INSERT INTO webhook_effects (provider_event_id, operation_id) \
+                         VALUES ($1, $2)",
+                        &[&event.id(), &payment_intent.operation_id()],
                     )
                     .await?;
             }
@@ -757,7 +892,7 @@ impl ReferenceApp {
         .await;
         drop(client);
         let connection_result = connection.await;
-        result.map_err(|_| ReferenceAppError::Database)?;
+        result.map_err(|error| classify_webhook_database_error(&error))?;
         connection_result
             .map_err(|_| ReferenceAppError::Database)?
             .map_err(|_| ReferenceAppError::Database)?;
@@ -826,6 +961,7 @@ async fn handle_app_request(
             &serde_json::json!({
                 "status": "ok",
                 "retry_key_mode": app.config.retry_key_mode.as_str(),
+                "webhook_effect_mode": app.config.webhook_effect_mode.as_str(),
             }),
         ),
         (&Method::GET, "/probe-fixture-control") => {
@@ -1040,15 +1176,16 @@ async fn handle_webhook(
             ));
         }
     };
-    let payment_intent =
-        match parse_succeeded_webhook(&raw_body, &signature, &app.config.webhook_secret) {
-            Ok(payment_intent) => payment_intent,
+    let event =
+        match parse_succeeded_webhook_event(&raw_body, &signature, &app.config.webhook_secret) {
+            Ok(event) => event,
             Err(ReferenceAppError::InvalidWebhookSignature) => {
                 return Ok(text_response(StatusCode::UNAUTHORIZED, "invalid signature"));
             }
             Err(_) => return Ok(text_response(StatusCode::BAD_REQUEST, "invalid event")),
         };
-    let registered = match app.registered_operation(&payment_intent).await {
+    let payment_intent = event.payment_intent();
+    let registered = match app.registered_operation(payment_intent).await {
         Ok(registered) => registered,
         Err(ReferenceAppError::UnknownOperation) => {
             return Ok(text_response(StatusCode::CONFLICT, "unknown operation"));
@@ -1073,15 +1210,20 @@ async fn handle_webhook(
             ));
         }
     }
-    if app
-        .persist_webhook(&registered.database, &payment_intent)
-        .await
-        .is_err()
-    {
-        return Ok(text_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "database failure",
-        ));
+    match app.persist_webhook(&registered.database, &event).await {
+        Ok(()) => {}
+        Err(ReferenceAppError::WebhookIdentityConflict) => {
+            return Ok(text_response(
+                StatusCode::CONFLICT,
+                "webhook identity conflict",
+            ));
+        }
+        Err(_) => {
+            return Ok(text_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "database failure",
+            ));
+        }
     }
     json_response(StatusCode::OK, &serde_json::json!({"accepted": true}))
 }
@@ -1166,6 +1308,18 @@ enum AppHttpError {
     ProviderResponse,
 }
 
+fn classify_webhook_database_error(error: &tokio_postgres::Error) -> ReferenceAppError {
+    if error
+        .as_db_error()
+        .and_then(tokio_postgres::error::DbError::constraint)
+        == Some(WEBHOOK_DELIVERY_IDENTITY_CONSTRAINT)
+    {
+        ReferenceAppError::WebhookIdentityConflict
+    } else {
+        ReferenceAppError::Database
+    }
+}
+
 impl fmt::Display for AppHttpError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
@@ -1190,6 +1344,7 @@ pub enum ReferenceAppError {
     ProviderResponse,
     ProviderTransport,
     UnknownOperation,
+    WebhookIdentityConflict,
 }
 
 impl fmt::Display for ReferenceAppError {
@@ -1205,6 +1360,9 @@ impl fmt::Display for ReferenceAppError {
             Self::ProviderResponse => "invalid provider response",
             Self::ProviderTransport => "provider transport failed",
             Self::UnknownOperation => "webhook operation is not registered",
+            Self::WebhookIdentityConflict => {
+                "provider event identity conflicts with prior processing"
+            }
         };
         formatter.write_str(message)
     }
@@ -1229,9 +1387,19 @@ mod tests {
         )
         .expect("the synthetic config is valid");
         assert_eq!(config.retry_key_mode(), RetryKeyMode::FaultyChangedKey);
+        assert_eq!(
+            config.webhook_effect_mode(),
+            WebhookEffectMode::RepairedDeduplicate
+        );
 
-        let repaired = config.with_retry_key_mode(RetryKeyMode::RepairedSameKey);
+        let repaired = config
+            .with_retry_key_mode(RetryKeyMode::RepairedSameKey)
+            .with_webhook_effect_mode(WebhookEffectMode::FaultyDuplicateEffect);
         assert_eq!(repaired.retry_key_mode(), RetryKeyMode::RepairedSameKey);
+        assert_eq!(
+            repaired.webhook_effect_mode(),
+            WebhookEffectMode::FaultyDuplicateEffect
+        );
     }
 
     #[test]

@@ -15,8 +15,32 @@ fn reference_stack_routes_fixture_webhooks_only_over_the_shared_data_network() {
     assert!(compose.contains(
         "TIV_REFERENCE_APP_RETRY_KEY_MODE: ${TIV_REFERENCE_APP_RETRY_KEY_MODE:-faulty_changed_key}"
     ));
+    assert!(compose.contains(
+        "TIV_REFERENCE_APP_WEBHOOK_EFFECT_MODE: ${TIV_REFERENCE_APP_WEBHOOK_EFFECT_MODE:-repaired_deduplicate}"
+    ));
     assert!(compose.contains("127.0.0.1:18080:18080"));
     assert!(!compose.contains("TIV_REFERENCE_APP_BIND: reference-app-host:18080"));
+}
+
+#[test]
+fn webhook_identity_is_validated_before_any_payment_mutation() {
+    let source = include_str!("../../../tests/reference-app/src/lib.rs");
+    let persistence = source
+        .split_once("    async fn persist_webhook(")
+        .and_then(|(_, suffix)| suffix.split_once("    async fn connect_database("))
+        .map(|(body, _)| body)
+        .expect("the bounded webhook persistence function remains inspectable");
+    let identity_validation = persistence
+        .find("INSERT INTO webhook_deliveries")
+        .expect("every delivery validates its durable event/operation identity");
+    let payment_mutation = persistence
+        .find("UPDATE payments SET status = 'succeeded'")
+        .expect("the successful payment relation remains explicit");
+
+    assert!(
+        identity_validation < payment_mutation,
+        "an event/operation collision must fail before payment state can change"
+    );
 }
 
 #[tokio::test]
