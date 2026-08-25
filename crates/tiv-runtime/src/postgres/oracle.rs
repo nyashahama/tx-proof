@@ -5,6 +5,11 @@ use tiv_core::{
 };
 use tokio_postgres::{Client, IsolationLevel};
 
+use crate::{
+    case_http::ReferenceCaseHttpCompletion, postgres::quiescence::DatabaseQuiescenceCompletion,
+    replay::ReferenceAppReplayCompletion,
+};
+
 const CHECKPOINT_ID: &str = "checkout-quiescent";
 const PROVIDER_UNIQUENESS_ID: &str = "provider-object-unique";
 const MAX_WITNESS_ROWS: usize = 100;
@@ -30,11 +35,31 @@ impl QuiescencePermit {
     pub(super) const fn after_synthetic_driver_stopped() -> Self {
         Self { _private: () }
     }
+
+    pub(crate) const fn after_reference_app_replay_completed(
+        _completion: ReferenceAppReplayCompletion,
+    ) -> Self {
+        Self { _private: () }
+    }
+
+    pub(crate) const fn after_reference_case_http_quiescent(
+        _completion: &ReferenceCaseHttpCompletion,
+    ) -> Self {
+        Self { _private: () }
+    }
+
+    pub(crate) const fn after_configured_case_quiescent(
+        _http_completion: &ReferenceCaseHttpCompletion,
+        _database_completion: DatabaseQuiescenceCompletion,
+    ) -> Self {
+        Self { _private: () }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProviderPaymentIntent {
     id: PaymentIntentId,
+    operation_id: String,
     amount_minor: i64,
     currency: String,
     status: String,
@@ -45,18 +70,22 @@ impl ProviderPaymentIntent {
     ///
     /// # Errors
     ///
-    /// Returns [`InvalidProviderProjection`] for an invalid provider ID,
-    /// non-positive amount, unsupported currency, or unsupported status.
+    /// Returns [`InvalidProviderProjection`] for an invalid provider or
+    /// operation ID, non-positive amount, unsupported currency, or unsupported
+    /// status.
     pub fn new(
         id: impl Into<String>,
+        operation_id: impl Into<String>,
         amount_minor: i64,
         currency: impl Into<String>,
         status: impl Into<String>,
     ) -> Result<Self, InvalidProviderProjection> {
         let id = PaymentIntentId::new(id).map_err(|_| InvalidProviderProjection)?;
+        let operation_id = operation_id.into();
         let currency = currency.into();
         let status = status.into();
-        if amount_minor <= 0
+        if !valid_operation_id(&operation_id)
+            || amount_minor <= 0
             || currency.len() != 3
             || !currency.bytes().all(|byte| byte.is_ascii_lowercase())
             || !matches!(status.as_str(), "requires_confirmation" | "succeeded")
@@ -65,27 +94,45 @@ impl ProviderPaymentIntent {
         }
         Ok(Self {
             id,
+            operation_id,
             amount_minor,
             currency,
             status,
         })
     }
 
-    pub(crate) fn id(&self) -> &str {
+    #[must_use]
+    pub fn id(&self) -> &str {
         self.id.as_str()
     }
 
-    pub(crate) const fn amount_minor(&self) -> i64 {
+    #[must_use]
+    pub fn operation_id(&self) -> &str {
+        &self.operation_id
+    }
+
+    #[must_use]
+    pub const fn amount_minor(&self) -> i64 {
         self.amount_minor
     }
 
-    pub(crate) fn currency(&self) -> &str {
+    #[must_use]
+    pub fn currency(&self) -> &str {
         &self.currency
     }
 
-    pub(crate) fn status(&self) -> &str {
+    #[must_use]
+    pub fn status(&self) -> &str {
         &self.status
     }
+}
+
+fn valid_operation_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 255
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -197,18 +244,26 @@ pub async fn run_reference_oracle(
             .await?;
         let rows = transaction
             .query(
-                "SELECT p.operation_id, \
-                        COUNT(*)::bigint AS local_payment_count, \
-                        COUNT(DISTINCT p.stripe_payment_intent_id)::bigint AS provider_object_count, \
-                        ARRAY_AGG(p.id ORDER BY p.id) AS payment_row_ids, \
-                        ARRAY_AGG(p.stripe_payment_intent_id ORDER BY p.stripe_payment_intent_id) \
+                "SELECT provider.operation_id, \
+                        COUNT(p.id)::bigint AS local_payment_count, \
+                        COUNT(DISTINCT provider.payment_intent_id)::bigint \
+                            AS provider_object_count, \
+                        COALESCE( \
+                            ARRAY_AGG(p.id ORDER BY p.id) FILTER (WHERE p.id IS NOT NULL), \
+                            ARRAY[]::bigint[] \
+                        ) AS payment_row_ids, \
+                        ARRAY_AGG( \
+                            provider.payment_intent_id \
+                            ORDER BY provider.payment_intent_id \
+                        ) \
                             AS provider_payment_intent_ids \
-                 FROM payments AS p \
-                 JOIN tiv_provider_state AS provider \
-                   ON provider.payment_intent_id = p.stripe_payment_intent_id \
-                 GROUP BY p.operation_id \
-                 HAVING COUNT(DISTINCT p.stripe_payment_intent_id) > 1 \
-                 ORDER BY p.operation_id \
+                 FROM tiv_provider_state AS provider \
+                 LEFT JOIN payments AS p \
+                   ON p.operation_id = provider.operation_id \
+                  AND p.stripe_payment_intent_id = provider.payment_intent_id \
+                 GROUP BY provider.operation_id \
+                 HAVING COUNT(DISTINCT provider.payment_intent_id) > 1 \
+                 ORDER BY provider.operation_id \
                  LIMIT 101",
                 &[],
             )
@@ -245,7 +300,7 @@ pub async fn run_reference_oracle(
     result
 }
 
-async fn load_provider_projection(
+pub(super) async fn load_provider_projection(
     client: &mut Client,
     provider_objects: &[ProviderPaymentIntent],
 ) -> Result<(), tokio_postgres::Error> {
@@ -253,6 +308,7 @@ async fn load_provider_projection(
         .batch_execute(
             "CREATE TEMP TABLE IF NOT EXISTS tiv_provider_state ( \
                  payment_intent_id text PRIMARY KEY, \
+                 operation_id text NOT NULL, \
                  amount_minor bigint NOT NULL, \
                  currency text NOT NULL, \
                  status text NOT NULL \
@@ -263,8 +319,8 @@ async fn load_provider_projection(
     let statement = client
         .prepare(
             "INSERT INTO tiv_provider_state \
-                 (payment_intent_id, amount_minor, currency, status) \
-             VALUES ($1, $2, $3, $4)",
+                 (payment_intent_id, operation_id, amount_minor, currency, status) \
+             VALUES ($1, $2, $3, $4, $5)",
         )
         .await?;
     for provider in provider_objects {
@@ -273,6 +329,7 @@ async fn load_provider_projection(
                 &statement,
                 &[
                     &provider.id(),
+                    &provider.operation_id(),
                     &provider.amount_minor(),
                     &provider.currency(),
                     &provider.status(),

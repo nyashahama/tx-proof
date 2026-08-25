@@ -17,7 +17,8 @@ use tokio::{
 
 use crate::{
     CreatePaymentIntent, DataPlaneDisposition, DataPlaneResponse, FaultOutcome, FixtureError,
-    FixtureServiceError, IdempotencyKey, ManagedFixture, OperationId, PaymentIntentFixture,
+    FixtureServiceError, HeldDataPlaneResponse, IdempotencyKey, ManagedDataPlaneDisposition,
+    ManagedFixture, OperationId, PaymentIntentFixture,
 };
 
 const MAX_REQUEST_BODY_BYTES: usize = 8 * 1024;
@@ -45,8 +46,8 @@ pub async fn serve_http1_connection(
 /// Serves one HTTP/1 connection using the fault plan installed through the
 /// local control plane.
 ///
-/// Invalid requests do not consume an outcome. A valid create consumes exactly
-/// one planned outcome.
+/// Invalid requests do not consume an outcome. A valid create or confirm
+/// consumes exactly one planned outcome.
 ///
 /// # Errors
 ///
@@ -81,10 +82,131 @@ async fn handle_request(
     backend: DataPlaneBackend,
     close_connection: Arc<Notify>,
 ) -> Result<Response<ResponseBody>, FixtureHttpError> {
+    if request.method() == Method::POST
+        && request.uri().path() == "/v1/tiv/webhook-request-forwarded"
+    {
+        return handle_webhook_request_forwarded(request, &backend).await;
+    }
+    if request.method() == Method::GET && request.uri().path() == "/v1/payment_intents/search" {
+        let Some(operation_id) = search_operation_id(request.uri().query()) else {
+            return Ok(response(
+                StatusCode::BAD_REQUEST,
+                "invalid operation search",
+            ));
+        };
+        return immediate_provider_result(backend.search(&operation_id).await);
+    }
+    if request.method() == Method::GET
+        && let Some(payment_intent_id) = retrieve_payment_intent_id(request.uri().path())
+    {
+        if request.uri().query().is_some() {
+            return Ok(response(StatusCode::BAD_REQUEST, "unsupported query"));
+        }
+        return immediate_provider_result(backend.retrieve(payment_intent_id).await);
+    }
+    if request.method() == Method::POST
+        && let Some(payment_intent_id) = confirm_payment_intent_id(request.uri().path())
+    {
+        let payment_intent_id = payment_intent_id.to_owned();
+        return handle_confirm(request, &backend, &payment_intent_id, &close_connection).await;
+    }
     if request.method() != Method::POST || request.uri().path() != "/v1/payment_intents" {
         return Ok(response(StatusCode::NOT_FOUND, b"not found".as_slice()));
     }
+    handle_create(request, &backend, &close_connection).await
+}
 
+async fn handle_webhook_request_forwarded(
+    request: Request<Incoming>,
+    backend: &DataPlaneBackend,
+) -> Result<Response<ResponseBody>, FixtureHttpError> {
+    if request.uri().query().is_some() {
+        return Ok(response(StatusCode::BAD_REQUEST, "unsupported query"));
+    }
+    let Some(capability) = request
+        .headers()
+        .get("X-Tiv-Webhook-Ingress-Capability")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| {
+            value.len() == 64
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+        .map(str::to_owned)
+    else {
+        return Ok(response(
+            StatusCode::FORBIDDEN,
+            "invalid ingress capability",
+        ));
+    };
+    let body = match Limited::new(request.into_body(), MAX_REQUEST_BODY_BYTES)
+        .collect()
+        .await
+    {
+        Ok(body) => body.to_bytes(),
+        Err(_) => return Ok(response(StatusCode::PAYLOAD_TOO_LARGE, "body too large")),
+    };
+    if !body.is_empty() {
+        return Ok(response(
+            StatusCode::BAD_REQUEST,
+            "unsupported callback body",
+        ));
+    }
+    let held = match backend.hold_webhook_request_forwarded(&capability).await {
+        Ok(held) => held,
+        Err(DataPlaneExecutionError::Service(FixtureServiceError::InvalidWebhookRequestGate)) => {
+            return Ok(response(
+                StatusCode::FORBIDDEN,
+                "invalid ingress capability",
+            ));
+        }
+        Err(error) => return Ok(provider_error_response(error)),
+    };
+    held.wait()
+        .await
+        .map_err(|_| FixtureHttpError::HeldResponseCancelled)?;
+    Ok(response(StatusCode::NO_CONTENT, Bytes::new()))
+}
+
+async fn handle_confirm(
+    request: Request<Incoming>,
+    backend: &DataPlaneBackend,
+    payment_intent_id: &str,
+    close_connection: &Notify,
+) -> Result<Response<ResponseBody>, FixtureHttpError> {
+    if request
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        != Some("application/x-www-form-urlencoded")
+    {
+        return Ok(response(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "unsupported content type",
+        ));
+    }
+    let collected = match Limited::new(request.into_body(), MAX_REQUEST_BODY_BYTES)
+        .collect()
+        .await
+    {
+        Ok(collected) => collected.to_bytes(),
+        Err(_) => return Ok(response(StatusCode::PAYLOAD_TOO_LARGE, "body too large")),
+    };
+    if !collected.is_empty() {
+        return Ok(response(
+            StatusCode::BAD_REQUEST,
+            "unsupported confirm parameters",
+        ));
+    }
+    data_plane_result(backend.confirm(payment_intent_id).await, close_connection).await
+}
+
+async fn handle_create(
+    request: Request<Incoming>,
+    backend: &DataPlaneBackend,
+    close_connection: &Notify,
+) -> Result<Response<ResponseBody>, FixtureHttpError> {
     let Some(key) = request
         .headers()
         .get("Idempotency-Key")
@@ -149,39 +271,47 @@ async fn handle_request(
         create = create.with_operation_id(operation_id);
     }
 
-    let result = backend.create_data_plane(key, create).await;
+    data_plane_result(
+        backend.create_data_plane(key, create).await,
+        close_connection,
+    )
+    .await
+}
+
+async fn data_plane_result(
+    result: Result<HttpDataPlaneDisposition, DataPlaneExecutionError>,
+    close_connection: &Notify,
+) -> Result<Response<ResponseBody>, FixtureHttpError> {
     match result {
-        Ok(DataPlaneDisposition::Response(provider_response)) => {
+        Ok(HttpDataPlaneDisposition::Response(provider_response)) => {
             data_plane_response(&provider_response)
         }
-        Ok(DataPlaneDisposition::CloseConnection) => {
+        Ok(HttpDataPlaneDisposition::CloseConnection) => {
             close_connection.notify_one();
             std::future::pending().await
         }
-        Err(DataPlaneExecutionError::Fixture(FixtureError::IdempotencyConflict)) => Ok(response(
-            StatusCode::CONFLICT,
-            "idempotency key conflicts with prior parameters",
-        )),
-        Err(DataPlaneExecutionError::Fixture(FixtureError::ConnectionClosed)) => {
-            unreachable!("the data plane uses a disposition")
+        Ok(HttpDataPlaneDisposition::Held(held)) => {
+            let provider_response = held
+                .wait()
+                .await
+                .map_err(|_| FixtureHttpError::HeldResponseCancelled)?;
+            data_plane_response(&provider_response)
         }
-        Err(DataPlaneExecutionError::Fixture(FixtureError::RateLimited)) => {
-            Ok(response(StatusCode::TOO_MANY_REQUESTS, "rate limited"))
-        }
-        Err(DataPlaneExecutionError::Fixture(FixtureError::NotFound)) => {
-            Ok(response(StatusCode::NOT_FOUND, "not found"))
-        }
-        Err(DataPlaneExecutionError::Fixture(
-            FixtureError::Serialization | FixtureError::ServerError,
-        )) => Ok(response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "provider error",
-        )),
-        Err(DataPlaneExecutionError::Service(_)) => Ok(response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "fixture fault plan unavailable",
-        )),
+        Ok(HttpDataPlaneDisposition::UnmanagedDelay) => std::future::pending().await,
+        Err(error) => Ok(provider_error_response(error)),
     }
+}
+
+fn retrieve_payment_intent_id(path: &str) -> Option<&str> {
+    let id = path.strip_prefix("/v1/payment_intents/")?;
+    (!id.is_empty() && !id.contains('/')).then_some(id)
+}
+
+fn confirm_payment_intent_id(path: &str) -> Option<&str> {
+    let id = path
+        .strip_prefix("/v1/payment_intents/")?
+        .strip_suffix("/confirm")?;
+    (!id.is_empty() && !id.contains('/')).then_some(id)
 }
 
 #[derive(Clone)]
@@ -194,33 +324,181 @@ enum DataPlaneBackend {
 }
 
 impl DataPlaneBackend {
+    async fn hold_webhook_request_forwarded(
+        &self,
+        capability: &str,
+    ) -> Result<crate::HeldWebhookRequest, DataPlaneExecutionError> {
+        match self {
+            Self::Managed(fixture) => fixture
+                .lock()
+                .await
+                .hold_webhook_request_forwarded(capability)
+                .map_err(DataPlaneExecutionError::Service),
+            Self::Fixed { .. } => Err(DataPlaneExecutionError::Service(
+                FixtureServiceError::InvalidWebhookRequestGate,
+            )),
+        }
+    }
+
     async fn create_data_plane(
         &self,
         key: IdempotencyKey,
         request: CreatePaymentIntent,
-    ) -> Result<DataPlaneDisposition, DataPlaneExecutionError> {
+    ) -> Result<HttpDataPlaneDisposition, DataPlaneExecutionError> {
         match self {
             Self::Fixed { fixture, outcome } => fixture
                 .lock()
                 .await
                 .create_data_plane(key, request, *outcome)
+                .map(fixed_disposition)
                 .map_err(DataPlaneExecutionError::Fixture),
             Self::Managed(fixture) => fixture
                 .lock()
                 .await
                 .create_data_plane(key, request)
+                .map(managed_disposition)
                 .map_err(|error| match error {
                     FixtureServiceError::Fixture(error) => DataPlaneExecutionError::Fixture(error),
                     error => DataPlaneExecutionError::Service(error),
                 }),
         }
     }
+
+    async fn confirm(
+        &self,
+        payment_intent_id: &str,
+    ) -> Result<HttpDataPlaneDisposition, DataPlaneExecutionError> {
+        match self {
+            Self::Fixed { fixture, outcome } => fixture
+                .lock()
+                .await
+                .confirm_data_plane(payment_intent_id, *outcome)
+                .map(fixed_disposition)
+                .map_err(DataPlaneExecutionError::Fixture),
+            Self::Managed(fixture) => fixture
+                .lock()
+                .await
+                .confirm_data_plane(payment_intent_id)
+                .map(managed_disposition)
+                .map_err(|error| match error {
+                    FixtureServiceError::Fixture(error) => DataPlaneExecutionError::Fixture(error),
+                    error => DataPlaneExecutionError::Service(error),
+                }),
+        }
+    }
+
+    async fn retrieve(
+        &self,
+        payment_intent_id: &str,
+    ) -> Result<DataPlaneResponse, DataPlaneExecutionError> {
+        match self {
+            Self::Fixed { fixture, .. } => fixture
+                .lock()
+                .await
+                .retrieve_data_plane(payment_intent_id)
+                .map_err(DataPlaneExecutionError::Fixture),
+            Self::Managed(fixture) => fixture
+                .lock()
+                .await
+                .retrieve_data_plane(payment_intent_id)
+                .map_err(DataPlaneExecutionError::Fixture),
+        }
+    }
+
+    async fn search(
+        &self,
+        operation_id: &str,
+    ) -> Result<DataPlaneResponse, DataPlaneExecutionError> {
+        match self {
+            Self::Fixed { fixture, .. } => fixture
+                .lock()
+                .await
+                .search_data_plane(operation_id)
+                .map_err(DataPlaneExecutionError::Fixture),
+            Self::Managed(fixture) => fixture
+                .lock()
+                .await
+                .search_data_plane(operation_id)
+                .map_err(DataPlaneExecutionError::Fixture),
+        }
+    }
+}
+
+fn search_operation_id(query: Option<&str>) -> Option<String> {
+    let mut pairs = form_urlencoded::parse(query?.as_bytes());
+    let (name, value) = pairs.next()?;
+    if name != "operation_id" || pairs.next().is_some() {
+        return None;
+    }
+    OperationId::new(value.into_owned())
+        .ok()
+        .map(|operation_id| operation_id.as_str().to_owned())
+}
+
+fn fixed_disposition(disposition: DataPlaneDisposition) -> HttpDataPlaneDisposition {
+    match disposition {
+        DataPlaneDisposition::Response(response) => HttpDataPlaneDisposition::Response(response),
+        DataPlaneDisposition::CloseConnection => HttpDataPlaneDisposition::CloseConnection,
+        DataPlaneDisposition::DelayResponse(_) => HttpDataPlaneDisposition::UnmanagedDelay,
+    }
+}
+
+fn managed_disposition(disposition: ManagedDataPlaneDisposition) -> HttpDataPlaneDisposition {
+    match disposition {
+        ManagedDataPlaneDisposition::Response(response) => {
+            HttpDataPlaneDisposition::Response(response)
+        }
+        ManagedDataPlaneDisposition::CloseConnection => HttpDataPlaneDisposition::CloseConnection,
+        ManagedDataPlaneDisposition::Held(held) => HttpDataPlaneDisposition::Held(held),
+    }
+}
+
+#[derive(Debug)]
+enum HttpDataPlaneDisposition {
+    Response(DataPlaneResponse),
+    CloseConnection,
+    Held(HeldDataPlaneResponse),
+    UnmanagedDelay,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DataPlaneExecutionError {
     Fixture(FixtureError),
     Service(FixtureServiceError),
+}
+
+fn immediate_provider_result(
+    result: Result<DataPlaneResponse, DataPlaneExecutionError>,
+) -> Result<Response<ResponseBody>, FixtureHttpError> {
+    match result {
+        Ok(provider_response) => data_plane_response(&provider_response),
+        Err(error) => Ok(provider_error_response(error)),
+    }
+}
+
+fn provider_error_response(error: DataPlaneExecutionError) -> Response<ResponseBody> {
+    match error {
+        DataPlaneExecutionError::Fixture(FixtureError::IdempotencyConflict) => response(
+            StatusCode::CONFLICT,
+            "idempotency key conflicts with prior parameters",
+        ),
+        DataPlaneExecutionError::Fixture(FixtureError::ConnectionClosed) => {
+            response(StatusCode::INTERNAL_SERVER_ERROR, "provider error")
+        }
+        DataPlaneExecutionError::Fixture(FixtureError::RateLimited) => {
+            response(StatusCode::TOO_MANY_REQUESTS, "rate limited")
+        }
+        DataPlaneExecutionError::Fixture(FixtureError::NotFound) => {
+            response(StatusCode::NOT_FOUND, "not found")
+        }
+        DataPlaneExecutionError::Fixture(
+            FixtureError::Serialization | FixtureError::ServerError,
+        ) => response(StatusCode::INTERNAL_SERVER_ERROR, "provider error"),
+        DataPlaneExecutionError::Service(_) => response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "fixture fault plan unavailable",
+        ),
+    }
 }
 
 fn data_plane_response(
@@ -244,12 +522,16 @@ fn response(status: StatusCode, body: impl Into<Bytes>) -> Response<ResponseBody
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FixtureHttpError {
+    HeldResponseCancelled,
     InvalidStatusCode,
 }
 
 impl fmt::Display for FixtureHttpError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::HeldResponseCancelled => {
+                formatter.write_str("held fixture response was cancelled")
+            }
             Self::InvalidStatusCode => {
                 formatter.write_str("fixture produced an invalid HTTP status")
             }

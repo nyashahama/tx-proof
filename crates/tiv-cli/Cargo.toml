@@ -11,6 +11,15 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tiv-core = { path = "../tiv-core" }
+tiv-runtime = { path = "../tiv-runtime" }
+tokio.workspace = true
+
+[dev-dependencies]
+blake3.workspace = true
+reqwest.workspace = true
+tiv-stripe-pi = { path = "../tiv-stripe-pi" }
+tokio-postgres.workspace = true
+uuid.workspace = true
 
 [[bin]]
 name = "tiv"

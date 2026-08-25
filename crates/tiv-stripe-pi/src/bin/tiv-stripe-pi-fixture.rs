@@ -1,9 +1,11 @@
-use std::{env, error::Error, sync::Arc};
+use std::{env, error::Error, sync::Arc, time::Duration};
 
 use tiv_core::decision::Seed;
 use tiv_stripe_pi::{
     ManagedFixture,
-    control::{ControlToken, WebhookSigningSecret, serve_http1_connection as serve_control},
+    control::{
+        ControlToken, WebhookSigningSecret, WebhookTarget, serve_http1_connection as serve_control,
+    },
     http::serve_managed_http1_connection,
 };
 use tokio::{net::TcpListener, sync::Mutex};
@@ -24,6 +26,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .map_err(|_| "invalid fixture control token")?;
     let webhook_secret = WebhookSigningSecret::new(required_env("TIV_WEBHOOK_SECRET")?)
         .map_err(|_| "invalid webhook signing secret")?;
+    let webhook_target =
+        WebhookTarget::new(required_env("TIV_WEBHOOK_URL")?, Duration::from_secs(10))
+            .map_err(|_| "invalid webhook target")?;
     let data_listener = TcpListener::bind(&data_bind).await?;
     let control_listener = TcpListener::bind(&control_bind).await?;
     let fixture = Arc::new(Mutex::new(ManagedFixture::new(Seed::new(0))));
@@ -42,12 +47,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 let fixture = Arc::clone(&fixture);
                 let control_token = control_token.clone();
                 let webhook_secret = webhook_secret.clone();
+                let webhook_target = webhook_target.clone();
                 tokio::spawn(async move {
                     let _result = serve_control(
                         stream,
                         fixture,
                         control_token,
                         webhook_secret,
+                        webhook_target,
                     ).await;
                 });
             }

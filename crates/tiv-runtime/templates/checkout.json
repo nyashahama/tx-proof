@@ -1,0 +1,5 @@
+{
+  "operation_id": "op_checkout",
+  "amount_minor": 2500,
+  "currency": "usd"
+}

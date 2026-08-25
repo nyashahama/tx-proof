@@ -4,12 +4,294 @@ use reqwest::StatusCode;
 use serde_json::json;
 use tiv_core::decision::Seed;
 use tiv_stripe_pi::{
-    CreatePaymentIntent, DataPlaneDisposition, FaultOutcome, FixtureServiceError, IdempotencyKey,
-    ManagedFixture, OperationId,
-    control::{ControlToken, WebhookSigningSecret, serve_http1_connection},
+    CreatePaymentIntent, FaultOutcome, FixtureServiceError, IdempotencyKey,
+    ManagedDataPlaneDisposition, ManagedFixture, OperationId, PaymentIntentStatus,
+    control::{ControlToken, WebhookSigningSecret, WebhookTarget, serve_http1_connection},
     http::serve_managed_http1_connection,
 };
 use tokio::{net::TcpListener, sync::Mutex, time::timeout};
+
+#[test]
+fn fault_outcome_wire_names_match_the_campaign_plan_contract() {
+    let outcomes: Vec<FaultOutcome> = serde_json::from_value(json!([
+        "normal",
+        "pre_execute_429",
+        "pre_execute_500",
+        "post_execute_500",
+        "commit_then_close",
+        "commit_then_delay"
+    ]))
+    .expect("every campaign provider outcome is accepted by the fixture");
+
+    assert_eq!(
+        outcomes,
+        vec![
+            FaultOutcome::Normal,
+            FaultOutcome::PreExecute429,
+            FaultOutcome::PreExecute500,
+            FaultOutcome::PostExecute500,
+            FaultOutcome::CommitThenClose,
+            FaultOutcome::CommitThenDelay,
+        ]
+    );
+}
+
+#[test]
+fn managed_generation_exposes_older_then_succeeded_snapshots_for_one_object() {
+    let mut fixture = ManagedFixture::new(Seed::new(42));
+    fixture
+        .reset(1, Seed::new(42), vec![FaultOutcome::Normal])
+        .unwrap();
+    fixture
+        .create_data_plane(
+            IdempotencyKey::new("op-42-attempt-1").unwrap(),
+            valid_create(),
+        )
+        .unwrap();
+    let payment_intent_id = fixture.snapshot().payment_intents()[0].id().to_owned();
+
+    let older = fixture
+        .generate_event_snapshot(
+            2,
+            &payment_intent_id,
+            PaymentIntentStatus::RequiresConfirmation,
+        )
+        .unwrap();
+    let succeeded = fixture
+        .generate_event_snapshot(3, &payment_intent_id, PaymentIntentStatus::Succeeded)
+        .unwrap();
+
+    assert_ne!(older.event_id(), succeeded.event_id());
+    assert_eq!(
+        fixture.snapshot().payment_intents()[0].status(),
+        "succeeded"
+    );
+}
+
+#[tokio::test]
+async fn commit_then_delay_is_observable_until_the_exact_gate_is_released() {
+    let mut fixture = ManagedFixture::new(Seed::new(42));
+    fixture
+        .reset(1, Seed::new(42), vec![FaultOutcome::CommitThenDelay])
+        .expect("the delay plan is installed");
+
+    let held = fixture
+        .create_data_plane(
+            IdempotencyKey::new("op-1-attempt-1").expect("the key is valid"),
+            valid_create(),
+        )
+        .expect("the create commits before it is held");
+    let ManagedDataPlaneDisposition::Held(held) = held else {
+        panic!("commit-then-delay must return an observable held response");
+    };
+    let gate_id = held.gate_id();
+
+    assert_eq!(fixture.snapshot().payment_intents().len(), 1);
+    assert_eq!(fixture.snapshot().held_gates()[0].gate_id(), gate_id);
+    assert_eq!(
+        fixture.release_gate(1, gate_id),
+        Err(FixtureServiceError::UnexpectedCommandSequence {
+            expected: 2,
+            received: 1,
+        })
+    );
+
+    let released = fixture
+        .release_gate(2, gate_id)
+        .expect("the exact next command releases the gate");
+    let response = held
+        .wait()
+        .await
+        .expect("the exact release wakes the held response");
+
+    assert_eq!(released.command_sequence(), 2);
+    assert!(released.held_gates().is_empty());
+    assert_eq!(response.status_code(), 200);
+    assert!(fixture.snapshot().held_gates().is_empty());
+}
+
+#[tokio::test]
+async fn reset_cancels_every_response_held_by_the_previous_fixture_state() {
+    let mut fixture = ManagedFixture::new(Seed::new(42));
+    fixture
+        .reset(1, Seed::new(42), vec![FaultOutcome::CommitThenDelay])
+        .expect("the delay plan is installed");
+    let held = fixture
+        .create_data_plane(
+            IdempotencyKey::new("op-1-attempt-1").expect("the key is valid"),
+            valid_create(),
+        )
+        .expect("the create commits before it is held");
+    let ManagedDataPlaneDisposition::Held(held) = held else {
+        panic!("commit-then-delay must return an observable held response");
+    };
+
+    fixture
+        .reset(2, Seed::new(43), vec![FaultOutcome::Normal])
+        .expect("the next reset replaces fixture state");
+    let cancellation = timeout(Duration::from_millis(100), held.wait())
+        .await
+        .expect("reset must wake the held data task")
+        .expect_err("reset must not release an obsolete response");
+
+    assert_eq!(cancellation.to_string(), "held response was cancelled");
+    assert!(fixture.snapshot().held_gates().is_empty());
+}
+
+#[tokio::test]
+async fn webhook_ingress_capability_is_event_bound_single_use_and_cancelled_by_control() {
+    let mut fixture = ManagedFixture::new(Seed::new(57));
+    fixture
+        .reset(1, Seed::new(57), vec![FaultOutcome::Normal])
+        .expect("the provider plan is installed");
+    let created = fixture
+        .create_data_plane(
+            IdempotencyKey::new("op-57-attempt-1").unwrap(),
+            valid_create(),
+        )
+        .expect("the provider object is created");
+    assert!(matches!(created, ManagedDataPlaneDisposition::Response(_)));
+    let payment_intent_id = fixture.snapshot().payment_intents()[0].id().to_owned();
+    let event = fixture
+        .generate_event(2, &payment_intent_id)
+        .expect("the immutable event is generated");
+    let prepared = fixture
+        .prepare_webhook_request_gate(event.event_id())
+        .expect("one event-bound ingress gate is prepared");
+
+    assert!(matches!(
+        fixture.hold_webhook_request_forwarded("not-the-capability"),
+        Err(FixtureServiceError::InvalidWebhookRequestGate)
+    ));
+    let held = fixture
+        .hold_webhook_request_forwarded(prepared.capability())
+        .expect("the exact single-use capability marks ingress forwarded");
+    assert_eq!(held.gate_id(), prepared.gate_id());
+    let state = serde_json::to_value(fixture.webhook_request_state()).unwrap();
+    assert_eq!(state["command_sequence"], 2);
+    assert_eq!(
+        state["held_webhook_requests"][0]["event_id"],
+        event.event_id()
+    );
+    assert_eq!(state["held_webhook_requests"][0]["forwarded"], true);
+    assert!(
+        matches!(
+            fixture.hold_webhook_request_forwarded(prepared.capability()),
+            Err(FixtureServiceError::InvalidWebhookRequestGate)
+        ),
+        "the capability cannot be replayed"
+    );
+
+    let discarded = fixture
+        .discard_webhook_request(3, prepared.gate_id())
+        .expect("control discards the exact forwarded request");
+    let discarded = serde_json::to_value(discarded).unwrap();
+    assert!(
+        discarded["held_webhook_requests"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(held.wait().await, Err(tiv_stripe_pi::HeldResponseCancelled));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn managed_data_plane_blocks_the_exact_webhook_ingress_callback_until_discard() {
+    let fixture = Arc::new(Mutex::new(ManagedFixture::new(Seed::new(59))));
+    let prepared = {
+        let mut fixture = fixture.lock().await;
+        fixture
+            .reset(1, Seed::new(59), vec![FaultOutcome::Normal])
+            .unwrap();
+        fixture
+            .create_data_plane(
+                IdempotencyKey::new("op-59-attempt-1").unwrap(),
+                valid_create(),
+            )
+            .unwrap();
+        let payment_intent_id = fixture.snapshot().payment_intents()[0].id().to_owned();
+        let event = fixture.generate_event(2, &payment_intent_id).unwrap();
+        fixture
+            .prepare_webhook_request_gate(event.event_id())
+            .unwrap()
+    };
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server_fixture = Arc::clone(&fixture);
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let result = serve_managed_http1_connection(stream, server_fixture).await;
+        assert!(
+            result.is_err(),
+            "discard closes the held callback without an acknowledgment"
+        );
+    });
+    let capability = prepared.capability().to_owned();
+    let callback = tokio::spawn(async move {
+        reqwest::Client::new()
+            .post(format!("http://{address}/v1/tiv/webhook-request-forwarded"))
+            .header("X-Tiv-Webhook-Ingress-Capability", capability)
+            .body("")
+            .send()
+            .await
+    });
+
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let state = serde_json::to_value(fixture.lock().await.webhook_request_state()).unwrap();
+            if state["held_webhook_requests"][0]["forwarded"] == true {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the exact callback reaches the forwarded boundary");
+    assert!(
+        !callback.is_finished(),
+        "the application is held before persistence"
+    );
+    fixture
+        .lock()
+        .await
+        .discard_webhook_request(3, prepared.gate_id())
+        .unwrap();
+
+    assert!(
+        timeout(Duration::from_secs(2), callback)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_err(),
+        "discard cannot become an application acknowledgment"
+    );
+    timeout(Duration::from_secs(2), server)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[test]
+fn held_control_state_matches_the_v1_golden_protocol() {
+    let mut fixture = ManagedFixture::new(Seed::new(42));
+    fixture
+        .reset(1, Seed::new(42), vec![FaultOutcome::CommitThenDelay])
+        .expect("the delay plan is installed");
+    let disposition = fixture
+        .create_data_plane(
+            IdempotencyKey::new("op-1-attempt-1").expect("the key is valid"),
+            valid_create(),
+        )
+        .expect("the create commits before it is held");
+    assert!(matches!(disposition, ManagedDataPlaneDisposition::Held(_)));
+
+    let encoded =
+        serde_json::to_string(&fixture.snapshot()).expect("the closed control DTO is serializable");
+    assert_eq!(
+        encoded,
+        include_str!("../../../tests/golden/stripe-fixture-state-v1.json").trim_end()
+    );
+}
 
 #[test]
 fn mutating_control_commands_are_strictly_sequenced() {
@@ -63,10 +345,68 @@ fn the_fault_plan_is_consumed_only_by_valid_provider_creates() {
         )
         .expect("the second planned action executes");
 
-    assert_eq!(first, DataPlaneDisposition::CloseConnection);
-    assert!(matches!(second, DataPlaneDisposition::Response(_)));
+    assert!(matches!(
+        first,
+        ManagedDataPlaneDisposition::CloseConnection
+    ));
+    assert!(matches!(second, ManagedDataPlaneDisposition::Response(_)));
     assert_eq!(fixture.snapshot().payment_intents().len(), 2);
     assert_eq!(fixture.snapshot().remaining_outcomes(), 0);
+}
+
+#[test]
+fn planned_confirm_outcomes_reach_the_same_observable_boundaries_as_create() {
+    for (outcome, expected_status, expected_disposition) in [
+        (FaultOutcome::Normal, "succeeded", "response_200"),
+        (
+            FaultOutcome::PreExecute429,
+            "requires_confirmation",
+            "response_429",
+        ),
+        (
+            FaultOutcome::PreExecute500,
+            "requires_confirmation",
+            "response_500",
+        ),
+        (FaultOutcome::PostExecute500, "succeeded", "response_500"),
+        (
+            FaultOutcome::CommitThenClose,
+            "succeeded",
+            "close_connection",
+        ),
+        (FaultOutcome::CommitThenDelay, "succeeded", "held_response"),
+    ] {
+        let mut fixture = ManagedFixture::new(Seed::new(42));
+        fixture
+            .reset(1, Seed::new(42), vec![FaultOutcome::Normal, outcome])
+            .expect("the create and confirm outcomes are installed");
+        fixture
+            .create_data_plane(
+                IdempotencyKey::new("op-1-attempt-1").expect("the key is valid"),
+                valid_create(),
+            )
+            .expect("the normal create returns a provider object");
+        let payment_intent_id = fixture.snapshot().payment_intents()[0].id().to_owned();
+
+        let disposition = fixture
+            .confirm_data_plane(&payment_intent_id)
+            .expect("the planned confirm outcome executes");
+        let actual_disposition = match disposition {
+            ManagedDataPlaneDisposition::Response(response) => {
+                format!("response_{}", response.status_code())
+            }
+            ManagedDataPlaneDisposition::CloseConnection => "close_connection".to_owned(),
+            ManagedDataPlaneDisposition::Held(_) => "held_response".to_owned(),
+        };
+
+        assert_eq!(actual_disposition, expected_disposition, "{outcome:?}");
+        assert_eq!(
+            fixture.snapshot().payment_intents()[0].status(),
+            expected_status,
+            "{outcome:?}"
+        );
+        assert_eq!(fixture.snapshot().remaining_outcomes(), 0, "{outcome:?}");
+    }
 }
 
 #[test]
@@ -118,7 +458,7 @@ async fn the_control_listener_requires_its_run_scoped_token() {
     let server_fixture = Arc::clone(&fixture);
     let server = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.expect("a client connects");
-        serve_http1_connection(stream, server_fixture, token, secret)
+        serve_test_control(stream, server_fixture, token, secret)
             .await
             .expect("the control connection is served");
     });
@@ -162,6 +502,127 @@ async fn the_control_listener_requires_its_run_scoped_token() {
         .await
         .expect("the control connection stops")
         .expect("the server task does not panic");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_real_data_response_waits_for_its_observed_control_gate() {
+    let fixture = Arc::new(Mutex::new(ManagedFixture::new(Seed::new(42))));
+    fixture
+        .lock()
+        .await
+        .reset(1, Seed::new(42), vec![FaultOutcome::CommitThenDelay])
+        .expect("the delay plan is installed");
+    let token = ControlToken::new("run-scoped-control-token")
+        .expect("the synthetic control token is valid");
+    let secret = WebhookSigningSecret::new("whsec_test_secret")
+        .expect("the synthetic webhook secret is valid");
+    let data_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("a data port is available");
+    let data_address = data_listener
+        .local_addr()
+        .expect("the data listener has an address");
+    let control_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("a control port is available");
+    let control_address = control_listener
+        .local_addr()
+        .expect("the control listener has an address");
+
+    let data_fixture = Arc::clone(&fixture);
+    let data_server = tokio::spawn(async move {
+        let (stream, _) = data_listener.accept().await.expect("a client connects");
+        serve_managed_http1_connection(stream, data_fixture)
+            .await
+            .expect("the held data connection is served");
+    });
+    let control_fixture = Arc::clone(&fixture);
+    let control_server = tokio::spawn(async move {
+        let (stream, _) = control_listener
+            .accept()
+            .await
+            .expect("a control client connects");
+        serve_test_control(stream, control_fixture, token, secret)
+            .await
+            .expect("the control connection is served");
+    });
+
+    let data_request = tokio::spawn(async move {
+        reqwest::Client::new()
+            .post(format!("http://{data_address}/v1/payment_intents"))
+            .header("Idempotency-Key", "op-1-attempt-1")
+            .form(&[
+                ("amount", "2500"),
+                ("currency", "usd"),
+                ("metadata[operation_id]", "op_1"),
+            ])
+            .send()
+            .await
+    });
+    let control_client = reqwest::Client::new();
+    let control_base = format!("http://{control_address}/v1/control");
+    let gate_id = timeout(Duration::from_secs(2), async {
+        loop {
+            let state: serde_json::Value = control_client
+                .get(format!("{control_base}/state"))
+                .header("X-Tiv-Control-Token", "run-scoped-control-token")
+                .send()
+                .await
+                .expect("control state is available")
+                .json()
+                .await
+                .expect("control state is JSON");
+            if let Some(gate_id) = state["held_gates"][0]["gate_id"].as_u64() {
+                break gate_id;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the committed response reaches an observable gate");
+    assert!(
+        !data_request.is_finished(),
+        "the response cannot escape before the gate is released"
+    );
+
+    let released: serde_json::Value = control_client
+        .post(format!("{control_base}/release-gate"))
+        .header("X-Tiv-Control-Token", "run-scoped-control-token")
+        .json(&json!({"command_sequence": 2, "gate_id": gate_id}))
+        .send()
+        .await
+        .expect("the release command returns an HTTP response")
+        .error_for_status()
+        .expect("the release command succeeds")
+        .json()
+        .await
+        .expect("the released state is JSON");
+    let response = timeout(Duration::from_secs(2), data_request)
+        .await
+        .expect("the released response arrives")
+        .expect("the data task does not panic")
+        .expect("the response has valid HTTP framing");
+
+    assert_eq!(released["command_sequence"], 2);
+    assert_eq!(released["held_gates"], json!([]));
+    assert_eq!(response.status(), StatusCode::OK);
+    drop(response);
+    drop(control_client);
+    join_server(data_server).await;
+    join_server(control_server).await;
+}
+
+fn test_webhook_target() -> WebhookTarget {
+    WebhookTarget::new("http://127.0.0.1:9/webhooks/stripe", Duration::from_secs(1)).unwrap()
+}
+
+async fn serve_test_control(
+    stream: tokio::net::TcpStream,
+    fixture: Arc<Mutex<ManagedFixture>>,
+    token: ControlToken,
+    secret: WebhookSigningSecret,
+) -> Result<(), hyper::Error> {
+    serve_http1_connection(stream, fixture, token, secret, test_webhook_target()).await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -235,4 +696,11 @@ fn valid_create() -> CreatePaymentIntent {
     CreatePaymentIntent::new(2_500, "usd")
         .expect("the create is valid")
         .with_operation_id(OperationId::new("op_1").expect("the operation ID is valid"))
+}
+
+async fn join_server(server: tokio::task::JoinHandle<()>) {
+    timeout(Duration::from_secs(2), server)
+        .await
+        .expect("the fixture connection stops")
+        .expect("the fixture server does not panic");
 }

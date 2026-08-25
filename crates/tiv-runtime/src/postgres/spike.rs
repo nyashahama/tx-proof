@@ -1,12 +1,16 @@
+use std::time::Duration;
+
 use thiserror::Error;
 use tokio::task::{JoinError, JoinHandle};
 use tokio_postgres::{Client, NoTls};
 use uuid::Uuid;
 
 use super::{
+    archive::{ArchiveError, BaselineArchive, PostgresArchiveToolchain},
     oracle::{
         OracleError, ProviderPaymentIntent, QuiescencePermit, SnapshotReport, run_reference_oracle,
     },
+    probe::{ConfiguredSqlProbe, SqlProbe, SqlProbeError},
     safety::{
         ComposeProjectId, DatabaseEndpoint, DatabaseIdentity, DatabaseKind, DatabaseMarker,
         DatabaseName, DatabaseTarget, InvalidDatabaseIdentity, InvalidDatabaseName, MarkerKind,
@@ -15,7 +19,10 @@ use super::{
 };
 
 const APPLICATION_ROLE: &str = "tiv_app";
-const EXPECTED_CLUSTER_NAME: &str = "tiv-truth-spike-postgres";
+const INVARIANT_ROLE: &str = "tiv_invariant";
+#[cfg(test)]
+const TRUTH_SPIKE_CLUSTER_NAME: &str = "tiv-truth-spike-postgres";
+const REFERENCE_APP_CLUSTER_NAME: &str = "tiv-reference-app-postgres";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BaselineTarget {
@@ -35,10 +42,13 @@ pub struct SpikePostgresConfig {
     admin_role: String,
     admin_password: String,
     application_password: String,
+    expected_cluster_name: &'static str,
+    archive_container_id: Option<String>,
 }
 
 impl SpikePostgresConfig {
     #[must_use]
+    #[cfg(test)]
     pub fn loopback(
         port: u16,
         admin_role: impl Into<String>,
@@ -50,12 +60,70 @@ impl SpikePostgresConfig {
             admin_role: admin_role.into(),
             admin_password: admin_password.into(),
             application_password: application_password.into(),
+            expected_cluster_name: TRUTH_SPIKE_CLUSTER_NAME,
+            archive_container_id: None,
+        }
+    }
+
+    #[must_use]
+    #[cfg(test)]
+    pub fn loopback_with_archive_container(
+        port: u16,
+        admin_role: impl Into<String>,
+        admin_password: impl Into<String>,
+        application_password: impl Into<String>,
+        archive_container_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            endpoint: DatabaseEndpoint::loopback(port),
+            admin_role: admin_role.into(),
+            admin_password: admin_password.into(),
+            application_password: application_password.into(),
+            expected_cluster_name: TRUTH_SPIKE_CLUSTER_NAME,
+            archive_container_id: Some(archive_container_id.into()),
+        }
+    }
+
+    #[must_use]
+    #[cfg(test)]
+    pub(crate) fn loopback_reference_app(
+        port: u16,
+        admin_role: impl Into<String>,
+        admin_password: impl Into<String>,
+        application_password: impl Into<String>,
+    ) -> Self {
+        Self {
+            endpoint: DatabaseEndpoint::loopback(port),
+            admin_role: admin_role.into(),
+            admin_password: admin_password.into(),
+            application_password: application_password.into(),
+            expected_cluster_name: REFERENCE_APP_CLUSTER_NAME,
+            archive_container_id: None,
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn loopback_reference_app_with_archive(
+        port: u16,
+        admin_role: impl Into<String>,
+        admin_password: impl Into<String>,
+        application_password: impl Into<String>,
+        archive_container_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            endpoint: DatabaseEndpoint::loopback(port),
+            admin_role: admin_role.into(),
+            admin_password: admin_password.into(),
+            application_password: application_password.into(),
+            expected_cluster_name: REFERENCE_APP_CLUSTER_NAME,
+            archive_container_id: Some(archive_container_id.into()),
         }
     }
 }
 
 pub struct TruthSpikePostgres {
     config: SpikePostgresConfig,
+    archive_toolchain: Option<PostgresArchiveToolchain>,
 }
 
 impl TruthSpikePostgres {
@@ -73,22 +141,39 @@ impl TruthSpikePostgres {
         {
             return Err(SpikePostgresError::InvalidConfiguration);
         }
-        let postgres = Self { config };
+        let mut postgres = Self {
+            config,
+            archive_toolchain: None,
+        };
         let mut session = postgres.connect_database("postgres").await?;
         let probe = session
             .client()
             .query_one(
-                "SELECT 1::integer, current_setting('cluster_name'), current_user",
+                "SELECT 1::integer, current_setting('cluster_name'), current_user, \
+                        current_setting('server_version_num')::integer",
                 &[],
             )
             .await;
         session.close().await?;
         let row = probe?;
         if row.get::<_, i32>(0) != 1
-            || row.get::<_, &str>(1) != EXPECTED_CLUSTER_NAME
+            || row.get::<_, &str>(1) != postgres.config.expected_cluster_name
             || row.get::<_, &str>(2) != postgres.config.admin_role
         {
             return Err(SpikePostgresError::UnexpectedServerIdentity);
+        }
+        let server_version_num = row.get::<_, i32>(3);
+        let server_major = u16::try_from(server_version_num / 10_000)
+            .map_err(|_| SpikePostgresError::UnexpectedServerIdentity)?;
+        if let Some(container_id) = postgres.config.archive_container_id.clone() {
+            postgres.archive_toolchain = Some(
+                PostgresArchiveToolchain::attest(
+                    container_id,
+                    postgres.config.admin_role.clone(),
+                    server_major,
+                )
+                .await?,
+            );
         }
         Ok(postgres)
     }
@@ -110,9 +195,21 @@ impl TruthSpikePostgres {
         let case_marker = Uuid::new_v4();
 
         self.ensure_application_role().await?;
+        self.ensure_invariant_role().await?;
         self.create_empty_database(&baseline_name).await?;
-        self.initialize_reference_baseline(&baseline_name, baseline_marker, &compose_project)
-            .await?;
+        let operation_id = format!("op_{suffix}");
+        self.initialize_reference_baseline(
+            &baseline_name,
+            baseline_marker,
+            &compose_project,
+            &operation_id,
+        )
+        .await?;
+        let baseline_archive = if let Some(toolchain) = &self.archive_toolchain {
+            Some(toolchain.capture(&baseline_name).await?)
+        } else {
+            None
+        };
         self.seal_and_clone_baseline(
             &baseline_name,
             &case_name,
@@ -141,6 +238,7 @@ impl TruthSpikePostgres {
             baseline_target,
             case_name,
             case_target: DatabaseTarget::new(identity),
+            baseline_archive,
         })
     }
 
@@ -153,6 +251,7 @@ impl TruthSpikePostgres {
     /// matches, exactly two distinct provider objects are supplied, and both
     /// local rows commit atomically. The returned target must be freshly
     /// verified again before another persistent mutation.
+    #[cfg(test)]
     pub async fn insert_buggy_payment_pair(
         &self,
         expected: DatabaseTarget<Unverified>,
@@ -175,6 +274,7 @@ impl TruthSpikePostgres {
             .await
     }
 
+    #[cfg(test)]
     async fn insert_verified_buggy_payment_pair(
         &self,
         verified: DatabaseTarget<Verified>,
@@ -231,6 +331,50 @@ impl TruthSpikePostgres {
         result
     }
 
+    /// Opens the configured repository-owned predicate against one freshly
+    /// attested reference case database.
+    pub(crate) async fn configured_sql_probe(
+        &self,
+        expected: &DatabaseTarget<Unverified>,
+        configured: ConfiguredSqlProbe,
+        timeout: Duration,
+        poll_interval: Duration,
+    ) -> Result<ReferenceSqlProbe, SpikePostgresError> {
+        let case_name = expected.identity().database_name();
+        if case_name.kind() != DatabaseKind::Case
+            || configured.role().as_str() != INVARIANT_ROLE
+            || timeout.is_zero()
+            || poll_interval.is_zero()
+            || poll_interval >= timeout
+        {
+            return Err(SpikePostgresError::InvalidSqlProbeConfiguration);
+        }
+        let observed = self.observe_identity(case_name).await?;
+        if &observed != expected.identity() {
+            return Err(SpikePostgresError::PostResetIdentityMismatch);
+        }
+        let mut session = self.connect_database(case_name.as_str()).await?;
+        let identity = session
+            .client()
+            .query_one(
+                "SELECT current_database(), current_setting('cluster_name'), current_user",
+                &[],
+            )
+            .await?;
+        if identity.get::<_, &str>(0) != case_name.as_str()
+            || identity.get::<_, &str>(1) != REFERENCE_APP_CLUSTER_NAME
+            || identity.get::<_, &str>(2) != self.config.admin_role
+        {
+            return Err(SpikePostgresError::UnexpectedServerIdentity);
+        }
+        Ok(ReferenceSqlProbe {
+            session,
+            probe: configured.into_probe(),
+            timeout,
+            poll_interval,
+        })
+    }
+
     /// Rechecks the exact case identity, consumes a mutation permit, drops only
     /// that case database, and clones the sealed baseline.
     ///
@@ -275,6 +419,53 @@ impl TruthSpikePostgres {
         .await
     }
 
+    /// Rechecks the exact case and baseline identities, consumes a mutation
+    /// permit, and restores the trusted custom-format baseline archive into a
+    /// fresh database created from `template0`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpikePostgresError`] before mutation when the archive,
+    /// toolchain, case, or baseline does not match this isolated run, or when a
+    /// bounded drop, restore, privilege, marker, or identity step fails.
+    pub async fn reset_case_from_archive(
+        &self,
+        expected: DatabaseTarget<Unverified>,
+        expected_baseline: &BaselineTarget,
+        archive: &BaselineArchive,
+        new_marker_uuid: Uuid,
+    ) -> Result<DatabaseTarget<Unverified>, SpikePostgresError> {
+        if expected_baseline.identity.database_name().kind() != DatabaseKind::Baseline
+            || !expected_baseline.is_sealed()
+        {
+            return Err(SpikePostgresError::ExpectedBaselineName);
+        }
+        let toolchain = self
+            .archive_toolchain
+            .as_ref()
+            .ok_or(SpikePostgresError::ArchiveUnavailable)?;
+        toolchain.preflight(archive, expected_baseline.identity.database_name())?;
+        let case_name = expected.identity().database_name().clone();
+        let observed = self.observe_identity(&case_name).await?;
+        let (verified, permit) = expected
+            .verify(&observed)
+            .map_err(SpikePostgresError::Safety)?;
+        let observed_baseline = self
+            .observe_baseline_identity(expected_baseline.identity.database_name())
+            .await?;
+        if &observed_baseline != expected_baseline
+            || observed_baseline.identity.server_fingerprint()
+                != verified.identity().server_fingerprint()
+            || observed_baseline.identity.endpoint() != verified.identity().endpoint()
+            || observed_baseline.identity.marker().compose_project()
+                != verified.identity().marker().compose_project()
+        {
+            return Err(SpikePostgresError::BaselineIdentityMismatch);
+        }
+        self.reset_verified_case_from_archive(verified, permit, archive, new_marker_uuid)
+            .await
+    }
+
     async fn create_empty_database(
         &self,
         database_name: &DatabaseName,
@@ -312,6 +503,22 @@ impl TruthSpikePostgres {
                     )
                     .await?;
             }
+            let unsafe_membership = session
+                .client()
+                .query_opt(
+                    "SELECT 1::integer \
+                     FROM pg_auth_members AS membership \
+                     JOIN pg_roles AS granted_role ON granted_role.oid = membership.roleid \
+                     JOIN pg_roles AS member_role ON member_role.oid = membership.member \
+                     WHERE granted_role.rolname = $1 OR member_role.rolname = $1 \
+                     LIMIT 1",
+                    &[&APPLICATION_ROLE],
+                )
+                .await?
+                .is_some();
+            if unsafe_membership {
+                return Err(SpikePostgresError::UnsafeApplicationRole);
+            }
             session
                 .client()
                 .batch_execute(
@@ -333,7 +540,8 @@ impl TruthSpikePostgres {
                 .batch_execute(&format!(
                     "ALTER ROLE {APPLICATION_ROLE} PASSWORD {quoted_password}"
                 ))
-                .await
+                .await?;
+            Ok::<(), SpikePostgresError>(())
         }
         .await;
         session.close().await?;
@@ -341,11 +549,69 @@ impl TruthSpikePostgres {
         Ok(())
     }
 
+    async fn ensure_invariant_role(&self) -> Result<(), SpikePostgresError> {
+        let mut session = self.connect_database("postgres").await?;
+        let result = async {
+            let role = session
+                .client()
+                .query_opt(
+                    "SELECT NOT role.rolsuper \
+                                AND NOT role.rolcreatedb \
+                                AND NOT role.rolcreaterole \
+                                AND NOT role.rolinherit \
+                                AND NOT role.rolcanlogin \
+                                AND NOT role.rolreplication \
+                                AND NOT role.rolbypassrls \
+                                AND role.rolconnlimit = -1 \
+                                AND role.rolvaliduntil IS NULL \
+                                AND role.rolconfig IS NULL, \
+                            NOT EXISTS ( \
+                                SELECT 1 \
+                                FROM pg_auth_members AS membership \
+                                WHERE membership.roleid = role.oid \
+                                   OR membership.member = role.oid \
+                            ), \
+                            NOT EXISTS ( \
+                                SELECT 1 FROM pg_database \
+                                WHERE datdba = role.oid \
+                            ) \
+                     FROM pg_roles AS role \
+                     WHERE role.rolname = $1",
+                    &[&INVARIANT_ROLE],
+                )
+                .await?;
+            match role {
+                Some(row)
+                    if row.get::<_, bool>(0) && row.get::<_, bool>(1) && row.get::<_, bool>(2) =>
+                {
+                    Ok(())
+                }
+                Some(_) => Err(SpikePostgresError::UnsafeInvariantRole),
+                None => {
+                    session
+                        .client()
+                        .batch_execute(
+                            "CREATE ROLE tiv_invariant WITH \
+                                 NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT \
+                                 NOREPLICATION NOBYPASSRLS CONNECTION LIMIT -1 PASSWORD NULL",
+                        )
+                        .await?;
+                    Ok(())
+                }
+            }
+        }
+        .await;
+        session.close().await?;
+        result
+    }
+
+    #[allow(clippy::too_many_lines)]
     async fn initialize_reference_baseline(
         &self,
         baseline_name: &DatabaseName,
         marker_uuid: Uuid,
         compose_project: &ComposeProjectId,
+        operation_id: &str,
     ) -> Result<(), SpikePostgresError> {
         let mut session = self.connect_database(baseline_name.as_str()).await?;
         let result = async {
@@ -364,7 +630,8 @@ impl TruthSpikePostgres {
                          operation_id text NOT NULL UNIQUE, \
                          amount_minor bigint NOT NULL CHECK (amount_minor > 0), \
                          currency text NOT NULL CHECK (currency ~ '^[a-z]{3}$'), \
-                         status text NOT NULL CHECK (status IN ('pending', 'paid')) \
+                         status text NOT NULL CHECK (status IN ('pending', 'paid')), \
+                         UNIQUE (operation_id, amount_minor, currency) \
                      ); \
                      CREATE TABLE payments ( \
                          id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, \
@@ -372,22 +639,129 @@ impl TruthSpikePostgres {
                          stripe_payment_intent_id text NOT NULL, \
                          amount_minor bigint NOT NULL CHECK (amount_minor > 0), \
                          currency text NOT NULL CHECK (currency ~ '^[a-z]{3}$'), \
-                         status text NOT NULL CHECK (status IN ('pending', 'succeeded')) \
+                         status text NOT NULL CHECK (status IN ('pending', 'succeeded')), \
+                         UNIQUE (operation_id, stripe_payment_intent_id) \
+                     ); \
+                     CREATE TABLE processed_webhook_events ( \
+                         provider_event_id text PRIMARY KEY \
+                             CHECK (provider_event_id ~ '^evt_tiv_[A-Za-z0-9_-]+$'), \
+                         operation_id text NOT NULL REFERENCES orders(operation_id), \
+                         UNIQUE (provider_event_id, operation_id) \
+                     ); \
+                     CREATE TABLE payment_status_history ( \
+                         history_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, \
+                         provider_event_id text NOT NULL UNIQUE, \
+                         operation_id text NOT NULL, \
+                         stripe_payment_intent_id text NOT NULL, \
+                         provider_created bigint NOT NULL CHECK (provider_created >= 0), \
+                         observed_status text NOT NULL \
+                             CHECK (observed_status IN ('requires_confirmation', 'succeeded')), \
+                         applied boolean NOT NULL, \
+                         local_status_after text NOT NULL \
+                             CHECK (local_status_after IN ('pending', 'succeeded')), \
+                         FOREIGN KEY (provider_event_id, operation_id) \
+                             REFERENCES processed_webhook_events \
+                                 (provider_event_id, operation_id), \
+                         FOREIGN KEY (operation_id, stripe_payment_intent_id) \
+                             REFERENCES payments \
+                                 (operation_id, stripe_payment_intent_id) \
+                     ); \
+                     CREATE TABLE webhook_deliveries ( \
+                         delivery_id uuid PRIMARY KEY, \
+                         provider_event_id text NOT NULL, \
+                         operation_id text NOT NULL, \
+                         UNIQUE (delivery_id, provider_event_id, operation_id), \
+                         CONSTRAINT webhook_deliveries_event_identity_fkey \
+                             FOREIGN KEY (provider_event_id, operation_id) \
+                             REFERENCES processed_webhook_events \
+                                 (provider_event_id, operation_id) \
+                     ); \
+                     CREATE TABLE ledger_entries ( \
+                         entry_id uuid PRIMARY KEY, \
+                         delivery_id uuid NOT NULL, \
+                         provider_event_id text NOT NULL, \
+                         operation_id text NOT NULL, \
+                         amount_minor bigint NOT NULL CHECK (amount_minor > 0), \
+                         currency text NOT NULL CHECK (currency ~ '^[a-z]{3}$'), \
+                         entry_kind text NOT NULL CHECK (entry_kind = 'payment_succeeded'), \
+                         UNIQUE (delivery_id), \
+                         UNIQUE (entry_id, amount_minor, currency), \
+                         CONSTRAINT ledger_entries_delivery_identity_fkey \
+                             FOREIGN KEY (delivery_id, provider_event_id, operation_id) \
+                             REFERENCES webhook_deliveries \
+                                 (delivery_id, provider_event_id, operation_id), \
+                         CONSTRAINT ledger_entries_order_value_fkey \
+                             FOREIGN KEY (operation_id, amount_minor, currency) \
+                             REFERENCES orders (operation_id, amount_minor, currency) \
+                     ); \
+                     CREATE TABLE ledger_postings ( \
+                         posting_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, \
+                         entry_id uuid NOT NULL, \
+                         account_code text NOT NULL, \
+                         entry_side text NOT NULL CHECK (entry_side IN ('debit', 'credit')), \
+                         amount_minor bigint NOT NULL CHECK (amount_minor > 0), \
+                         currency text NOT NULL CHECK (currency ~ '^[a-z]{3}$'), \
+                         UNIQUE (entry_id, account_code), \
+                         CONSTRAINT ledger_postings_account_side_check CHECK ( \
+                             ( \
+                                 account_code = 'processor_clearing' \
+                                 AND entry_side = 'debit' \
+                             ) OR ( \
+                                 account_code = 'order_payment_liability' \
+                                 AND entry_side = 'credit' \
+                             ) \
+                         ), \
+                         CONSTRAINT ledger_postings_entry_value_fkey \
+                             FOREIGN KEY (entry_id, amount_minor, currency) \
+                             REFERENCES ledger_entries (entry_id, amount_minor, currency) \
+                     ); \
+                     CREATE TABLE webhook_effects ( \
+                         id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, \
+                         provider_event_id text NOT NULL, \
+                         operation_id text NOT NULL, \
+                         FOREIGN KEY (provider_event_id, operation_id) \
+                             REFERENCES processed_webhook_events \
+                                 (provider_event_id, operation_id) \
                      ); \
                      CREATE INDEX payments_operation_id_idx ON payments (operation_id); \
-                    CREATE INDEX payments_provider_id_idx ON payments (stripe_payment_intent_id); \
-                     INSERT INTO orders (operation_id, amount_minor, currency, status) \
-                     VALUES ('op_1', 2500, 'usd', 'pending'); \
+                     CREATE INDEX payments_provider_id_idx ON payments (stripe_payment_intent_id); \
+                     CREATE INDEX webhook_effects_event_idx \
+                         ON webhook_effects (provider_event_id); \
+                     CREATE INDEX ledger_entries_event_idx \
+                         ON ledger_entries (provider_event_id); \
                      REVOKE ALL ON SCHEMA public FROM PUBLIC; \
-                     GRANT USAGE ON SCHEMA public TO tiv_app; \
-                     REVOKE ALL ON TABLE tiv_verifier_marker, orders, payments \
-                         FROM PUBLIC, tiv_app; \
-                     REVOKE ALL ON SEQUENCE orders_id_seq, payments_id_seq \
-                         FROM PUBLIC, tiv_app; \
+                     GRANT USAGE ON SCHEMA public TO tiv_app, tiv_invariant; \
+                     REVOKE ALL ON TABLE tiv_verifier_marker, orders, payments, \
+                         processed_webhook_events, payment_status_history, \
+                         webhook_deliveries, webhook_effects, \
+                         ledger_entries, ledger_postings \
+                         FROM PUBLIC, tiv_app, tiv_invariant; \
+                     REVOKE ALL ON SEQUENCE orders_id_seq, payments_id_seq, \
+                         payment_status_history_history_id_seq, \
+                         webhook_effects_id_seq, ledger_postings_posting_id_seq \
+                         FROM PUBLIC, tiv_app, tiv_invariant; \
+                     GRANT SELECT (operation_id, amount_minor, currency) ON TABLE orders TO tiv_app; \
                      GRANT INSERT ON TABLE payments TO tiv_app; \
-                     GRANT SELECT (operation_id, stripe_payment_intent_id), \
+                     GRANT SELECT (operation_id, stripe_payment_intent_id, status), \
                            UPDATE (status) ON TABLE payments TO tiv_app; \
-                     GRANT USAGE ON SEQUENCE payments_id_seq TO tiv_app;",
+                     GRANT INSERT ON TABLE processed_webhook_events, payment_status_history, \
+                         webhook_deliveries, webhook_effects, ledger_entries, ledger_postings \
+                         TO tiv_app; \
+                     GRANT USAGE ON SEQUENCE payments_id_seq, \
+                         payment_status_history_history_id_seq, webhook_effects_id_seq, \
+                         ledger_postings_posting_id_seq TO tiv_app; \
+                     GRANT SELECT ON TABLE orders, payments, processed_webhook_events, \
+                         payment_status_history, webhook_deliveries, webhook_effects, \
+                         ledger_entries, ledger_postings \
+                         TO tiv_invariant;",
+                )
+                .await?;
+            session
+                .client()
+                .execute(
+                    "INSERT INTO orders (operation_id, amount_minor, currency, status) \
+                     VALUES ($1, 2500, 'usd', 'pending')",
+                    &[&operation_id],
                 )
                 .await?;
             session
@@ -458,7 +832,9 @@ impl TruthSpikePostgres {
             .batch_execute(&format!(
                 "REVOKE ALL ON DATABASE {} FROM PUBLIC; \
                  REVOKE ALL ON DATABASE {} FROM {APPLICATION_ROLE}; \
+                 REVOKE ALL ON DATABASE {} FROM {INVARIANT_ROLE}; \
                  GRANT CONNECT ON DATABASE {} TO {APPLICATION_ROLE}",
+                case_name.as_str(),
                 case_name.as_str(),
                 case_name.as_str(),
                 case_name.as_str(),
@@ -654,6 +1030,135 @@ impl TruthSpikePostgres {
         Ok(DatabaseTarget::new(observed))
     }
 
+    async fn reset_verified_case_from_archive(
+        &self,
+        verified: DatabaseTarget<Verified>,
+        _permit: MutationPermit,
+        archive: &BaselineArchive,
+        new_marker_uuid: Uuid,
+    ) -> Result<DatabaseTarget<Unverified>, SpikePostgresError> {
+        let prior = verified.identity();
+        let case_name = prior.database_name().clone();
+        let prior_fingerprint = prior.server_fingerprint().to_owned();
+        let prior_endpoint = prior.endpoint();
+        let prior_owner_oid = prior.owner_oid();
+        let compose_project = prior.marker().compose_project().clone();
+        let application_role = prior.expected_application_role().to_owned();
+        let database_oid = i64::from(prior.database_oid());
+
+        let mut maintenance = self.connect_database("postgres").await?;
+        let drop_case = format!("DROP DATABASE {}", case_name.as_str());
+        let create_case = format!(
+            "CREATE DATABASE {} WITH OWNER = {} TEMPLATE = template0",
+            case_name.as_str(),
+            self.config.admin_role,
+        );
+        let reset_result = async {
+            maintenance
+                .client()
+                .execute(
+                    "SELECT pg_terminate_backend(pid) \
+                     FROM pg_stat_activity \
+                     WHERE datid::bigint = $1 AND pid <> pg_backend_pid()",
+                    &[&database_oid],
+                )
+                .await?;
+            maintenance.client().batch_execute(&drop_case).await?;
+            maintenance.client().batch_execute(&create_case).await?;
+            maintenance
+                .client()
+                .query_one(
+                    "SELECT oid::bigint FROM pg_database WHERE datname = $1",
+                    &[&case_name.as_str()],
+                )
+                .await
+                .map(|row| row.get::<_, i64>(0))
+        }
+        .await;
+        maintenance.close().await?;
+        let created_database_oid = reset_result?;
+
+        let restore_result = self
+            .archive_toolchain
+            .as_ref()
+            .ok_or(SpikePostgresError::ArchiveUnavailable)?
+            .restore(archive, &case_name)
+            .await;
+        if let Err(error) = restore_result {
+            self.remove_failed_archive_case(&case_name, created_database_oid, prior_owner_oid)
+                .await?;
+            return Err(error.into());
+        }
+        let mut maintenance = self.connect_database("postgres").await?;
+        let configure_result = self
+            .configure_case_connect(maintenance.client(), &case_name)
+            .await;
+        maintenance.close().await?;
+        configure_result?;
+
+        self.replace_case_marker(&case_name, new_marker_uuid)
+            .await?;
+        let observed = self.observe_identity(&case_name).await?;
+        if observed.server_fingerprint() != prior_fingerprint
+            || observed.endpoint() != prior_endpoint
+            || observed.owner_oid() != prior_owner_oid
+            || observed.marker().marker_uuid() != new_marker_uuid
+            || observed.marker().kind() != MarkerKind::Case
+            || observed.marker().compose_project() != &compose_project
+            || observed.expected_application_role() != application_role
+        {
+            return Err(SpikePostgresError::PostResetIdentityMismatch);
+        }
+        Ok(DatabaseTarget::new(observed))
+    }
+
+    async fn remove_failed_archive_case(
+        &self,
+        case_name: &DatabaseName,
+        expected_database_oid: i64,
+        expected_owner_oid: u32,
+    ) -> Result<(), SpikePostgresError> {
+        let mut maintenance = self.connect_database("postgres").await?;
+        let catalog = maintenance
+            .client()
+            .query_opt(
+                "SELECT oid::bigint, datdba::bigint FROM pg_database WHERE datname = $1",
+                &[&case_name.as_str()],
+            )
+            .await?;
+        let cleanup_result = if let Some(catalog) = catalog {
+            let observed_database_oid = catalog.get::<_, i64>(0);
+            let observed_owner_oid = u32::try_from(catalog.get::<_, i64>(1))
+                .map_err(|_| SpikePostgresError::ArchiveCleanupIdentityMismatch)?;
+            if observed_database_oid != expected_database_oid
+                || observed_owner_oid != expected_owner_oid
+            {
+                Err(SpikePostgresError::ArchiveCleanupIdentityMismatch)
+            } else {
+                maintenance
+                    .client()
+                    .execute(
+                        "SELECT pg_terminate_backend(pid) \
+                         FROM pg_stat_activity \
+                         WHERE datid::bigint = $1 AND pid <> pg_backend_pid()",
+                        &[&expected_database_oid],
+                    )
+                    .await?;
+                let drop_case = format!("DROP DATABASE {}", case_name.as_str());
+                maintenance
+                    .client()
+                    .batch_execute(&drop_case)
+                    .await
+                    .map_err(SpikePostgresError::Postgres)
+            }
+        } else {
+            Ok(())
+        };
+        maintenance.close().await?;
+        cleanup_result?;
+        Ok(())
+    }
+
     async fn connect_database(
         &self,
         database_name: &str,
@@ -666,6 +1171,7 @@ impl TruthSpikePostgres {
         .await
     }
 
+    #[cfg(test)]
     async fn connect_application_database(
         &self,
         database_name: &DatabaseName,
@@ -708,33 +1214,87 @@ pub struct ReferenceProvisioning {
     baseline_target: BaselineTarget,
     case_name: DatabaseName,
     case_target: DatabaseTarget<Unverified>,
+    baseline_archive: Option<BaselineArchive>,
 }
 
 impl ReferenceProvisioning {
     #[must_use]
+    #[cfg(test)]
     pub const fn baseline_target(&self) -> &BaselineTarget {
         &self.baseline_target
     }
 
     #[must_use]
+    #[cfg(test)]
     pub const fn case_name(&self) -> &DatabaseName {
         &self.case_name
     }
 
     #[must_use]
+    #[cfg(test)]
     pub const fn case_target(&self) -> &DatabaseTarget<Unverified> {
         &self.case_target
     }
 
     #[must_use]
+    #[cfg(test)]
     pub fn into_case_target(self) -> DatabaseTarget<Unverified> {
         self.case_target
+    }
+
+    #[must_use]
+    pub fn into_archive_parts(
+        self,
+    ) -> Option<(
+        BaselineTarget,
+        DatabaseName,
+        DatabaseTarget<Unverified>,
+        BaselineArchive,
+    )> {
+        let Self {
+            baseline_target,
+            case_name,
+            case_target,
+            baseline_archive,
+        } = self;
+        Some((baseline_target, case_name, case_target, baseline_archive?))
     }
 }
 
 struct PostgresSession {
     client: Option<Client>,
     connection: Option<JoinHandle<Result<(), tokio_postgres::Error>>>,
+}
+
+/// One bounded configured `PostgreSQL` observer for a reference case.
+pub(crate) struct ReferenceSqlProbe {
+    session: PostgresSession,
+    probe: SqlProbe,
+    timeout: Duration,
+    poll_interval: Duration,
+}
+
+impl ReferenceSqlProbe {
+    /// Proves the repository predicate is false immediately before the owning
+    /// application action begins.
+    pub(crate) async fn require_false(&mut self) -> Result<(), SpikePostgresError> {
+        self.probe
+            .require_false(self.session.client())
+            .await
+            .map_err(SpikePostgresError::SqlProbe)
+    }
+
+    /// Observes the repository predicate's first committed true value.
+    pub(crate) async fn observe_true(&mut self) -> Result<(), SpikePostgresError> {
+        self.probe
+            .observe_true(self.session.client(), self.timeout, self.poll_interval)
+            .await
+            .map_err(SpikePostgresError::SqlProbe)
+    }
+
+    pub(crate) const fn observed(&self) -> bool {
+        self.probe.observed()
+    }
 }
 
 impl PostgresSession {
@@ -787,10 +1347,25 @@ pub enum SpikePostgresError {
     PostResetIdentityMismatch,
     #[error("sealed baseline identity did not match the scoped run")]
     BaselineIdentityMismatch,
+    #[error("the application role has unexpected inherited memberships")]
+    UnsafeApplicationRole,
+    #[error("the invariant role exceeds the isolated least-privilege contract")]
+    UnsafeInvariantRole,
+    #[error("invalid reference SQL probe configuration")]
+    InvalidSqlProbeConfiguration,
+    #[error("the configured reference SQL probe failed: {0}")]
+    SqlProbe(#[source] SqlProbeError),
+    #[cfg(test)]
     #[error("the synthetic bug requires two distinct provider objects")]
     InvalidBugState,
     #[error("PostgreSQL server is not the isolated truth-spike cluster")]
     UnexpectedServerIdentity,
+    #[error("the matching PostgreSQL archive toolchain was not attested")]
+    ArchiveUnavailable,
+    #[error("failed archive cleanup refused a substituted database identity")]
+    ArchiveCleanupIdentityMismatch,
+    #[error(transparent)]
+    Archive(#[from] ArchiveError),
     #[error(transparent)]
     InvalidUuid(#[from] uuid::Error),
     #[error("reference invariant oracle failed: {0}")]
@@ -843,11 +1418,21 @@ fn parse_baseline_catalog_marker(
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::Arc, time::Duration};
+    use std::{
+        os::unix::fs::PermissionsExt,
+        process::Command as StdCommand,
+        sync::Arc,
+        time::{Duration, SystemTime, UNIX_EPOCH},
+    };
 
     use reqwest::StatusCode;
-    use tiv_core::decision::Seed;
+    use tiv_core::{decision::Seed, result::AttemptResult, trace::CompiledTrace};
     use tiv_stripe_pi::{FaultOutcome, PaymentIntentFixture, http::serve_http1_connection};
+
+    use crate::replay::{
+        ReferenceAppReplayConfig, ReferenceReplayScript, ReferenceReplayScriptError, ReplayPlan,
+        run_reference_app_replay,
+    };
     use tokio::{net::TcpListener, sync::Mutex, time::timeout};
 
     use super::*;
@@ -855,6 +1440,30 @@ mod tests {
         evidence::TruthSpikeEvidence,
         postgres::oracle::{InvariantOutcome, InvariantVerdict},
     };
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires the isolated tiv-truth-spike-postgres Compose project"]
+    async fn provisioned_reference_case_owns_its_case_derived_operation() {
+        let postgres = test_postgres().await;
+        let suffix = Uuid::new_v4().simple().to_string()[..16].to_owned();
+        let provisioned = postgres
+            .provision_reference_databases(&suffix, test_project())
+            .await
+            .expect("the baseline and case are provisioned");
+        let mut session = postgres
+            .connect_database(provisioned.case_name().as_str())
+            .await
+            .expect("the generated case is reachable");
+        let operation_id: String = session
+            .client()
+            .query_one("SELECT operation_id FROM orders", &[])
+            .await
+            .expect("the seed order is readable")
+            .get(0);
+        session.close().await.expect("the session closes cleanly");
+
+        assert_eq!(operation_id, format!("op_{suffix}"));
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "requires the isolated tiv-truth-spike-postgres Compose project"]
@@ -868,11 +1477,16 @@ mod tests {
         let baseline_target = provisioned.baseline_target().clone();
         let case_name = provisioned.case_name().clone();
         let original_oid = provisioned.case_target().identity().database_oid();
-        let provider_objects = provider_objects();
+        let operation_id = format!("op_{suffix}");
+        let provider_objects = provider_objects(&operation_id);
 
         let stale_case_target = DatabaseTarget::new(provisioned.case_target().identity().clone());
         let dirty_case_target = postgres
-            .insert_buggy_payment_pair(provisioned.into_case_target(), "op_1", &provider_objects)
+            .insert_buggy_payment_pair(
+                provisioned.into_case_target(),
+                &operation_id,
+                &provider_objects,
+            )
             .await
             .expect("the synthetic bug state is inserted");
         let first_report = postgres
@@ -890,9 +1504,9 @@ mod tests {
             .expect("a fresh identity check authorizes the template reset");
         assert_ne!(reset_target.identity().database_oid(), original_oid);
         let clean_report = postgres
-            .check_reference_invariants(&case_name, &provider_objects, quiescence())
+            .check_reference_invariants(&case_name, &[], quiescence())
             .await
-            .expect("the clean baseline snapshot completes");
+            .expect("the reset database and provider baseline snapshot completes");
         assert!(matches!(
             clean_report
                 .outcome("provider-object-unique")
@@ -902,7 +1516,7 @@ mod tests {
         ));
 
         let stale_write = postgres
-            .insert_buggy_payment_pair(stale_case_target, "op_1", &provider_objects)
+            .insert_buggy_payment_pair(stale_case_target, &operation_id, &provider_objects)
             .await;
         assert!(matches!(
             stale_write,
@@ -911,9 +1525,9 @@ mod tests {
             )))
         ));
         let still_clean_report = postgres
-            .check_reference_invariants(&case_name, &provider_objects, quiescence())
+            .check_reference_invariants(&case_name, &[], quiescence())
             .await
-            .expect("the rejected stale write leaves the reset baseline inspectable");
+            .expect("the rejected stale write leaves both reset projections inspectable");
         assert!(matches!(
             still_clean_report
                 .outcome("provider-object-unique")
@@ -923,7 +1537,7 @@ mod tests {
         ));
 
         let _replayed_case_target = postgres
-            .insert_buggy_payment_pair(reset_target, "op_1", &provider_objects)
+            .insert_buggy_payment_pair(reset_target, &operation_id, &provider_objects)
             .await
             .expect("the same compiled fault is replayed");
         let replay_report = postgres
@@ -936,9 +1550,118 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires the isolated tiv-truth-spike-postgres Compose project"]
+    async fn custom_archive_fallback_restores_a_private_fresh_case() {
+        let postgres = test_postgres_with_archive().await;
+        let suffix = Uuid::new_v4().simple().to_string()[..16].to_owned();
+        let provisioned = postgres
+            .provision_reference_databases(&suffix, test_project())
+            .await
+            .expect("the baseline, archive, and first case are provisioned");
+        let (baseline_target, case_name, first_case_target, archive) = provisioned
+            .into_archive_parts()
+            .expect("the matching container toolchain captured a baseline archive");
+        let archive_path = archive.path().to_owned();
+        let archive_metadata = archive_path
+            .metadata()
+            .expect("archive metadata is readable");
+        assert_eq!(
+            archive_metadata.permissions().mode() & 0o777,
+            0o600,
+            "the host archive is never group- or world-readable"
+        );
+        assert!(archive_metadata.len() > 0, "the archive is not empty");
+        let original_oid = first_case_target.identity().database_oid();
+        let operation_id = format!("op_{suffix}");
+        let provider_objects = provider_objects(&operation_id);
+        let dirty_case_target = postgres
+            .insert_buggy_payment_pair(first_case_target, &operation_id, &provider_objects)
+            .await
+            .expect("the synthetic bug state is inserted before fallback reset");
+
+        let reset_target = postgres
+            .reset_case_from_archive(
+                dirty_case_target,
+                &baseline_target,
+                &archive,
+                Uuid::new_v4(),
+            )
+            .await
+            .expect("the custom archive restores into a fresh template0 database");
+
+        assert_ne!(reset_target.identity().database_oid(), original_oid);
+        let clean_report = postgres
+            .check_reference_invariants(&case_name, &[], quiescence())
+            .await
+            .expect("the restored database and provider baseline are inspectable");
+        assert!(matches!(
+            clean_report
+                .outcome("provider-object-unique")
+                .expect("the invariant ran")
+                .verdict(),
+            InvariantVerdict::Held
+        ));
+        assert_application_role_after_reset(&postgres, reset_target.identity().database_name())
+            .await;
+        assert_invariant_role_contract(&postgres, reset_target.identity().database_name()).await;
+
+        drop(archive);
+        assert!(
+            !archive_path.exists(),
+            "drop deletes the trusted local archive"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires the isolated tiv-truth-spike-postgres Compose project"]
+    async fn failed_archive_restore_removes_the_new_empty_case() {
+        let postgres = test_postgres_with_archive().await;
+        let suffix = Uuid::new_v4().simple().to_string()[..16].to_owned();
+        let provisioned = postgres
+            .provision_reference_databases(&suffix, test_project())
+            .await
+            .expect("the baseline archive and first case are provisioned");
+        let (baseline_target, case_name, case_target, mut archive) = provisioned
+            .into_archive_parts()
+            .expect("the baseline archive exists");
+        archive
+            .truncate_after_magic_for_test()
+            .expect("the test leaves only a valid custom-archive magic prefix");
+
+        let result = postgres
+            .reset_case_from_archive(case_target, &baseline_target, &archive, Uuid::new_v4())
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(SpikePostgresError::Archive(
+                ArchiveError::ToolCommandFailed(crate::postgres::archive::PostgresTool::Restore)
+            ))
+        ));
+        let mut maintenance = postgres
+            .connect_database("postgres")
+            .await
+            .expect("the maintenance database remains reachable");
+        let case_count = maintenance
+            .client()
+            .query_one(
+                "SELECT COUNT(*)::bigint FROM pg_database WHERE datname = $1",
+                &[&case_name.as_str()],
+            )
+            .await
+            .expect("the failed case name can be checked")
+            .get::<_, i64>(0);
+        maintenance
+            .close()
+            .await
+            .expect("the maintenance session closes");
+        assert_eq!(case_count, 0, "a failed restore leaves no usable case");
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore = "requires the isolated tiv-truth-spike-postgres Compose project"]
-    async fn full_commit_close_reset_and_replay_chain_has_one_failure_identity() {
+    async fn full_commit_close_three_attempt_chain_has_one_failure_identity() {
         let postgres = test_postgres().await;
         let suffix = Uuid::new_v4().simple().to_string()[..16].to_owned();
         let provisioned = postgres
@@ -953,21 +1676,37 @@ mod tests {
         let first_identity = provider_uniqueness_failure(&first_report)
             .identity()
             .clone();
-        let reset_target = postgres
+        let second_case_target = postgres
             .reset_case_from_template(dirty_case_target, &baseline_target, Uuid::new_v4())
             .await
             .expect("the marked case resets from the sealed template");
-        let reset_database_oid = reset_target.identity().database_oid();
-        let (replay_report, _replayed_case_target) =
-            run_buggy_checkout(&postgres, reset_target).await;
-        let replay_identity = provider_uniqueness_failure(&replay_report).identity();
+        let second_database_oid = second_case_target.identity().database_oid();
+        let (second_report, second_dirty_case_target) =
+            run_buggy_checkout(&postgres, second_case_target).await;
+        let second_identity = provider_uniqueness_failure(&second_report)
+            .identity()
+            .clone();
+        let third_case_target = postgres
+            .reset_case_from_template(second_dirty_case_target, &baseline_target, Uuid::new_v4())
+            .await
+            .expect("the second marked case resets from the sealed template");
+        let third_database_oid = third_case_target.identity().database_oid();
+        let (third_report, _third_dirty_case_target) =
+            run_buggy_checkout(&postgres, third_case_target).await;
+        let third_identity = provider_uniqueness_failure(&third_report)
+            .identity()
+            .clone();
+        let attempts = [
+            AttemptResult::Violation(first_identity.clone()),
+            AttemptResult::Violation(second_identity),
+            AttemptResult::Violation(third_identity),
+        ];
 
         let evidence = TruthSpikeEvidence::new(
-            2,
-            first_database_oid,
-            reset_database_oid,
+            [2, 2, 2],
+            [first_database_oid, second_database_oid, third_database_oid],
             &first_identity,
-            replay_identity,
+            &attempts,
         )
         .expect("the observed chain forms coherent bounded evidence");
         let encoded = evidence
@@ -989,6 +1728,7 @@ mod tests {
         let baseline_target = provisioned.baseline_target().clone();
         let case_name = provisioned.case_name().clone();
         assert_application_role_contract(&postgres, &case_name).await;
+        assert_invariant_role_contract(&postgres, &case_name).await;
 
         let reset_target = postgres
             .reset_case_from_template(
@@ -1000,12 +1740,251 @@ mod tests {
             .expect("the marked case resets from the template");
         assert_application_role_after_reset(&postgres, reset_target.identity().database_name())
             .await;
+        assert_invariant_role_contract(&postgres, reset_target.identity().database_name()).await;
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires the isolated tiv-truth-spike-postgres Compose project"]
+    async fn preexisting_application_role_membership_blocks_provisioning() {
+        let postgres = test_postgres().await;
+        postgres
+            .ensure_application_role()
+            .await
+            .expect("the initial isolated application role is safe");
+        let mut maintenance = postgres
+            .connect_database("postgres")
+            .await
+            .expect("the isolated maintenance database is reachable");
+        maintenance
+            .client()
+            .batch_execute(
+                "DROP ROLE IF EXISTS tiv_unexpected_member_role; \
+                 CREATE ROLE tiv_unexpected_member_role; \
+                 GRANT tiv_unexpected_member_role TO tiv_app;",
+            )
+            .await
+            .expect("the test installs one unexpected membership");
+        maintenance
+            .close()
+            .await
+            .expect("the maintenance session closes");
+
+        let suffix = Uuid::new_v4().simple().to_string()[..16].to_owned();
+        let port = std::env::var("TIV_POSTGRES_TEST_PORT")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(15_432);
+        let rotating_postgres = TruthSpikePostgres::connect(SpikePostgresConfig::loopback(
+            port,
+            "tiv_admin",
+            "tiv-local-only-password",
+            "unexpected-new-password",
+        ))
+        .await
+        .expect("the isolated maintenance identity is unchanged");
+        let result = rotating_postgres
+            .provision_reference_databases(&suffix, test_project())
+            .await;
+
+        let mut cleanup = postgres
+            .connect_database("postgres")
+            .await
+            .expect("the isolated maintenance database remains reachable");
+        let generated_database_count = cleanup
+            .client()
+            .query_one(
+                "SELECT COUNT(*)::bigint FROM pg_database \
+                 WHERE datname IN ($1, $2)",
+                &[&format!("tiv_base_{suffix}"), &format!("tiv_case_{suffix}")],
+            )
+            .await
+            .expect("the generated database names are observable")
+            .get::<_, i64>(0);
+        cleanup
+            .client()
+            .batch_execute(
+                "REVOKE tiv_unexpected_member_role FROM tiv_app; \
+                 DROP ROLE tiv_unexpected_member_role;",
+            )
+            .await
+            .expect("the test membership is removed");
+        cleanup.close().await.expect("the cleanup session closes");
+
+        let old_password_session = postgres
+            .connect_database_as("postgres", APPLICATION_ROLE, "tiv-app-local-only-password")
+            .await
+            .expect("the rejected provisioning did not rotate the application password");
+        old_password_session
+            .close()
+            .await
+            .expect("the application session closes");
+        assert!(
+            postgres
+                .connect_database_as("postgres", APPLICATION_ROLE, "unexpected-new-password")
+                .await
+                .is_err(),
+            "the rejected provisioning must not install the proposed password"
+        );
+
+        assert!(matches!(
+            result,
+            Err(SpikePostgresError::UnsafeApplicationRole)
+        ));
+        assert_eq!(generated_database_count, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires the isolated tiv-truth-spike-postgres Compose project"]
+    async fn preexisting_member_of_application_role_blocks_provisioning() {
+        let postgres = test_postgres().await;
+        postgres
+            .ensure_application_role()
+            .await
+            .expect("the initial isolated application role is safe");
+        let mut maintenance = postgres
+            .connect_database("postgres")
+            .await
+            .expect("the isolated maintenance database is reachable");
+        maintenance
+            .client()
+            .batch_execute(
+                "DROP ROLE IF EXISTS tiv_unexpected_app_member; \
+                 CREATE ROLE tiv_unexpected_app_member; \
+                 GRANT tiv_app TO tiv_unexpected_app_member;",
+            )
+            .await
+            .expect("the test installs one unexpected application-role member");
+        maintenance
+            .close()
+            .await
+            .expect("the maintenance session closes");
+
+        let suffix = Uuid::new_v4().simple().to_string()[..16].to_owned();
+        let result = postgres
+            .provision_reference_databases(&suffix, test_project())
+            .await;
+
+        let mut cleanup = postgres
+            .connect_database("postgres")
+            .await
+            .expect("the isolated maintenance database remains reachable");
+        let generated_database_count = cleanup
+            .client()
+            .query_one(
+                "SELECT COUNT(*)::bigint FROM pg_database \
+                 WHERE datname IN ($1, $2)",
+                &[&format!("tiv_base_{suffix}"), &format!("tiv_case_{suffix}")],
+            )
+            .await
+            .expect("the generated database names are observable")
+            .get::<_, i64>(0);
+        cleanup
+            .client()
+            .batch_execute(
+                "REVOKE tiv_app FROM tiv_unexpected_app_member; \
+                 DROP ROLE tiv_unexpected_app_member;",
+            )
+            .await
+            .expect("the test membership is removed");
+        cleanup.close().await.expect("the cleanup session closes");
+
+        assert!(matches!(
+            result,
+            Err(SpikePostgresError::UnsafeApplicationRole)
+        ));
+        assert_eq!(generated_database_count, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires the isolated tiv-truth-spike-postgres Compose project"]
+    async fn expanded_invariant_role_blocks_provisioning_without_automatic_repair() {
+        let postgres = test_postgres().await;
+        postgres
+            .ensure_invariant_role()
+            .await
+            .expect("the initial isolated invariant role is safe");
+        let mut maintenance = postgres
+            .connect_database("postgres")
+            .await
+            .expect("the isolated maintenance database is reachable");
+        maintenance
+            .client()
+            .batch_execute("ALTER ROLE tiv_invariant LOGIN")
+            .await
+            .expect("the test expands the invariant role");
+        maintenance
+            .close()
+            .await
+            .expect("the maintenance session closes");
+
+        let suffix = Uuid::new_v4().simple().to_string()[..16].to_owned();
+        let result = postgres
+            .provision_reference_databases(&suffix, test_project())
+            .await;
+
+        let mut cleanup = postgres
+            .connect_database("postgres")
+            .await
+            .expect("the isolated maintenance database remains reachable");
+        let state = cleanup
+            .client()
+            .query_one(
+                "SELECT role.rolcanlogin, \
+                        COUNT(database.oid)::bigint \
+                 FROM pg_roles AS role \
+                 LEFT JOIN pg_database AS database \
+                   ON database.datname IN ($1, $2) \
+                 WHERE role.rolname = 'tiv_invariant' \
+                 GROUP BY role.rolcanlogin",
+                &[&format!("tiv_base_{suffix}"), &format!("tiv_case_{suffix}")],
+            )
+            .await
+            .expect("the rejected provisioning state is observable");
+        cleanup
+            .client()
+            .batch_execute("ALTER ROLE tiv_invariant NOLOGIN")
+            .await
+            .expect("the test restores the invariant role");
+        cleanup.close().await.expect("the cleanup session closes");
+
+        assert!(matches!(
+            result,
+            Err(SpikePostgresError::UnsafeInvariantRole)
+        ));
+        assert!(
+            state.get::<_, bool>(0),
+            "provisioning must not repair an expanded role"
+        );
+        assert_eq!(state.get::<_, i64>(1), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires the isolated tiv-truth-spike-postgres Compose project"]
+    async fn reference_app_connection_rejects_the_generic_truth_spike_cluster() {
+        let port = std::env::var("TIV_POSTGRES_TEST_PORT")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(15_432);
+        let result = TruthSpikePostgres::connect(SpikePostgresConfig::loopback_reference_app(
+            port,
+            "tiv_admin",
+            "tiv-local-only-password",
+            "tiv-app-local-only-password",
+        ))
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(SpikePostgresError::UnexpectedServerIdentity)
+        ));
+    }
+
+    #[allow(clippy::too_many_lines)]
     async fn assert_application_role_contract(
         postgres: &TruthSpikePostgres,
         case_name: &DatabaseName,
     ) {
+        let operation_id = reference_operation_id(case_name);
         let mut app = postgres
             .connect_application_database(case_name)
             .await
@@ -1022,11 +2001,133 @@ mod tests {
             .execute(
                 "INSERT INTO payments \
                      (operation_id, stripe_payment_intent_id, amount_minor, currency, status) \
-                 VALUES ('op_1', 'pi_tiv_role_test', 2500, 'usd', 'succeeded')",
+                 VALUES ($1, 'pi_tiv_role_test', 2500, 'usd', 'succeeded')",
+                &[&operation_id],
+            )
+            .await
+            .expect("the app can persist its payment relation");
+        let processed_event = app
+            .client()
+            .execute(
+                "INSERT INTO processed_webhook_events (provider_event_id, operation_id) \
+                 VALUES ('evt_tiv_role_test', $1) ON CONFLICT DO NOTHING",
+                &[&operation_id],
+            )
+            .await
+            .expect("the app can claim one immutable provider event");
+        let status_history = app
+            .client()
+            .execute(
+                "INSERT INTO payment_status_history \
+                     (provider_event_id, operation_id, stripe_payment_intent_id, \
+                      provider_created, observed_status, applied, local_status_after) \
+                 VALUES ( \
+                     'evt_tiv_role_test', $1, 'pi_tiv_role_test', \
+                     1, 'succeeded', true, 'succeeded' \
+                 )",
+                &[&operation_id],
+            )
+            .await
+            .expect("the app can persist terminal-state history");
+        let delivery = app
+            .client()
+            .execute(
+                "INSERT INTO webhook_deliveries \
+                     (delivery_id, provider_event_id, operation_id) \
+                 VALUES ( \
+                     '00000000-0000-4000-8000-000000000001', \
+                     'evt_tiv_role_test', \
+                     $1 \
+                 )",
+                &[&operation_id],
+            )
+            .await
+            .expect("the app can persist one authenticated delivery identity");
+        let effect = app
+            .client()
+            .execute(
+                "INSERT INTO webhook_effects (provider_event_id, operation_id) \
+                 VALUES ('evt_tiv_role_test', $1)",
+                &[&operation_id],
+            )
+            .await
+            .expect("the app can persist the event business effect");
+        let ledger_entry = app
+            .client()
+            .execute(
+                "INSERT INTO ledger_entries \
+                     (entry_id, delivery_id, provider_event_id, operation_id, \
+                      amount_minor, currency, entry_kind) \
+                 VALUES ( \
+                     '10000000-0000-4000-8000-000000000001', \
+                     '00000000-0000-4000-8000-000000000001', \
+                     'evt_tiv_role_test', $1, 2500, 'usd', 'payment_succeeded' \
+                 )",
+                &[&operation_id],
+            )
+            .await
+            .expect("the app can persist one journal entry header");
+        let debit_posting = app
+            .client()
+            .execute(
+                "INSERT INTO ledger_postings \
+                     (entry_id, account_code, entry_side, amount_minor, currency) \
+                 VALUES ( \
+                     '10000000-0000-4000-8000-000000000001', \
+                     'processor_clearing', 'debit', 2500, 'usd' \
+                 )",
                 &[],
             )
             .await
-            .expect("the app can persist its one required relation");
+            .expect("the app can persist the debit posting");
+        let credit_posting = app
+            .client()
+            .execute(
+                "INSERT INTO ledger_postings \
+                     (entry_id, account_code, entry_side, amount_minor, currency) \
+                 VALUES ( \
+                     '10000000-0000-4000-8000-000000000001', \
+                     'order_payment_liability', 'credit', 2500, 'usd' \
+                 )",
+                &[],
+            )
+            .await
+            .expect("the app can persist the credit posting");
+        let duplicate_delivery_entry = {
+            let transaction = app
+                .client()
+                .transaction()
+                .await
+                .expect("the duplicate-delivery entry probe starts");
+            let result = transaction
+                .execute(
+                    "INSERT INTO ledger_entries \
+                         (entry_id, delivery_id, provider_event_id, operation_id, \
+                          amount_minor, currency, entry_kind) \
+                     VALUES ( \
+                         '10000000-0000-4000-8000-000000000099', \
+                         '00000000-0000-4000-8000-000000000001', \
+                         'evt_tiv_role_test', $1, 2500, 'usd', 'payment_succeeded' \
+                     )",
+                    &[&operation_id],
+                )
+                .await;
+            transaction
+                .rollback()
+                .await
+                .expect("the duplicate-delivery entry probe rolls back");
+            result
+        };
+        let repeated_event = app
+            .client()
+            .execute(
+                "INSERT INTO processed_webhook_events (provider_event_id, operation_id) \
+                 VALUES ('evt_tiv_role_test', $1) ON CONFLICT DO NOTHING",
+                &[&operation_id],
+            )
+            .await
+            .expect("the app can deduplicate without table read privilege");
+        assert_durable_operation_read(app.client(), &operation_id).await;
         let marker_read = app
             .client()
             .query("SELECT marker_uuid FROM tiv_verifier_marker", &[])
@@ -1035,9 +2136,9 @@ mod tests {
             .client()
             .execute(
                 "UPDATE payments SET status = 'succeeded' \
-                 WHERE operation_id = 'op_1' \
+                 WHERE operation_id = $1 \
                    AND stripe_payment_intent_id = 'pi_tiv_role_test'",
-                &[],
+                &[&operation_id],
             )
             .await
             .expect("the app can reconcile the exact provider relation it wrote");
@@ -1064,13 +2165,59 @@ mod tests {
                 &[],
             )
             .await;
-        let ungranted_payment_read = app.client().query("SELECT status FROM payments", &[]).await;
+        let ungranted_payment_read = app
+            .client()
+            .query("SELECT amount_minor FROM payments", &[])
+            .await;
+        let ungranted_order_read = app.client().query("SELECT status FROM orders", &[]).await;
+        let ungranted_event_read = app
+            .client()
+            .query(
+                "SELECT provider_event_id FROM processed_webhook_events",
+                &[],
+            )
+            .await;
+        let ungranted_history_read = app
+            .client()
+            .query("SELECT history_id FROM payment_status_history", &[])
+            .await;
+        let ungranted_delivery_read = app
+            .client()
+            .query("SELECT provider_event_id FROM webhook_deliveries", &[])
+            .await;
+        let ungranted_ledger_read = app
+            .client()
+            .query("SELECT entry_id FROM ledger_entries", &[])
+            .await;
+        let ledger_update = app
+            .client()
+            .execute("UPDATE ledger_postings SET amount_minor = 1", &[])
+            .await;
+        let effect_update = app
+            .client()
+            .execute(
+                "UPDATE webhook_effects SET operation_id = 'op_tampered'",
+                &[],
+            )
+            .await;
         app.close()
             .await
             .expect("the application connection closes cleanly");
 
         assert_eq!(current_user, APPLICATION_ROLE);
         assert_eq!(inserted, 1);
+        assert_eq!(processed_event, 1);
+        assert_eq!(status_history, 1);
+        assert_eq!(delivery, 1);
+        assert_eq!(effect, 1);
+        assert_eq!(ledger_entry, 1);
+        assert_eq!(debit_posting, 1);
+        assert_eq!(credit_posting, 1);
+        assert!(
+            duplicate_delivery_entry.is_err(),
+            "one authenticated delivery can own only one ledger entry"
+        );
+        assert_eq!(repeated_event, 0);
         assert_eq!(reconciled, 1);
         assert!(
             marker_read.is_err(),
@@ -1091,14 +2238,241 @@ mod tests {
         assert!(payment_delete.is_err(), "the app cannot delete payments");
         assert!(
             ungranted_payment_read.is_err(),
-            "the app cannot read columns outside its reconciliation predicate"
+            "the app cannot read payment value columns outside its state predicate"
         );
+        assert!(
+            ungranted_order_read.is_err(),
+            "the app cannot read mutable order state while recovering routing"
+        );
+        assert!(
+            ungranted_event_read.is_err(),
+            "the app cannot enumerate processed event identities"
+        );
+        assert!(
+            ungranted_history_read.is_err(),
+            "the app cannot enumerate terminal-state history"
+        );
+        assert!(
+            ungranted_delivery_read.is_err(),
+            "the app cannot enumerate authenticated webhook deliveries"
+        );
+        assert!(
+            ungranted_ledger_read.is_err(),
+            "the app cannot enumerate ledger entries"
+        );
+        assert!(
+            ledger_update.is_err(),
+            "the app cannot rewrite ledger postings"
+        );
+        assert!(
+            effect_update.is_err(),
+            "the app cannot rewrite a recorded business effect"
+        );
+        assert_webhook_identity_collision_contract(postgres, case_name, &operation_id).await;
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn assert_webhook_identity_collision_contract(
+        postgres: &TruthSpikePostgres,
+        case_name: &DatabaseName,
+        operation_id: &str,
+    ) {
+        let colliding_operation_id = format!("{operation_id}_collision");
+        prepare_collision_probe_order(postgres, case_name, &colliding_operation_id).await;
+        let mut app = postgres
+            .connect_application_database(case_name)
+            .await
+            .expect("the app role can exercise the webhook identity boundary");
+        let processed_event = app
+            .client()
+            .execute(
+                "INSERT INTO processed_webhook_events (provider_event_id, operation_id) \
+                 VALUES ('evt_tiv_identity_contract', $1) ON CONFLICT DO NOTHING",
+                &[&operation_id],
+            )
+            .await
+            .expect("the app can claim the immutable event identity");
+        let first_delivery = app
+            .client()
+            .execute(
+                "INSERT INTO webhook_deliveries \
+                     (delivery_id, provider_event_id, operation_id) \
+                 VALUES ( \
+                     '00000000-0000-4000-8000-000000000003', \
+                     'evt_tiv_identity_contract', $1 \
+                 )",
+                &[&operation_id],
+            )
+            .await
+            .expect("the first authenticated delivery keeps the claimed identity");
+        let repeated_delivery = app
+            .client()
+            .execute(
+                "INSERT INTO webhook_deliveries \
+                     (delivery_id, provider_event_id, operation_id) \
+                 VALUES ( \
+                     '00000000-0000-4000-8000-000000000004', \
+                     'evt_tiv_identity_contract', $1 \
+                 )",
+                &[&operation_id],
+            )
+            .await
+            .expect("an exact duplicate keeps the claimed identity");
+        let transaction = app
+            .client()
+            .transaction()
+            .await
+            .expect("the collision probe transaction starts");
+        let colliding_claim = transaction
+            .execute(
+                "INSERT INTO processed_webhook_events (provider_event_id, operation_id) \
+                 VALUES ('evt_tiv_identity_contract', $1) ON CONFLICT DO NOTHING",
+                &[&colliding_operation_id],
+            )
+            .await
+            .expect("the global event ID is already claimed");
+        let colliding_delivery = transaction
+            .execute(
+                "INSERT INTO webhook_deliveries \
+                         (delivery_id, provider_event_id, operation_id) \
+                     VALUES ( \
+                         '00000000-0000-4000-8000-000000000005', \
+                         'evt_tiv_identity_contract', $1 \
+                     )",
+                &[&colliding_operation_id],
+            )
+            .await;
+        let payment_after_collision = transaction
+            .execute(
+                "INSERT INTO payments \
+                     (operation_id, stripe_payment_intent_id, amount_minor, currency, status) \
+                 VALUES ($1, 'pi_tiv_collision', 2500, 'usd', 'succeeded')",
+                &[&colliding_operation_id],
+            )
+            .await;
+        transaction
+            .rollback()
+            .await
+            .expect("the rejected collision transaction rolls back");
+        app.close()
+            .await
+            .expect("the identity-contract app session closes cleanly");
+
+        assert_eq!(processed_event, 1);
+        assert_eq!(first_delivery, 1);
+        assert_eq!(repeated_delivery, 1);
+        assert_eq!(colliding_claim, 0);
+        let collision_error =
+            colliding_delivery.expect_err("one event ID cannot be reassigned to another operation");
+        assert_eq!(
+            collision_error
+                .as_db_error()
+                .and_then(tokio_postgres::error::DbError::constraint),
+            Some("webhook_deliveries_event_identity_fkey")
+        );
+        assert!(
+            payment_after_collision.is_err(),
+            "identity rejection aborts the transaction before a payment mutation"
+        );
+        let collision_state =
+            inspect_and_remove_collision_probe_order(postgres, case_name, &colliding_operation_id)
+                .await;
+        assert_eq!(collision_state, (0, 0));
+    }
+
+    async fn prepare_collision_probe_order(
+        postgres: &TruthSpikePostgres,
+        case_name: &DatabaseName,
+        operation_id: &str,
+    ) {
+        let mut admin = postgres
+            .connect_database(case_name.as_str())
+            .await
+            .expect("the case accepts its isolated admin role");
+        admin
+            .client()
+            .execute(
+                "INSERT INTO orders (operation_id, amount_minor, currency, status) \
+                 VALUES ($1, 2500, 'usd', 'pending')",
+                &[&operation_id],
+            )
+            .await
+            .expect("the collision probe has a second valid operation");
+        admin
+            .close()
+            .await
+            .expect("the collision-probe admin session closes");
+    }
+
+    async fn inspect_and_remove_collision_probe_order(
+        postgres: &TruthSpikePostgres,
+        case_name: &DatabaseName,
+        operation_id: &str,
+    ) -> (i64, i64) {
+        let mut admin = postgres
+            .connect_database(case_name.as_str())
+            .await
+            .expect("the collision result is inspectable by the isolated admin");
+        let state = admin
+            .client()
+            .query_one(
+                "SELECT \
+                     (SELECT COUNT(*)::bigint FROM payments WHERE operation_id = $1), \
+                     (SELECT COUNT(*)::bigint FROM webhook_deliveries WHERE operation_id = $1)",
+                &[&operation_id],
+            )
+            .await
+            .expect("the rejected collision leaves no durable application state");
+        let state = (state.get::<_, i64>(0), state.get::<_, i64>(1));
+        admin
+            .client()
+            .execute(
+                "DELETE FROM orders WHERE operation_id = $1",
+                &[&operation_id],
+            )
+            .await
+            .expect("the isolated collision-probe order is removed");
+        admin
+            .close()
+            .await
+            .expect("the collision-result admin session closes");
+        state
+    }
+
+    async fn assert_durable_operation_read(client: &Client, operation_id: &str) {
+        let order = client
+            .query_one(
+                "SELECT operation_id, amount_minor, currency FROM orders WHERE operation_id = $1",
+                &[&operation_id],
+            )
+            .await
+            .expect("the app can recover its durable operation relation");
+        assert_eq!(order.get::<_, String>(0), operation_id);
+        assert_eq!(order.get::<_, i64>(1), 2_500);
+        assert_eq!(order.get::<_, String>(2), "usd");
+    }
+
+    async fn insert_status_history_after_reset(client: &Client, operation_id: &str) -> u64 {
+        client
+            .execute(
+                "INSERT INTO payment_status_history \
+                     (provider_event_id, operation_id, stripe_payment_intent_id, \
+                      provider_created, observed_status, applied, local_status_after) \
+                 VALUES ( \
+                     'evt_tiv_role_test_after_reset', $1, \
+                     'pi_tiv_role_test_after_reset', 1, 'succeeded', true, 'succeeded' \
+                 )",
+                &[&operation_id],
+            )
+            .await
+            .expect("the history grant survives a template reset")
     }
 
     async fn assert_application_role_after_reset(
         postgres: &TruthSpikePostgres,
         case_name: &DatabaseName,
     ) {
+        let operation_id = reference_operation_id(case_name);
         let mut reset_app = postgres
             .connect_application_database(case_name)
             .await
@@ -1108,22 +2482,197 @@ mod tests {
             .execute(
                 "INSERT INTO payments \
                      (operation_id, stripe_payment_intent_id, amount_minor, currency, status) \
-                 VALUES ('op_1', 'pi_tiv_role_test_after_reset', 2500, 'usd', 'succeeded')",
-                &[],
+                 VALUES ($1, 'pi_tiv_role_test_after_reset', 2500, 'usd', 'succeeded')",
+                &[&operation_id],
             )
             .await
             .expect("the narrow grant survives a template reset");
+        let reset_processed_event = reset_app
+            .client()
+            .execute(
+                "INSERT INTO processed_webhook_events (provider_event_id, operation_id) \
+                 VALUES ('evt_tiv_role_test_after_reset', $1) ON CONFLICT DO NOTHING",
+                &[&operation_id],
+            )
+            .await
+            .expect("the event grant survives a template reset");
+        let reset_status_history =
+            insert_status_history_after_reset(reset_app.client(), &operation_id).await;
+        let reset_delivery = reset_app
+            .client()
+            .execute(
+                "INSERT INTO webhook_deliveries \
+                     (delivery_id, provider_event_id, operation_id) \
+                 VALUES ( \
+                     '00000000-0000-4000-8000-000000000002', \
+                     'evt_tiv_role_test_after_reset', $1 \
+                 )",
+                &[&operation_id],
+            )
+            .await
+            .expect("the delivery grant survives a template reset");
+        let reset_effect = reset_app
+            .client()
+            .execute(
+                "INSERT INTO webhook_effects (provider_event_id, operation_id) \
+                 VALUES ('evt_tiv_role_test_after_reset', $1)",
+                &[&operation_id],
+            )
+            .await
+            .expect("the effect grant survives a template reset");
+        let reset_ledger_entry = reset_app
+            .client()
+            .execute(
+                "INSERT INTO ledger_entries \
+                     (entry_id, delivery_id, provider_event_id, operation_id, \
+                      amount_minor, currency, entry_kind) \
+                 VALUES ( \
+                     '10000000-0000-4000-8000-000000000002', \
+                     '00000000-0000-4000-8000-000000000002', \
+                     'evt_tiv_role_test_after_reset', $1, \
+                     2500, 'usd', 'payment_succeeded' \
+                 )",
+                &[&operation_id],
+            )
+            .await
+            .expect("the ledger-entry grant survives a template reset");
+        let reset_postings = reset_app
+            .client()
+            .execute(
+                "INSERT INTO ledger_postings \
+                     (entry_id, account_code, entry_side, amount_minor, currency) \
+                 VALUES \
+                     ( \
+                         '10000000-0000-4000-8000-000000000002', \
+                         'processor_clearing', 'debit', 2500, 'usd' \
+                     ), \
+                     ( \
+                         '10000000-0000-4000-8000-000000000002', \
+                         'order_payment_liability', 'credit', 2500, 'usd' \
+                     )",
+                &[],
+            )
+            .await
+            .expect("the ledger-posting grant survives a template reset");
         reset_app
             .close()
             .await
             .expect("the reset application connection closes cleanly");
         assert_eq!(reset_insert, 1);
+        assert_eq!(reset_processed_event, 1);
+        assert_eq!(reset_status_history, 1);
+        assert_eq!(reset_delivery, 1);
+        assert_eq!(reset_effect, 1);
+        assert_eq!(reset_ledger_entry, 1);
+        assert_eq!(reset_postings, 2);
+    }
+
+    fn reference_operation_id(case_name: &DatabaseName) -> String {
+        format!(
+            "op_{}",
+            case_name
+                .as_str()
+                .strip_prefix("tiv_case_")
+                .expect("generated case keeps its validated prefix")
+        )
+    }
+
+    async fn assert_invariant_role_contract(
+        postgres: &TruthSpikePostgres,
+        case_name: &DatabaseName,
+    ) {
+        use crate::postgres::snapshot::{InvariantRoleName, attest_invariant_role};
+
+        let mut admin = postgres
+            .connect_database(case_name.as_str())
+            .await
+            .expect("the isolated case database accepts its admin role");
+        let role = InvariantRoleName::new("tiv_invariant")
+            .expect("the fixed truth-spike invariant role is valid");
+        let attestation = attest_invariant_role(admin.client(), role).await;
+        assert!(
+            attestation.is_ok(),
+            "the provisioned invariant role must satisfy fresh attestation"
+        );
+
+        let grants = admin
+            .client()
+            .query_one(
+                "SELECT has_schema_privilege('tiv_invariant', 'public', 'USAGE'), \
+                        has_schema_privilege('tiv_invariant', 'public', 'CREATE'), \
+                        has_table_privilege('tiv_invariant', 'orders', 'SELECT'), \
+                        has_table_privilege('tiv_invariant', 'payments', 'SELECT'), \
+                        has_table_privilege( \
+                            'tiv_invariant', 'processed_webhook_events', 'SELECT' \
+                        ), \
+                        has_table_privilege( \
+                            'tiv_invariant', 'payment_status_history', 'SELECT' \
+                        ), \
+                        has_table_privilege( \
+                            'tiv_invariant', 'webhook_deliveries', 'SELECT' \
+                        ), \
+                        has_table_privilege('tiv_invariant', 'webhook_effects', 'SELECT'), \
+                        has_table_privilege('tiv_invariant', 'ledger_entries', 'SELECT'), \
+                        has_table_privilege('tiv_invariant', 'ledger_postings', 'SELECT'), \
+                        has_table_privilege( \
+                            'tiv_invariant', 'tiv_verifier_marker', 'SELECT' \
+                        ), \
+                        has_table_privilege('tiv_invariant', 'payments', 'INSERT'), \
+                        has_database_privilege( \
+                            'tiv_invariant', current_database(), 'TEMP' \
+                        )",
+                &[],
+            )
+            .await
+            .expect("the invariant role grants are observable");
+        assert!(grants.get::<_, bool>(0));
+        assert!(!grants.get::<_, bool>(1));
+        assert!(grants.get::<_, bool>(2));
+        assert!(grants.get::<_, bool>(3));
+        assert!(grants.get::<_, bool>(4));
+        assert!(grants.get::<_, bool>(5));
+        assert!(grants.get::<_, bool>(6));
+        assert!(grants.get::<_, bool>(7));
+        assert!(grants.get::<_, bool>(8));
+        assert!(grants.get::<_, bool>(9));
+        assert!(!grants.get::<_, bool>(10));
+        assert!(!grants.get::<_, bool>(11));
+        assert!(!grants.get::<_, bool>(12));
+
+        let transaction = admin
+            .client()
+            .build_transaction()
+            .read_only(true)
+            .start()
+            .await
+            .expect("the invariant proof transaction starts read-only");
+        transaction
+            .batch_execute("SET LOCAL ROLE tiv_invariant")
+            .await
+            .expect("the isolated admin can drop to the invariant role");
+        let effective = transaction
+            .query_one(
+                "SELECT current_user::text, COUNT(*)::bigint FROM orders",
+                &[],
+            )
+            .await
+            .expect("the invariant role can read application state");
+        assert_eq!(effective.get::<_, &str>(0), "tiv_invariant");
+        assert_eq!(effective.get::<_, i64>(1), 1);
+        transaction
+            .rollback()
+            .await
+            .expect("the invariant proof transaction rolls back");
+        admin
+            .close()
+            .await
+            .expect("the invariant-role admin session closes");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore = "requires the isolated reference-app Compose project"]
-    async fn real_reference_app_replays_commit_close_with_the_same_failure_identity() {
-        let postgres = test_postgres().await;
+    async fn real_reference_app_runs_three_fresh_commit_close_attempts() {
+        let postgres = test_reference_postgres().await;
         let suffix = Uuid::new_v4().simple().to_string()[..16].to_owned();
         let provisioned = postgres
             .provision_reference_databases(&suffix, test_project())
@@ -1133,11 +2682,12 @@ mod tests {
         let case_name = provisioned.case_name().clone();
         let first_database_oid = provisioned.case_target().identity().database_oid();
 
-        let first_report = run_reference_app_checkout(&postgres, &case_name, 1, 2).await;
+        let plan = committed_replay_plan();
+        let first_report = run_reference_app_checkout(&postgres, &case_name, &plan, 1).await;
         let first_identity = provider_uniqueness_failure(&first_report)
             .identity()
             .clone();
-        let reset_target = postgres
+        let second_case_target = postgres
             .reset_case_from_template(
                 provisioned.into_case_target(),
                 &baseline_target,
@@ -1145,16 +2695,31 @@ mod tests {
             )
             .await
             .expect("the real app case resets from the sealed template");
-        let reset_database_oid = reset_target.identity().database_oid();
+        let second_database_oid = second_case_target.identity().database_oid();
 
-        let replay_report = run_reference_app_checkout(&postgres, &case_name, 3, 4).await;
-        let replay_identity = provider_uniqueness_failure(&replay_report).identity();
+        let second_report = run_reference_app_checkout(&postgres, &case_name, &plan, 3).await;
+        let second_identity = provider_uniqueness_failure(&second_report)
+            .identity()
+            .clone();
+        let third_case_target = postgres
+            .reset_case_from_template(second_case_target, &baseline_target, Uuid::new_v4())
+            .await
+            .expect("the second real app case resets from the sealed template");
+        let third_database_oid = third_case_target.identity().database_oid();
+        let third_report = run_reference_app_checkout(&postgres, &case_name, &plan, 5).await;
+        let third_identity = provider_uniqueness_failure(&third_report)
+            .identity()
+            .clone();
+        let attempts = [
+            AttemptResult::Violation(first_identity.clone()),
+            AttemptResult::Violation(second_identity),
+            AttemptResult::Violation(third_identity),
+        ];
         let evidence = TruthSpikeEvidence::new(
-            2,
-            first_database_oid,
-            reset_database_oid,
+            [2, 2, 2],
+            [first_database_oid, second_database_oid, third_database_oid],
             &first_identity,
-            replay_identity,
+            &attempts,
         )
         .expect("the real application path forms coherent bounded evidence");
         let encoded = evidence
@@ -1181,19 +2746,138 @@ mod tests {
         .expect("the isolated PostgreSQL fixture is healthy")
     }
 
+    async fn test_postgres_with_archive() -> TruthSpikePostgres {
+        let port = std::env::var("TIV_POSTGRES_TEST_PORT")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(15_432);
+        let mut command = StdCommand::new("docker");
+        let output = command
+            .args([
+                "--host",
+                "unix:///var/run/docker.sock",
+                "ps",
+                "--filter",
+                "label=com.docker.compose.project=tiv-truth-spike-postgres",
+                "--filter",
+                "label=com.docker.compose.service=postgres",
+                "--format",
+                "{{.ID}}",
+            ])
+            .env_remove("DOCKER_HOST")
+            .env_remove("DOCKER_CONTEXT")
+            .env_remove("DOCKER_TLS_VERIFY")
+            .env_remove("DOCKER_CERT_PATH")
+            .output()
+            .expect("local Docker is available");
+        assert!(
+            output.status.success(),
+            "the isolated container is discoverable"
+        );
+        let container_id = String::from_utf8(output.stdout)
+            .expect("Docker emits UTF-8")
+            .trim()
+            .to_owned();
+        assert!(
+            !container_id.contains('\n'),
+            "exactly one container is running"
+        );
+        TruthSpikePostgres::connect(SpikePostgresConfig::loopback_with_archive_container(
+            port,
+            "tiv_admin",
+            "tiv-local-only-password",
+            "tiv-app-local-only-password",
+            container_id,
+        ))
+        .await
+        .expect("the isolated PostgreSQL archive toolchain is compatible")
+    }
+
+    async fn test_reference_postgres() -> TruthSpikePostgres {
+        let port = std::env::var("TIV_POSTGRES_TEST_PORT")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(15_432);
+        TruthSpikePostgres::connect(SpikePostgresConfig::loopback_reference_app(
+            port,
+            "tiv_admin",
+            "tiv-local-only-password",
+            "tiv-app-local-only-password",
+        ))
+        .await
+        .expect("the isolated reference PostgreSQL fixture is healthy")
+    }
+
     fn test_project() -> ComposeProjectId {
         let project = std::env::var("TIV_COMPOSE_PROJECT")
             .unwrap_or_else(|_| "tiv-truth-spike-postgres".to_owned());
         ComposeProjectId::new(project).expect("the test project name is valid")
     }
 
-    fn provider_objects() -> [ProviderPaymentIntent; 2] {
+    fn provider_objects(operation_id: &str) -> [ProviderPaymentIntent; 2] {
         [
-            ProviderPaymentIntent::new("pi_tiv_first", 2_500, "usd", "requires_confirmation")
-                .expect("the first provider projection is valid"),
-            ProviderPaymentIntent::new("pi_tiv_retry", 2_500, "usd", "requires_confirmation")
-                .expect("the retry provider projection is valid"),
+            ProviderPaymentIntent::new(
+                "pi_tiv_first",
+                operation_id,
+                2_500,
+                "usd",
+                "requires_confirmation",
+            )
+            .expect("the first provider projection is valid"),
+            ProviderPaymentIntent::new(
+                "pi_tiv_retry",
+                operation_id,
+                2_500,
+                "usd",
+                "requires_confirmation",
+            )
+            .expect("the retry provider projection is valid"),
         ]
+    }
+
+    fn committed_replay_plan() -> ReplayPlan {
+        replay_plan_from_json(include_str!("../../../../spike/compiled-trace-v1.json"))
+    }
+
+    fn replay_plan_from_json(document: &str) -> ReplayPlan {
+        let trace: CompiledTrace = serde_json::from_str(document).expect("the trace is valid");
+        ReplayPlan::from_trace(&trace).expect("the trace compiles into a replay plan")
+    }
+
+    #[test]
+    fn reference_app_replay_script_is_derived_from_the_committed_trace_plan() {
+        let plan = committed_replay_plan();
+        let script =
+            ReferenceReplayScript::from_plan(&plan).expect("the committed trace is executable");
+
+        assert_eq!(script.fixture_seed(), Seed::new(7));
+        assert_eq!(
+            script.expected_payment_intent_id(),
+            "pi_tiv_7dc6fb6eb37270c34d739b91"
+        );
+
+        let incomplete_plan = replay_plan_from_json(
+            r#"{
+            "schema_version": 1,
+            "seed": 7,
+            "actions": [{
+                "id": 1,
+                "kind": "DriveCheckout",
+                "dependencies": [],
+                "inputs": [],
+                "declared_outputs": ["PaymentIntentId"]
+            }],
+            "captured": [{
+                "output_ref": {"action_id": 1, "slot": "PaymentIntentId"},
+                "value": {"PaymentIntentId": "pi_tiv_7dc6fb6eb37270c34d739b91"}
+            }]
+        }"#,
+        );
+
+        assert_eq!(
+            ReferenceReplayScript::from_plan(&incomplete_plan),
+            Err(ReferenceReplayScriptError::UnexpectedStepCount { actual: 1 })
+        );
     }
 
     async fn run_buggy_checkout(
@@ -1201,6 +2885,13 @@ mod tests {
         case_target: DatabaseTarget<Unverified>,
     ) -> (SnapshotReport, DatabaseTarget<Unverified>) {
         let case_name = case_target.identity().database_name().clone();
+        let operation_id = format!(
+            "op_{}",
+            case_name
+                .as_str()
+                .strip_prefix("tiv_case_")
+                .expect("generated case keeps its validated prefix")
+        );
         let fixture = Arc::new(Mutex::new(PaymentIntentFixture::new(Seed::new(42))));
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -1252,6 +2943,7 @@ mod tests {
                 .map(|payment_intent| {
                     ProviderPaymentIntent::new(
                         payment_intent.id(),
+                        &operation_id,
                         2_500,
                         "usd",
                         "requires_confirmation",
@@ -1261,7 +2953,7 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         let case_target = postgres
-            .insert_buggy_payment_pair(case_target, "op_1", &provider_objects)
+            .insert_buggy_payment_pair(case_target, &operation_id, &provider_objects)
             .await
             .expect("reconciliation persists both provider objects for one operation");
         let report = postgres
@@ -1274,175 +2966,47 @@ mod tests {
     async fn run_reference_app_checkout(
         postgres: &TruthSpikePostgres,
         case_name: &DatabaseName,
+        plan: &ReplayPlan,
         reset_sequence: u64,
-        confirm_sequence: u64,
     ) -> SnapshotReport {
-        let client = reqwest::Client::new();
         let control_base = std::env::var("TIV_FIXTURE_CONTROL_URL")
             .unwrap_or_else(|_| "http://127.0.0.1:12112".to_owned());
         let app_base = std::env::var("TIV_REFERENCE_APP_URL")
             .unwrap_or_else(|_| "http://127.0.0.1:18080".to_owned());
-        reset_fixture(&client, &control_base, reset_sequence).await;
-        drive_reference_checkout(&client, &app_base, case_name).await;
-        assert_fixture_control_is_isolated(&client, &app_base).await;
-        let attempts = confirm_fixture(&client, &control_base, confirm_sequence).await;
-        deliver_webhook_attempts(&client, &app_base, &attempts).await;
-        let provider_objects = fixture_provider_projection(&client, &control_base).await;
+        let config = ReferenceAppReplayConfig::new(
+            case_name.clone(),
+            &app_base,
+            &control_base,
+            "run-scoped-control-token",
+            reset_sequence,
+            reset_sequence + 1,
+            current_unix_timestamp(),
+        )
+        .expect("the reference app replay config is valid");
+        let receipt = run_reference_app_replay(plan, &config)
+            .await
+            .expect("the trace drives the real reference app");
+        let provider_objects = receipt
+            .provider_payment_intents()
+            .iter()
+            .map(|payment_intent| {
+                ProviderPaymentIntent::new(
+                    payment_intent.id(),
+                    payment_intent
+                        .operation_id()
+                        .expect("the fixture object retains operation metadata"),
+                    payment_intent.amount_minor(),
+                    payment_intent.currency(),
+                    payment_intent.status(),
+                )
+                .expect("the fixture projection is valid")
+            })
+            .collect::<Vec<_>>();
 
         postgres
             .check_reference_invariants(case_name, &provider_objects, quiescence())
             .await
             .expect("the real app path reaches the five-query oracle")
-    }
-
-    async fn reset_fixture(client: &reqwest::Client, control_base: &str, sequence: u64) {
-        const CONTROL_TOKEN: &str = "run-scoped-control-token";
-        let reset = client
-            .post(format!("{control_base}/v1/control/reset"))
-            .header("X-Tiv-Control-Token", CONTROL_TOKEN)
-            .json(&serde_json::json!({
-                "command_sequence": sequence,
-                "seed": 42,
-                "outcomes": ["commit_then_close", "normal"]
-            }))
-            .send()
-            .await
-            .expect("the host reaches the loopback-only fixture control listener");
-        assert_eq!(reset.status(), StatusCode::OK);
-    }
-
-    async fn drive_reference_checkout(
-        client: &reqwest::Client,
-        app_base: &str,
-        case_name: &DatabaseName,
-    ) {
-        let checkout = client
-            .post(format!("{app_base}/checkout"))
-            .json(&serde_json::json!({
-                "database": case_name.as_str(),
-                "operation_id": "op_1",
-                "amount_minor": 2500,
-                "currency": "usd"
-            }))
-            .send()
-            .await
-            .expect("the host reaches the real reference application");
-        assert_eq!(checkout.status(), StatusCode::OK);
-        let checkout: serde_json::Value = checkout.json().await.expect("checkout returns JSON");
-        assert!(
-            checkout["payment_intent_id"]
-                .as_str()
-                .is_some_and(|id| id.starts_with("pi_tiv_"))
-        );
-    }
-
-    async fn assert_fixture_control_is_isolated(client: &reqwest::Client, app_base: &str) {
-        let isolation_probe = client
-            .get(format!("{app_base}/probe-fixture-control"))
-            .send()
-            .await
-            .expect("the app reports its control-network probe");
-        assert_eq!(isolation_probe.status(), StatusCode::OK);
-        let isolation_probe: serde_json::Value = isolation_probe
-            .json()
-            .await
-            .expect("the isolation probe is JSON");
-        assert_eq!(isolation_probe["reachable"], false);
-    }
-
-    async fn confirm_fixture(
-        client: &reqwest::Client,
-        control_base: &str,
-        sequence: u64,
-    ) -> Vec<serde_json::Value> {
-        const CONTROL_TOKEN: &str = "run-scoped-control-token";
-        let confirmation = client
-            .post(format!("{control_base}/v1/control/confirm-all"))
-            .header("X-Tiv-Control-Token", CONTROL_TOKEN)
-            .json(&serde_json::json!({
-                "command_sequence": sequence,
-                "timestamp": 1_700_000_000
-            }))
-            .send()
-            .await
-            .expect("the host confirms the fixture objects");
-        assert_eq!(confirmation.status(), StatusCode::OK);
-        let confirmation: serde_json::Value = confirmation
-            .json()
-            .await
-            .expect("the signed attempts are JSON");
-        let attempts = confirmation["attempts"]
-            .as_array()
-            .expect("confirmation exports attempts");
-        assert_eq!(attempts.len(), 2);
-        attempts.clone()
-    }
-
-    async fn deliver_webhook_attempts(
-        client: &reqwest::Client,
-        app_base: &str,
-        attempts: &[serde_json::Value],
-    ) {
-        for attempt in attempts {
-            let raw_body = hex::decode(
-                attempt["raw_body_hex"]
-                    .as_str()
-                    .expect("the attempt carries raw bytes"),
-            )
-            .expect("the raw-body transport is valid hex");
-            let delivery = client
-                .post(format!("{app_base}/webhooks/stripe"))
-                .header(
-                    "Stripe-Signature",
-                    attempt["signature_header"]
-                        .as_str()
-                        .expect("the attempt carries a signature"),
-                )
-                .body(raw_body)
-                .send()
-                .await
-                .expect("the exact signed bytes reach the app handler");
-            assert_eq!(delivery.status(), StatusCode::OK);
-        }
-    }
-
-    async fn fixture_provider_projection(
-        client: &reqwest::Client,
-        control_base: &str,
-    ) -> Vec<ProviderPaymentIntent> {
-        const CONTROL_TOKEN: &str = "run-scoped-control-token";
-        let state = client
-            .get(format!("{control_base}/v1/control/state"))
-            .header("X-Tiv-Control-Token", CONTROL_TOKEN)
-            .send()
-            .await
-            .expect("the host reads the bounded provider projection");
-        assert_eq!(state.status(), StatusCode::OK);
-        let state: serde_json::Value = state.json().await.expect("fixture state is JSON");
-        let provider_objects = state["payment_intents"]
-            .as_array()
-            .expect("fixture state carries provider objects")
-            .iter()
-            .map(|payment_intent| {
-                ProviderPaymentIntent::new(
-                    payment_intent["id"]
-                        .as_str()
-                        .expect("the provider ID is present"),
-                    payment_intent["amount_minor"]
-                        .as_i64()
-                        .expect("the amount is present"),
-                    payment_intent["currency"]
-                        .as_str()
-                        .expect("the currency is present"),
-                    payment_intent["status"]
-                        .as_str()
-                        .expect("the status is present"),
-                )
-                .expect("the fixture projection is valid")
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(provider_objects.len(), 2);
-        provider_objects
     }
 
     fn provider_uniqueness_failure(report: &SnapshotReport) -> &InvariantOutcome {
@@ -1455,5 +3019,15 @@ mod tests {
 
     fn quiescence() -> QuiescencePermit {
         QuiescencePermit::after_synthetic_driver_stopped()
+    }
+
+    fn current_unix_timestamp() -> i64 {
+        i64::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("the system clock is after the Unix epoch")
+                .as_secs(),
+        )
+        .expect("the current Unix timestamp fits in i64")
     }
 }

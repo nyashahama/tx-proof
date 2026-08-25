@@ -6,6 +6,7 @@ reference-projects/
 
 # Local database baselines
 *.pgdump
+.tiv/
 
 # Node / Next.js
 node_modules/

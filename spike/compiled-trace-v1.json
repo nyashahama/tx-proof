@@ -1,6 +1,39 @@
 {
   "schema_version": 1,
   "seed": 7,
-  "actions": [],
-  "captured": []
+  "actions": [
+    {
+      "id": 1,
+      "kind": "DriveCheckout",
+      "dependencies": [],
+      "inputs": [],
+      "declared_outputs": ["PaymentIntentId"]
+    },
+    {
+      "id": 2,
+      "kind": "ConfirmPaymentIntent",
+      "dependencies": [1],
+      "inputs": [
+        {
+          "slot": "PaymentIntentId",
+          "source": {
+            "action_id": 1,
+            "slot": "PaymentIntentId"
+          }
+        }
+      ],
+      "declared_outputs": []
+    }
+  ],
+  "captured": [
+    {
+      "output_ref": {
+        "action_id": 1,
+        "slot": "PaymentIntentId"
+      },
+      "value": {
+        "PaymentIntentId": "pi_tiv_7dc6fb6eb37270c34d739b91"
+      }
+    }
+  ]
 }

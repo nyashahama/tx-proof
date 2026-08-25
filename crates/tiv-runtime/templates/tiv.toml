@@ -1,0 +1,117 @@
+# TxProof configuration v1.
+# Replace every TODO mapping with this disposable repository's real boundary.
+# Store only environment-variable names here; never paste credentials or keys.
+# Add .tiv/ to this repository's .gitignore before the first run.
+schema_version = 1
+
+[run]
+cases = 20
+seed = 424242
+max_actions_per_case = 40
+case_timeout = "90s"
+parallelism = 1
+artifact_dir = ".tiv/runs"
+
+[safety]
+mode = "local_disposable_only"
+deny_public_ips = true
+deny_live_stripe_keys = true
+database_name_prefix = "tiv_case_"
+require_database_marker = true
+max_database_bytes = 2147483648
+
+[compose]
+# TODO: map the repository's disposable Compose file and exact service names.
+project_name = "tiv-local-disposable"
+files = ["compose.yaml"]
+application_service = "app"
+postgres_service = "postgres"
+worker_services = []
+health_url = "http://127.0.0.1:8080/healthz"
+health_timeout = "30s"
+
+[database]
+admin_url_env = "TIV_POSTGRES_ADMIN_URL"
+case_url_env = "DATABASE_URL"
+strategy = "template_then_dump_fallback"
+case_database = "tiv_case_checkout"
+baseline_database = "tiv_base_checkout"
+invariant_role = "tiv_invariant"
+quiescence_sql = "quiescence.sql"
+quiescence_stable_for = "500ms"
+quiescence_timeout = "10s"
+statement_timeout = "2s"
+lock_timeout = "500ms"
+
+[stripe]
+adapter = "payment_intent_v1"
+api_version = "2026-02-25.clover"
+# TODO: map the internal fixture service and application webhook route.
+application_base_url = "http://stripe-fixture:12111"
+webhook_url = "http://app:8080/webhooks/stripe"
+webhook_secret_env = "TIV_STRIPE_WEBHOOK_SECRET"
+# TODO: map the host-only fixture control listener and its secret environment.
+control_url = "http://127.0.0.1:12112"
+control_token_env = "TIV_FIXTURE_CONTROL_TOKEN"
+poll_interval = "10ms"
+
+[driver]
+# TODO: replace the URL and checkout.json body with one synthetic money operation.
+method = "POST"
+url = "http://127.0.0.1:8080/api/checkout"
+body_file = "checkout.json"
+timeout = "10s"
+
+[faults.webhooks]
+duplicate_max = 3
+allow_reorder = true
+allow_drop = true
+delay_ms = [0, 10, 100, 1000, 5000]
+
+[faults.stripe_api]
+outcomes = [
+  "normal",
+  "pre_execute_429",
+  "pre_execute_500",
+  "post_execute_500",
+  "commit_then_close",
+  "commit_then_delay",
+]
+
+[faults.process]
+service = "app"
+max_kills_per_case = 1
+cut_points = [
+  "client_request_forwarded",
+  "client_response_observed",
+  "webhook_request_forwarded",
+  "webhook_response_observed",
+  "sql_probe",
+]
+sql_probe_file = "kill_probe.sql"
+
+# TODO: replace all five fail-closed SQL templates with repository-owned queries.
+[[invariants]]
+id = "provider-object-unique"
+sql_file = "invariants/01_provider_object_unique.sql"
+expect = "zero_rows"
+
+[[invariants]]
+id = "webhook-effect-at-most-once"
+sql_file = "invariants/02_webhook_effect_at_most_once.sql"
+expect = "zero_rows"
+
+[[invariants]]
+id = "paid-order-amount-conservation"
+sql_file = "invariants/03_paid_order_amount_conservation.sql"
+expect = "zero_rows"
+
+[[invariants]]
+id = "terminal-success-monotonic"
+sql_file = "invariants/04_terminal_success_monotonic.sql"
+expect = "zero_rows"
+
+[[invariants]]
+id = "balanced-ledger"
+sql_file = "invariants/05_balanced_ledger.sql"
+expect = "zero_rows"

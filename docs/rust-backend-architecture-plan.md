@@ -316,6 +316,27 @@ The action vocabulary is intentionally closed in v0:
 
 Async outcomes may fill values already reserved by the plan, but do not request new random choices.
 
+A business action carries an action-scoped provider script, rather than one
+provider outcome. This is required because the reference checkout performs one
+internal retry after a transport close before the business request returns.
+The v1 script is bounded to one call, or exactly two calls where the first is
+`commit_then_close`; each committed call reserves a distinct, occurrence-indexed
+PaymentIntent output in the compiled trace. The terminal script outcome drives
+the next business phase, while ambiguity and provider-object cardinality include
+every call in the script.
+
+Before an effect executes, the runtime resolves every occurrence-indexed input
+binding from prior captures and passes the exact value to the adapter. Provider
+retrieval and confirmation therefore operate on the PaymentIntent named by the
+compiled trace; they never rediscover an implicit "active" object.
+
+The loopback provider HTTP adapter checks both sides of every planned outcome:
+the driver/provider status or transport result, and the fixture state delta.
+That includes exact fault-queue consumption, object cardinality and identity,
+operation metadata, confirmation status, held-gate lifecycle, and the invariant
+that retrieval consumes no fault. A mismatch is an execution failure rather
+than an accepted approximation.
+
 ### Fixture
 
 The fixture is a single-writer actor. Its state includes:
@@ -344,6 +365,128 @@ Webhook behavior:
 - order is controlled at the event-attempt layer, not at packet level;
 - a drop means no delivery before the declared reconciliation horizon.
 
+The reference application preserves each authenticated provider event ID in a
+durable `processed_webhook_events` relation, records authenticated attempts in
+`webhook_deliveries`, and records business-effect applications separately in
+`webhook_effects`. Each attempt first claims the primary-key event ID with
+`INSERT ... ON CONFLICT DO NOTHING`, then inserts a delivery through the exact
+event/operation composite foreign key. A colliding event ID for another
+operation therefore aborts before payment state can change. The repaired row-1
+mode applies the effect only when the event claim succeeds; the faulty mode
+applies it on every identity-valid delivery. Each delivery has an
+application-generated UUID. Applied effects create a delivery-bound
+`ledger_entries` header and fixed `ledger_postings`: a
+`processor_clearing` debit and `order_payment_liability` credit for the exact
+positive amount and currency. Composite foreign keys bind the journal header
+to the authenticated delivery and order value, and postings back to the header
+value. Faulty row-6 mode writes a new debit-only header on a duplicate whose
+effect is already deduplicated; repaired mode writes nothing for that
+duplicate. All writes share one transaction, and the application role has
+insert-only access to these relations; the read-only invariant role alone can
+enumerate them. Duplicate-effect and one-sided-ledger faults are mutually
+exclusive at process startup, so health never advertises a fault hidden by
+branch precedence.
+
+The row-4 caller pair is independently selected once at process startup. After
+a successful checkout response is durably observed and the application is
+SIGKILLed before caller acknowledgement, faulty mode treats the caller retry as
+a new provider create. Repaired mode instead queries the synthetic fixture by
+the immutable operation metadata, creates only when the lookup is empty, fails
+closed on multiple or paginated matches, and reuses the one validated
+PaymentIntent.
+The local `payments` relation enforces uniqueness for the operation/provider
+pair and uses a conflict-safe insert, so recovery cannot duplicate the local
+representation. The temporary provider projection carries that validated
+operation ID, and `provider-object-unique` starts from provider state before it
+left-joins local payments, so duplicate provider objects remain visible even
+when no local row represents one. This operation search is a bounded fixture
+protocol for the reference proof, not a statement about a general Stripe
+metadata-search API.
+
+The row-5 reconciliation pair is also startup-only. Every checkout starts a
+bounded watchdog that holds one application-role database session, making the
+repository quiescence predicate false until the payment settles or the
+five-second synthetic horizon closes. Webhook delivery marks the exact provider
+object settled and releases the watchdog immediately, so existing delivered
+event cases do not pay the horizon. In faulty mode a dropped provider success
+leaves the matching payment pending until the horizon and the provider-led
+`paid-order-amount-conservation` query reports succeeded provider value with no
+locally succeeded value. Repaired mode polls only the exact validated provider
+object and updates only the matching payment status through the existing
+least-privilege grant before releasing the watchdog. The compressed five-second
+horizon is reference configuration, not a universal customer deadline.
+
+The row-2 terminal-state pair uses a dedicated stale-event capability that is
+off by default. For one provider object the fixture retains two immutable event
+snapshots with explicit provider-created order: non-terminal at `0`, success at
+`1`. A ten-action full-capability campaign generates both and reorders their
+delivery so success arrives before the older snapshot. Each first-seen event is
+recorded in `payment_status_history` with provider-created order, application
+arrival identity, whether the transition was applied, and local status after
+the decision. Faulty mode applies arrival order and records a durable success
+to pending regression; repaired mode records the older event without applying
+it. Repaired provider reconciliation is held constant so current value
+converges and `terminal-success-monotonic` is decided from exact causal history.
+The strict synthetic allowlist retains that history witness row under the same
+per-attempt evidence budget as ledger witnesses.
+
+The implemented action-level control slice uses two exact, sequenced commands:
+`generate-event` confirms the PaymentIntent resolved from the compiled trace and
+captures its immutable event ID; `deliver-event` signs that exact event with a
+fresh timestamp and makes the fixture perform the application-facing HTTP
+request. The runtime keeps a deterministic per-case queue for delay, reorder,
+drop, delivery, and duplication. It never receives an application webhook URL
+or forwards the signed body itself. Both HTTP clients ignore ambient proxies,
+reject redirects, and use bounded timeouts. A non-2xx application response
+fails the delivery action without removing the pending event.
+
+The serial case HTTP adapter owns the provider and webhook adapters together.
+After each successful effect it transfers the exact validated fixture command
+sequence to the other adapter, preventing a later webhook command from
+replaying a sequence already consumed by a provider-gate release. The
+reference application also exposes only the supported PaymentIntent confirm
+and retrieve routes as a bounded proxy to its internal fixture address. Its
+repaired caller mode also uses the fixture's exact operation-metadata search
+route internally; that route is never exposed through the application proxy.
+The proxy preserves provider status/body and propagates a real upstream
+transport close by ending the driver connection; the host does not receive a
+fixture data-plane port.
+
+The reference planned-case runner validates the compiled plan before mutation,
+installs the exact flattened provider fault scripts, and executes the full
+serial plan into a durable journal. It supports two honest process cut points:
+`client_request_forwarded` after the fixture has committed and held its
+response, and `client_response_observed` after the driver has validated and
+durably journaled an application response while its logical delivery remains
+blocked. The runner sends SIGKILL to the exact locally attested application
+container, proves that container stopped, starts the same container, and waits
+for both application health and full three-service re-attestation. Releasing
+the provider gate must then end the killed in-flight driver request without a
+manufactured response. Case-derived operation identity and a narrow durable
+order read let a restarted application recover webhook routing from PostgreSQL
+instead of process RAM.
+
+Webhook-response cut points are supported only when immediately owned by a
+real fixture delivery. The reference SQL probe is supported only around the
+initial checkout: it proves the case-owned payment predicate false before the
+action, observes the first true value through `tiv_invariant`, and journals it
+before the immediately following kill. Abstract placements remain unsupported
+and are rejected before stack inspection or database provisioning. The
+reference-only
+quiescence gate requires no held provider request, no queued webhook, no held
+fixture gate, no unexplained unused provider outcome, and a validated provider
+projection. A recovered caller request accounts exactly for its intentionally
+unconsumed planned create outcome; any other remainder is an execution error.
+The final checkpoint yields the unforgeable permit consumed by the existing
+five-query PostgreSQL oracle. Self-contained public runs allocate the next
+authenticated fixture sequence so multiple commands can run serially on the
+same isolated stack.
+
+This slice is proven through real loopback fixture and application endpoints
+and the live Compose reference runner. Durable fixture delivery-attempt history
+and the configured customer-repository SQL file remain later integration
+boundaries.
+
 The proposed fixture topology has separate data and control listeners. The data listener is reachable by the SUT on an internal Compose network. The control listener is published only to loopback and requires an unlogged run token plus a monotonic command sequence. Control DTOs are versioned. The truth spike must prove that this protocol is necessary and portable before it becomes part of trace compatibility.
 
 Normal health/control HTTP can use ordinary request handling. The provider data path uses Hyper's lower-level connection API because `commit_then_close` must mutate the provider model and then end the TCP connection without manufacturing an HTTP response. The truth spike must prove the exact behavior against a real client before the abstraction is generalized.
@@ -360,13 +503,23 @@ Supported cut points are external and honest:
 - webhook response observed but designated unacknowledged by the logical sender;
 - customer SQL probe first becomes true.
 
-At a cut point, the responsible driver/fixture task records the observation and blocks on a gate. The orchestrator persists it, invokes:
+At an implemented cut point, the responsible driver/fixture task records the observation and blocks on a gate. The orchestrator persists it, invokes:
 
 ```text
 docker compose --project-name <exact> ... kill --signal SIGKILL <configured-service>
 ```
 
-and then releases or closes the held operation according to the trace. Restart uses an explicit Compose command followed by both Compose-state and application-health checks.
+and then releases or closes the held operation according to the trace. The
+current reference runner implements `client_request_forwarded`, the
+application-checkout form of `client_response_observed`, and the
+fixture-delivery form of `webhook_response_observed`. It also implements the
+repository-owned `sql_probe_file` resolved from the typed project
+configuration. The predicate must be parameter-free, begin false immediately
+before its owning action, and first become true through a committed read-only
+snapshot under the freshly attested invariant role. The runner uses
+the already-attested local Docker container ID rather than ambient Docker
+context. Restart starts that exact stopped container, then repeats full Docker
+attestation and application-health checks before execution continues.
 
 The report calls these “observable external cut points.” It makes no source-line or instruction-level crash claim.
 
@@ -412,7 +565,7 @@ Preferred reset:
 
 PostgreSQL requires no connected sessions on the template source while copying. Template cloning is therefore a capability proven by `doctor`, not an assumption.
 
-Fallback reset uses a custom-format `pg_dump` and `pg_restore --single-transaction --exit-on-error`. `doctor` verifies client/server version compatibility. The baseline dump is trusted local test input, mode `0600`, excluded from CI artifacts, and deleted by cleanup.
+Fallback reset uses a custom-format `pg_dump` and `pg_restore --single-transaction --exit-on-error`. `doctor` verifies client/server version compatibility. The baseline dump is trusted local test input, mode `0600`, excluded from CI artifacts, and deleted by the process-owned `BaselineArchive` lifecycle. The artifact-only `tiv cleanup` command does not scan or recover temporary baseline archives.
 
 Transactions, exported snapshots, copied live volumes, and rollback of one connection are not accepted as whole-application reset strategies.
 
@@ -487,7 +640,51 @@ Artifacts are built in a private staging directory. The journal begins as recove
   replay.txt
 ```
 
-The manifest binds tool and adapter versions, trace schema, repository commit and relevant dirty hash, Compose hash, container digests, PostgreSQL facts, invariant hashes, config hash, OS/architecture, database identity, fixture image digest, and safety attestation.
+The manifest binds tool and adapter versions, trace schema, repository commit and an explicitly scoped worktree-status fingerprint, Compose hash, container digests, PostgreSQL facts, invariant hashes, config hash, OS/architecture, database identity, fixture image digest, and safety attestation. The status fingerprint is not described as a dirty-content hash: execution-relevant inputs are bound separately through the redacted configuration, compatibility document, and typed authority-file digests.
+
+### Implemented manifest-v2 provenance contract
+
+New configured campaign, replay, shrink, and minimized-replay artifacts emit
+strict manifest schema `2`; the verifier continues to accept existing complete schema-`1`
+artifacts. A complete v2 manifest records one typed artifact kind, one coherent
+result, and its exact public exit code. Campaigns may be `held` (`0`) or
+`counterexample` (`10`); configured and minimized replays may be `counterexample` (`10`) or
+`inconclusive` (`4`); shrinks may additionally be `budget_exhausted` (`11`).
+Partial artifacts have no result or exit code and cannot be inspected as
+complete artifacts.
+
+Repository provenance is diagnostic metadata, never mutation authority. It
+records the resolved Git commit, `clean` or `dirty`, and the BLAKE3 digest of
+the exact bytes returned by `git status --porcelain=v1 -z --untracked-files=all
+--ignore-submodules=none`. The manifest tags that digest with format
+`git_porcelain_v1_z` and scope
+`tracked_index_worktree_and_non_ignored_untracked_with_non_recursive_submodules`.
+This binds status codes and paths, including non-ignored untracked entries, but
+does not bind dirty file contents or recursively attest submodule contents.
+Relevant executed configuration remains bound by `config.redacted.json` and
+`compatibility.json`. The bounded Git probe clears the inherited environment,
+keeps only the executable search path and fixed locale/Git controls, suppresses
+Git output from errors, and fails before execution after five seconds or one
+MiB of status output. Capture occurs under the Compose-project lock and, for
+replay and shrink, after compatibility attestation immediately before staging.
+
+The finalizer derives every bound digest from its own indexed-file map. Complete
+artifacts require both the redacted configuration and compatibility document;
+only then may safety state be
+`initial_execution_boundary_attested`. An earlier partial run uses
+`not_reached`. Authority roles are fixed to canonical files:
+`campaign-plan.json`, `cases/case_*/trace.json`, `source.json`,
+`trace.original.json`, and optional or required `trace.minimized.json`, according
+to artifact kind. Replay, shrink, and minimized-replay manifests contain exactly
+one cryptographic source-artifact identity; campaign manifests contain none. The
+verifier rejects incoherent kind/result/exit-code, source-count,
+role/path/schema, safety, or digest combinations.
+
+These checks provide bounded local integrity and provenance for a finalized
+directory. They are not a signature, transparency log, or hostile same-user
+chain of custody. A same-user filesystem or worktree race remains possible;
+consumers therefore reverify indexed bytes when reading them, and compatibility
+plus the disposable-database safety boundary—not Git metadata—govern execution.
 
 Redaction is structural:
 
@@ -495,6 +692,11 @@ Redaction is structural:
 - authorization values, keys, passwords, run tokens, and webhook secrets have non-serializable types;
 - raw customer request/response bodies are hashed by default;
 - exact fixture-generated webhook bytes may be stored because the test-data contract is synthetic, but secret-bearing metadata is excluded;
+- configured attempts persist one private violation-only witness bundle;
+  generic repository rows are digest/count-only, while exact rows require the
+  strict synthetic reference-ledger allowlist and share an 8 KiB per-attempt
+  cap with explicit omission/truncation metadata; reports expose only identity
+  and count;
 - truncation is explicit and hashed; silent truncation is prohibited.
 
 ### Error, classification, and exit contracts
@@ -518,13 +720,189 @@ tiv init
 tiv doctor [--config tiv.toml]
 tiv baseline [--config tiv.toml]
 tiv run [--seed U64] [--cases N] [--ci]
-tiv replay PATH [--attempts N]
-tiv shrink PATH [--max-candidates N] [--max-time 10m]
+tiv replay configured --artifact PATH [--config tiv.toml] --case N
+tiv replay minimized --artifact SHRINK_PATH [--config tiv.toml]
+tiv shrink configured --artifact REPLAY_PATH [--config tiv.toml] [--max-candidates N] [--max-time 10m]
 tiv inspect PATH
-tiv cleanup --run RUN_ID
+tiv cleanup --run RUN_ID [--config tiv.toml]
 ```
 
 `replay` fails before mutation if the compatibility fingerprint is missing or incompatible. `inspect` never executes customer code.
+
+### Implemented complete-artifact inspection contract
+
+`tiv inspect PATH` is a synchronous, read-only trust-boundary command. It
+accepts only a finalized complete run directory whose private permissions,
+manifest (schema `1` or `2`), bounded file set, exact byte digests, checksum
+index, and v1 compatibility document all verify. Partial, corrupt, malformed, oversized, or
+unsafe artifacts fail with exit `2` and no success document on standard output.
+
+Successful inspection emits a versioned JSON receipt containing only the run
+ID, complete status, verification flags, and indexed-file count. It does not
+load project configuration, inspect evidence payloads, contact Docker or
+PostgreSQL, or execute customer code. Paths, compatibility contents, summary
+contents, filenames, and digests are deliberately excluded from the public
+receipt so that inspection cannot turn secret-bearing evidence into CLI output.
+
+### Implemented exact-run artifact cleanup contract
+
+`tiv cleanup --run RUN_ID [--config tiv.toml]` is an explicit, idempotent
+artifact-deletion command. `RUN_ID` is parsed with the existing run-identity
+grammar; paths, separators, staging names, globs, uppercase text, and traversal
+are rejected. The selected target is always derived as the exact child
+`<configured artifact_dir>/<run-id>` after loading the configuration. Cleanup
+does not create a missing artifact directory.
+
+Before deletion, cleanup acquires the configured Compose-project lock, rejects
+the repository root as an artifact base, rejects any symlinked or non-private
+artifact-directory component, refuses a matching staging directory, and runs
+the complete-artifact verifier over the target.
+Partial, corrupt, malformed, oversized, permission-unsafe, or otherwise
+unverifiable evidence is preserved with exit `2`. A held project lock or an I/O
+failure exits `3` without a success receipt.
+
+The runtime scans only verified complete sibling artifacts in the same
+configured artifact directory. If a manifest-v2 sibling cryptographically
+identifies the selected run as its source, cleanup refuses to remove that
+source. A verified, unreferenced target is removed, the parent directory is
+synced, and success is reported only after the exact path is absent. A missing
+target is a successful `already_absent` no-op, so retrying the same command is
+safe. The versioned JSON receipt contains only `status` and `run_id`; it never
+prints configuration or filesystem paths.
+
+This v0 command is intentionally artifact-only. It never invokes Docker,
+Compose, PostgreSQL, baseline reset, or temporary-archive recovery; it never
+deletes staging, partial, or corrupt evidence; and it does not implement
+age-based retention, global graph traversal, `--force`, or cross-artifact-root
+reference discovery. Baseline dump files remain process-owned temporary data
+removed by their existing lifecycle. Same-user filesystem replacement races
+remain outside the local-integrity threat model, and an operating-system error
+during recursive removal can leave an incomplete target that later cleanup
+will refuse rather than misreport as successfully removed.
+
+### Implemented configured-shrink contract
+
+`tiv shrink configured` accepts only a complete, checksum-valid configured-replay
+artifact. It loads and validates that source before configuration or stack access,
+then repeats the compatibility and disposable-database safety boundary before any
+mutation. The source trace bytes are copied unchanged into the shrink artifact;
+shrinking never overwrites its input.
+
+The runtime first re-executes the original trace three times from fresh baselines.
+Fewer than two matching failures produces `source_inconclusive` and exit `4`, with
+no candidate accepted. Once the source is reproducible, each deterministic,
+dependency-valid candidate also receives three fresh-baseline attempts and is
+accepted only when the same invariant fails at the same checkpoint in at least
+two attempts. `complete` means the representable frontier finished within the
+configured bounds; it is a bounded counterexample reduction, not proof of a
+global minimum.
+
+Both limits are fixed v1 safety bounds: `--max-candidates` accepts `1..=60`, and
+`--max-time` accepts `1ms..=10m`. One time budget starts immediately before the
+original three-attempt recheck and is shared by all candidate attempts. No new
+attempt starts after that deadline, and supervised case execution is capped by
+the lesser of the configured case timeout and the remaining shrink time. An
+already-started database safety operation or mandatory process recovery is
+allowed to finish after the deadline rather than being abandoned mid-mutation.
+Preflight, compatibility attestation, and initial evidence staging occur before
+the shrink timer starts.
+
+Completed outcomes are intentionally distinct:
+
+- exit `10`, `complete`: the source remained reproducible and the bounded
+  representable frontier was exhausted, whether or not a smaller candidate was
+  accepted;
+- exit `11`, `budget_exhausted`: the reproducible source is retained, but the
+  candidate count, time budget, or internal 60-candidate frontier cap stopped
+  the search;
+- exit `4`, `source_inconclusive`: the original trace did not reproduce the same
+  failure in at least two fresh attempts before evaluation completed.
+
+The finalized bundle records the original attempts, every fully evaluated
+candidate and its three attempts, cache and acceptance counts, the exact failure
+identity, both budgets, the untouched original trace, and an optional minimized
+trace. It uses the normal manifest/checksum verifier and allowlisted evidence
+projections.
+
+The current v1 transform vocabulary can delete dependency-valid action chunks;
+remove optional retries, retrievals, gates, webhook duplication/reordering, and
+crash/restart pairs; reduce or remove webhook delay; turn a dropped webhook into
+delivery; and simplify two-call or faulting provider scripts. It does not yet
+change the source amount, currency, or operation identity, move an action or
+crash cut point, synthesize metadata variants, or remove mandatory business-flow
+actions rejected by replay validation. Those are future transform families, not
+implicit claims of the present search.
+
+### Implemented minimized-replay contract
+
+`tiv replay minimized` accepts only a complete manifest-v2 configured-shrink
+artifact whose result is `counterexample` or `budget_exhausted` and whose
+manifest binds exactly one canonical `trace.minimized.json` authority. Merely
+indexing a file with that name is insufficient. Before configuration or stack
+access, the loader reverifies the artifact and source identity, parses both
+trace authorities, proves the minimized candidate descends from the untouched
+original plan, and checks the shrink source, summary, candidate, evaluation,
+per-attempt result, and per-attempt trace documents for exact coherence.
+
+The selected candidate is then executed exactly three times. Every attempt uses
+a freshly reset disposable baseline; compatibility is attested before the first
+attempt and recaptured exactly before attempts two and three. Each execution
+must match the minimized trace's replay authority and is classified against the
+same invariant/checkpoint identity recorded by shrink. Stable 3/3 and
+reproducible 2/3 conclusions exit `10`; fewer than two matching failures is
+`inconclusive` and exits `4`.
+
+The command writes a new, non-overwriting manifest-v2
+`configured_minimized_replay` artifact. Its source identity binds the shrink
+artifact, its canonical authorities bind `source.json` and the byte-identical
+minimized trace, and its allowlisted evidence retains three journals, traces,
+results, and a summary without secret-bearing configuration. Execution failure,
+divergence, interruption, or compatibility drift after staging retains
+finalized partial evidence under the existing failure-class contract; an
+initial compatibility rejection occurs before staging and emits no artifact.
+This is repeatable bounded counterexample execution, not proof of a global
+minimum or of correctness.
+
+### Implemented human and CI report bundle contract
+
+Every newly finalized configured campaign, replay, shrink, and minimized-replay
+artifact writes three derived files before checksums and the manifest:
+`summary.md`, `junit.xml`, and `replay.txt`. They are ordinary indexed evidence,
+not replay authorities. The existing typed `summary.json` remains the structured
+run record. Partial artifacts receive an explicitly partial report bundle; this
+does not add a manifest result, complete status, or replay authority.
+
+One allowlisted in-memory result model drives both the Markdown and JUnit
+renderers. Campaign JUnit contains one testcase per case/invariant outcome;
+replay and shrink reports contain the classified expected-failure check. Held
+checks pass, reproducible counterexamples are failures, inconclusive results are
+skipped, and a shrink-budget exhaustion remains a failed counterexample with
+exit `11`. JUnit properties repeat the artifact kind, result, run ID, and exact
+public exit code. `quick-xml` performs attribute and text escaping; fixture tests
+parse the emitted XML and bind held (`0`), counterexample (`10`), exhausted
+(`11`), and inconclusive (`4`) semantics to the same report conclusion.
+Configuration (`2`), infrastructure (`3`), and interrupted (`130`) partial runs
+emit one JUnit error; an inconclusive partial run emits one skipped testcase.
+Their report names the allowlisted failure code and completed-work counts, but
+never claims a product conclusion or emits an executable replay command.
+
+The Markdown report includes the allowlisted failure identity, bounded witness
+row count when the campaign has it, attempt/candidate/action counts, configured
+budget, replay stability, determinism boundary, exclusions, and the explicit
+“bounded counterexample search—not proof” claim. It never copies raw witness
+values, request bodies, journals, configuration, environment, URLs, SQL, or
+credentials.
+
+`replay.txt` and the Markdown report emit only real current CLI invocations.
+Paths beneath the recorded configuration directory are rendered relative to
+that directory; an explicitly supplied source outside it remains an exact
+absolute path. Dynamic arguments use POSIX single-quote escaping, including
+embedded apostrophes, and control-character or non-UTF-8 paths fail closed.
+Configured campaign/replay reports emit `tiv replay configured`; shrink reports
+emit the exact bounded shrink command and, when a minimized authority exists,
+`tiv replay minimized`; minimized-replay reports point back to the verified
+source shrink artifact. Every mutable command still performs complete-artifact,
+compatibility, and disposable-database safety checks before mutation.
 
 ## Concurrency, cancellation, and resource budgets
 
@@ -623,6 +1001,52 @@ One small synthetic checkout application exposes feature flags for these bugs:
 6. repeated effect creates a one-sided ledger entry.
 
 Each has a paired corrected mode. Acceptance requires the faulty mode to produce the named invariant and checkpoint, the minimized trace to reproduce at least 2/3, and the corrected mode to pass the same compiled regression.
+
+Current implementation status (2026-08-25): all six rows have explicit
+startup-only faulty/repaired pairs. Row 1 uses campaign seed `1792` to deliver
+and duplicate one immutable event. Its faulty mode records two durable effect
+applications and violates `webhook-effect-at-most-once`; its repaired mode
+atomically deduplicates through the provider event ID and records one effect.
+The faulty trace reproduces on 3/3 fresh baselines; bounded shrink rejects a
+candidate that removes the duplicate, accepts a seven-action trace within
+three candidates, and that minimized authority reproduces 3/3.
+Row 2 uses its stale-history configuration with campaign seed `329` and a
+ten-action budget. One PaymentIntent yields older and succeeded immutable
+snapshots; reorder delivers success first. Faulty mode applies the older event
+later and violates only `terminal-success-monotonic`; repaired mode records it
+as unapplied and holds all five invariants. Source and minimized replay are
+stable 3/3, the simplification audit retains reorder plus both deliveries, and
+each violation artifact retains the exact bounded history witness.
+Row 3 uses campaign seed `69` for one checkout script (`commit_then_close`, then
+`normal`). Its faulty mode creates two provider objects and violates
+`provider-object-unique`; its repaired mode preserves both planned attempt
+outputs while aliasing them to one provider object and immutable event. Each
+repaired execution finalizes a verified artifact with all five configured
+invariants held. Row 4 uses campaign seed `422` to observe a successful checkout
+response, SIGKILL the application before caller acknowledgement, restart, and
+retry the business request. Its faulty per-request mode creates two provider
+objects and two local payment rows, violating only `provider-object-unique`.
+Its repaired mode searches by immutable operation metadata, recovers exactly
+one provider object without consuming the planned retry create outcome, and
+retains one local payment row with all five invariants held. Source replay and
+the minimized authority are stable 3/3; the bounded shrink retains both the
+response-observed kill and caller retry. Row 5 uses campaign seed `359` to
+generate and drop one immutable success event. Its webhook-only mode holds the
+case through the five-second horizon, leaves one pending payment, and violates
+only `paid-order-amount-conservation`; its repaired provider poll converges to
+one succeeded payment with all five invariants held. Source replay and the
+minimized authority are stable 3/3, and the minimized schedule retains the
+causal drop. Row 6 reuses seed `1792` with repaired
+retry/effect modes. Its faulty ledger mode records a balanced first entry and a
+debit-only duplicate, violating only `balanced-ledger`; its repaired mode
+records one balanced entry.
+The source, replay, shrink, minimized replay, and repaired artifacts are
+verified; each violation artifact retains the exact bounded ledger row plus its
+witness digest. Both replay forms are stable 3/3, the actual seven-action
+minimized authority retains the duplicate, and the duplicate-removal candidate
+is rejected. The six-row reference application implementation gate is closed;
+release still requires the branch-level quality, PostgreSQL, and Compose jobs
+to pass on the integrated stack.
 
 ## Implementation sequence
 

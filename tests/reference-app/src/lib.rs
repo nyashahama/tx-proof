@@ -1,4 +1,11 @@
-use std::{collections::BTreeMap, error::Error, fmt, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    error::Error,
+    fmt,
+    str::FromStr,
+    sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use bytes::Bytes;
 use hmac::{Hmac, KeyInit, Mac};
@@ -14,7 +21,11 @@ use hyper_util::rt::TokioIo;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use tokio::{net::TcpStream, sync::Mutex, time::timeout};
-use tokio_postgres::{Client, NoTls};
+use tokio_postgres::{Client, NoTls, Transaction};
+use uuid::Uuid;
+
+const DRIVER_ACTION_ID_HEADER: &str = "X-Tiv-Action-Id";
+const WEBHOOK_INGRESS_CAPABILITY_HEADER: &str = "X-Tiv-Webhook-Ingress-Capability";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReferenceDatabaseName(String);
@@ -44,6 +55,25 @@ impl ReferenceDatabaseName {
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    /// Returns the operation identity reserved for this generated case.
+    #[must_use]
+    pub fn operation_id(&self) -> String {
+        format!("op_{}", self.0.trim_start_matches("tiv_case_"))
+    }
+
+    /// Recovers the only generated case that may own an operation identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReferenceAppError::InvalidDatabaseName`] unless the operation
+    /// uses the exact case-derived identity grammar.
+    pub fn from_operation_id(value: &str) -> Result<Self, ReferenceAppError> {
+        let suffix = value
+            .strip_prefix("op_")
+            .ok_or(ReferenceAppError::InvalidDatabaseName)?;
+        Self::parse(format!("tiv_case_{suffix}"))
     }
 }
 
@@ -106,6 +136,269 @@ impl CheckoutOperation {
     }
 }
 
+/// Controls whether an ambiguous provider create is retried with the known
+/// faulty changed key or the repaired original key.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum RetryKeyMode {
+    /// Reproduces the reference bug by changing the key after a transport
+    /// failure.
+    #[default]
+    FaultyChangedKey,
+    /// Reuses the original key so an executed provider request is not repeated.
+    RepairedSameKey,
+}
+
+impl RetryKeyMode {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::FaultyChangedKey => "faulty_changed_key",
+            Self::RepairedSameKey => "repaired_same_key",
+        }
+    }
+}
+
+impl FromStr for RetryKeyMode {
+    type Err = InvalidRetryKeyMode;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "faulty_changed_key" => Ok(Self::FaultyChangedKey),
+            "repaired_same_key" => Ok(Self::RepairedSameKey),
+            _ => Err(InvalidRetryKeyMode),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InvalidRetryKeyMode;
+
+impl fmt::Display for InvalidRetryKeyMode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("invalid reference-app retry-key mode")
+    }
+}
+
+impl Error for InvalidRetryKeyMode {}
+
+/// Controls whether a new caller request blindly starts another provider
+/// create or first recovers an object already committed for the operation.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum CallerRetryMode {
+    /// Reproduces the bug by assigning every caller request a fresh scope.
+    #[default]
+    FaultyPerRequest,
+    /// Recovers an existing provider object by immutable operation metadata.
+    RepairedRecoverOperation,
+}
+
+impl CallerRetryMode {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::FaultyPerRequest => "faulty_per_request",
+            Self::RepairedRecoverOperation => "repaired_recover_operation",
+        }
+    }
+}
+
+impl FromStr for CallerRetryMode {
+    type Err = InvalidCallerRetryMode;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "faulty_per_request" => Ok(Self::FaultyPerRequest),
+            "repaired_recover_operation" => Ok(Self::RepairedRecoverOperation),
+            _ => Err(InvalidCallerRetryMode),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InvalidCallerRetryMode;
+
+impl fmt::Display for InvalidCallerRetryMode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("invalid reference-app caller-retry mode")
+    }
+}
+
+impl Error for InvalidCallerRetryMode {}
+
+/// Controls whether provider success depends only on webhook delivery or is
+/// also reconciled from provider state within a bounded horizon.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ReconciliationMode {
+    /// Reproduces the bug by leaving a dropped success event unreconciled.
+    #[default]
+    FaultyWebhookOnly,
+    /// Polls the exact provider object and converges local payment state.
+    RepairedProviderReconcile,
+}
+
+impl ReconciliationMode {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::FaultyWebhookOnly => "faulty_webhook_only",
+            Self::RepairedProviderReconcile => "repaired_provider_reconcile",
+        }
+    }
+}
+
+impl FromStr for ReconciliationMode {
+    type Err = InvalidReconciliationMode;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "faulty_webhook_only" => Ok(Self::FaultyWebhookOnly),
+            "repaired_provider_reconcile" => Ok(Self::RepairedProviderReconcile),
+            _ => Err(InvalidReconciliationMode),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InvalidReconciliationMode;
+
+impl fmt::Display for InvalidReconciliationMode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("invalid reference-app reconciliation mode")
+    }
+}
+
+impl Error for InvalidReconciliationMode {}
+
+/// Controls whether webhook arrival order may regress a terminal success.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum TerminalStateMode {
+    /// Reproduces the bug by applying every event snapshot in arrival order.
+    #[default]
+    FaultyArrivalOrder,
+    /// Preserves terminal success when an older non-terminal snapshot arrives.
+    RepairedMonotonic,
+}
+
+impl TerminalStateMode {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::FaultyArrivalOrder => "faulty_arrival_order",
+            Self::RepairedMonotonic => "repaired_monotonic",
+        }
+    }
+}
+
+impl FromStr for TerminalStateMode {
+    type Err = InvalidTerminalStateMode;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "faulty_arrival_order" => Ok(Self::FaultyArrivalOrder),
+            "repaired_monotonic" => Ok(Self::RepairedMonotonic),
+            _ => Err(InvalidTerminalStateMode),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InvalidTerminalStateMode;
+
+impl fmt::Display for InvalidTerminalStateMode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("invalid reference-app terminal-state mode")
+    }
+}
+
+impl Error for InvalidTerminalStateMode {}
+
+/// Controls whether repeated delivery of one authenticated provider event
+/// applies its business effect again or is durably deduplicated.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum WebhookEffectMode {
+    /// Reproduces the reference bug by applying the effect for every delivery.
+    FaultyDuplicateEffect,
+    /// Applies the effect only when the immutable provider event is first seen.
+    #[default]
+    RepairedDeduplicate,
+}
+
+impl WebhookEffectMode {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::FaultyDuplicateEffect => "faulty_duplicate_effect",
+            Self::RepairedDeduplicate => "repaired_deduplicate",
+        }
+    }
+}
+
+impl FromStr for WebhookEffectMode {
+    type Err = InvalidWebhookEffectMode;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "faulty_duplicate_effect" => Ok(Self::FaultyDuplicateEffect),
+            "repaired_deduplicate" => Ok(Self::RepairedDeduplicate),
+            _ => Err(InvalidWebhookEffectMode),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InvalidWebhookEffectMode;
+
+impl fmt::Display for InvalidWebhookEffectMode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("invalid reference-app webhook-effect mode")
+    }
+}
+
+impl Error for InvalidWebhookEffectMode {}
+
+/// Controls how the reference application posts its double-entry ledger.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum LedgerBalanceMode {
+    /// Reproduces a partial repeated-effect write with only the debit side.
+    FaultyOneSidedOnDuplicate,
+    /// Posts one balanced debit/credit pair for the first accepted effect.
+    #[default]
+    RepairedBalancedOnce,
+}
+
+impl LedgerBalanceMode {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::FaultyOneSidedOnDuplicate => "faulty_one_sided_duplicate",
+            Self::RepairedBalancedOnce => "repaired_balanced_once",
+        }
+    }
+}
+
+impl FromStr for LedgerBalanceMode {
+    type Err = InvalidLedgerBalanceMode;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "faulty_one_sided_duplicate" => Ok(Self::FaultyOneSidedOnDuplicate),
+            "repaired_balanced_once" => Ok(Self::RepairedBalancedOnce),
+            _ => Err(InvalidLedgerBalanceMode),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InvalidLedgerBalanceMode;
+
+impl fmt::Display for InvalidLedgerBalanceMode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("invalid reference-app ledger-balance mode")
+    }
+}
+
+impl Error for InvalidLedgerBalanceMode {}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ObservedPaymentIntent {
     id: String,
@@ -142,6 +435,35 @@ impl ObservedPaymentIntent {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ObservedWebhookEvent {
+    id: String,
+    provider_created: i64,
+    payment_intent: ObservedPaymentIntent,
+}
+
+impl ObservedWebhookEvent {
+    #[must_use]
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    #[must_use]
+    pub const fn provider_created(&self) -> i64 {
+        self.provider_created
+    }
+
+    #[must_use]
+    pub const fn payment_intent(&self) -> &ObservedPaymentIntent {
+        &self.payment_intent
+    }
+
+    #[must_use]
+    pub fn into_payment_intent(self) -> ObservedPaymentIntent {
+        self.payment_intent
+    }
+}
+
 /// Deliberately reproduces the reference bug: after an ambiguous transport
 /// failure, the retry changes its idempotency key.
 ///
@@ -154,16 +476,113 @@ pub async fn create_with_changed_retry_key(
     fixture_base_url: &str,
     operation: &CheckoutOperation,
 ) -> Result<ObservedPaymentIntent, ReferenceAppError> {
+    create_with_retry_key_mode_in_scope(
+        client,
+        fixture_base_url,
+        operation,
+        operation.operation_id(),
+        RetryKeyMode::FaultyChangedKey,
+    )
+    .await
+}
+
+/// Executes one provider create with the selected retry-key behavior.
+///
+/// # Errors
+///
+/// Returns [`ReferenceAppError`] when both attempts fail or the fixture returns
+/// an invalid response.
+pub async fn create_with_retry_key_mode(
+    client: &reqwest::Client,
+    fixture_base_url: &str,
+    operation: &CheckoutOperation,
+    retry_key_mode: RetryKeyMode,
+) -> Result<ObservedPaymentIntent, ReferenceAppError> {
+    create_with_retry_key_mode_in_scope(
+        client,
+        fixture_base_url,
+        operation,
+        operation.operation_id(),
+        retry_key_mode,
+    )
+    .await
+}
+
+/// Executes the deliberately faulty provider retry in one caller-owned
+/// business-request scope.
+///
+/// A caller retry is a new business request, so its provider idempotency keys
+/// must not alias the keys used by an earlier planned action. The two provider
+/// attempts inside this request still intentionally use different keys.
+///
+/// # Errors
+///
+/// Returns [`ReferenceAppError`] when both attempts fail or the fixture returns
+/// an invalid response.
+pub async fn create_with_changed_retry_key_for_business_request(
+    client: &reqwest::Client,
+    fixture_base_url: &str,
+    operation: &CheckoutOperation,
+    business_request_id: u32,
+) -> Result<ObservedPaymentIntent, ReferenceAppError> {
+    create_with_retry_key_mode_for_business_request(
+        client,
+        fixture_base_url,
+        operation,
+        business_request_id,
+        RetryKeyMode::FaultyChangedKey,
+    )
+    .await
+}
+
+/// Executes one caller-owned business request with the selected retry-key
+/// behavior.
+///
+/// # Errors
+///
+/// Returns [`ReferenceAppError`] when both attempts fail or the fixture returns
+/// an invalid response.
+pub async fn create_with_retry_key_mode_for_business_request(
+    client: &reqwest::Client,
+    fixture_base_url: &str,
+    operation: &CheckoutOperation,
+    business_request_id: u32,
+    retry_key_mode: RetryKeyMode,
+) -> Result<ObservedPaymentIntent, ReferenceAppError> {
+    let idempotency_scope = format!(
+        "{}-business-{business_request_id}",
+        operation.operation_id()
+    );
+    create_with_retry_key_mode_in_scope(
+        client,
+        fixture_base_url,
+        operation,
+        &idempotency_scope,
+        retry_key_mode,
+    )
+    .await
+}
+
+async fn create_with_retry_key_mode_in_scope(
+    client: &reqwest::Client,
+    fixture_base_url: &str,
+    operation: &CheckoutOperation,
+    idempotency_scope: &str,
+    retry_key_mode: RetryKeyMode,
+) -> Result<ObservedPaymentIntent, ReferenceAppError> {
     let endpoint = format!(
         "{}/v1/payment_intents",
         fixture_base_url.trim_end_matches('/')
     );
-    let first_key = format!("{}-attempt-1", operation.operation_id());
+    let first_key = format!("{idempotency_scope}-attempt-1");
     let first = send_create(client, &endpoint, &first_key, operation).await;
     if let Ok(response) = first {
         decode_provider_response(response, operation).await
     } else {
-        let retry_key = format!("{}-attempt-2", operation.operation_id());
+        let retry_key = match retry_key_mode {
+            RetryKeyMode::FaultyChangedKey => format!("{idempotency_scope}-attempt-2"),
+            RetryKeyMode::RepairedSameKey => first_key,
+        };
         let retry = send_create(client, &endpoint, &retry_key, operation)
             .await
             .map_err(|_| ReferenceAppError::ProviderTransport)?;
@@ -203,11 +622,26 @@ async fn decode_provider_response(
         .json::<PaymentIntentWire>()
         .await
         .map_err(|_| ReferenceAppError::ProviderResponse)?;
+    observed_payment_intent(response, operation)
+}
+
+fn observed_payment_intent(
+    response: PaymentIntentWire,
+    operation: &CheckoutOperation,
+) -> Result<ObservedPaymentIntent, ReferenceAppError> {
+    observed_payment_intent_with_statuses(response, operation, &["requires_confirmation"])
+}
+
+fn observed_payment_intent_with_statuses(
+    response: PaymentIntentWire,
+    operation: &CheckoutOperation,
+    allowed_statuses: &[&str],
+) -> Result<ObservedPaymentIntent, ReferenceAppError> {
     if response.object != "payment_intent"
         || !response.id.starts_with("pi_tiv_")
         || response.amount != operation.amount_minor()
         || response.currency != operation.currency()
-        || response.status != "requires_confirmation"
+        || !allowed_statuses.contains(&response.status.as_str())
         || response.metadata.operation_id != operation.operation_id()
     {
         return Err(ReferenceAppError::ProviderResponse);
@@ -219,6 +653,79 @@ async fn decode_provider_response(
         currency: response.currency,
         status: response.status,
     })
+}
+
+async fn retrieve_payment_intent_for_reconciliation(
+    client: &reqwest::Client,
+    fixture_base_url: &str,
+    expected: &ObservedPaymentIntent,
+) -> Result<ObservedPaymentIntent, ReferenceAppError> {
+    let operation = CheckoutOperation::new(
+        expected.operation_id(),
+        expected.amount_minor(),
+        expected.currency(),
+    )?;
+    let response = client
+        .get(format!(
+            "{}/v1/payment_intents/{}",
+            fixture_base_url.trim_end_matches('/'),
+            expected.id()
+        ))
+        .send()
+        .await
+        .map_err(|_| ReferenceAppError::ProviderTransport)?;
+    if response.status() != StatusCode::OK {
+        return Err(ReferenceAppError::ProviderResponse);
+    }
+    let response = response
+        .json::<PaymentIntentWire>()
+        .await
+        .map_err(|_| ReferenceAppError::ProviderResponse)?;
+    let observed = observed_payment_intent_with_statuses(
+        response,
+        &operation,
+        &["requires_confirmation", "succeeded"],
+    )?;
+    if observed.id() != expected.id() {
+        return Err(ReferenceAppError::ProviderResponse);
+    }
+    Ok(observed)
+}
+
+async fn recover_payment_intent_by_operation(
+    client: &reqwest::Client,
+    fixture_base_url: &str,
+    operation: &CheckoutOperation,
+) -> Result<Option<ObservedPaymentIntent>, ReferenceAppError> {
+    let mut endpoint = reqwest::Url::parse(&format!(
+        "{}/v1/payment_intents/search",
+        fixture_base_url.trim_end_matches('/')
+    ))
+    .map_err(|_| ReferenceAppError::ProviderResponse)?;
+    endpoint
+        .query_pairs_mut()
+        .append_pair("operation_id", operation.operation_id());
+    let response = client
+        .get(endpoint)
+        .send()
+        .await
+        .map_err(|_| ReferenceAppError::ProviderTransport)?;
+    if response.status() != StatusCode::OK {
+        return Err(ReferenceAppError::ProviderResponse);
+    }
+    let response = response
+        .json::<PaymentIntentListWire>()
+        .await
+        .map_err(|_| ReferenceAppError::ProviderResponse)?;
+    if response.object != "list" || response.has_more || response.data.len() > 1 {
+        return Err(ReferenceAppError::ProviderResponse);
+    }
+    response
+        .data
+        .into_iter()
+        .next()
+        .map(|payment_intent| observed_payment_intent(payment_intent, operation))
+        .transpose()
 }
 
 #[derive(Deserialize)]
@@ -236,6 +743,14 @@ struct PaymentIntentWire {
 #[serde(deny_unknown_fields)]
 struct PaymentIntentMetadataWire {
     operation_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PaymentIntentListWire {
+    object: String,
+    data: Vec<PaymentIntentWire>,
+    has_more: bool,
 }
 
 /// Verifies the fixture's narrow `t=...,v1=...` HMAC header over the exact raw
@@ -261,6 +776,15 @@ pub fn verify_webhook_signature(
         .strip_prefix("t=")
         .and_then(|value| value.parse::<i64>().ok())
         .ok_or(ReferenceAppError::InvalidWebhookSignature)?;
+    let timestamp_seconds =
+        u64::try_from(timestamp).map_err(|_| ReferenceAppError::InvalidWebhookSignature)?;
+    let now_seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| ReferenceAppError::InvalidWebhookSignature)?
+        .as_secs();
+    if now_seconds.abs_diff(timestamp_seconds) > WEBHOOK_TIMESTAMP_TOLERANCE_SECONDS {
+        return Err(ReferenceAppError::InvalidWebhookSignature);
+    }
     let signature = signature
         .strip_prefix("v1=")
         .and_then(|value| hex::decode(value).ok())
@@ -288,12 +812,49 @@ pub fn parse_succeeded_webhook(
     signature_header: &str,
     secret: &[u8],
 ) -> Result<ObservedPaymentIntent, ReferenceAppError> {
+    parse_succeeded_webhook_event(raw_body, signature_header, secret)
+        .map(ObservedWebhookEvent::into_payment_intent)
+}
+
+/// Verifies and decodes one supported event while preserving its immutable
+/// provider event identity for durable deduplication.
+///
+/// # Errors
+///
+/// Returns [`ReferenceAppError::InvalidWebhookSignature`] when authenticity
+/// fails, or [`ReferenceAppError::InvalidWebhookEvent`] when the signed bytes
+/// are outside the narrow reference contract.
+pub fn parse_succeeded_webhook_event(
+    raw_body: &[u8],
+    signature_header: &str,
+    secret: &[u8],
+) -> Result<ObservedWebhookEvent, ReferenceAppError> {
+    let event = parse_payment_intent_webhook_event(raw_body, signature_header, secret)?;
+    if event.payment_intent().status() != "succeeded" {
+        return Err(ReferenceAppError::InvalidWebhookEvent);
+    }
+    Ok(event)
+}
+
+fn parse_payment_intent_webhook_event(
+    raw_body: &[u8],
+    signature_header: &str,
+    secret: &[u8],
+) -> Result<ObservedWebhookEvent, ReferenceAppError> {
     verify_webhook_signature(raw_body, signature_header, secret)?;
     let event = serde_json::from_slice::<ProviderEventWire>(raw_body)
         .map_err(|_| ReferenceAppError::InvalidWebhookEvent)?;
     let payment_intent = event.data.object;
+    let supported_transition = matches!(
+        (event.event_type.as_str(), payment_intent.status.as_str()),
+        (
+            "payment_intent.requires_confirmation",
+            "requires_confirmation"
+        ) | ("payment_intent.succeeded", "succeeded")
+    );
     if event.object != "event"
-        || event.event_type != "payment_intent.succeeded"
+        || event.created < 0
+        || !supported_transition
         || !event.id.starts_with("evt_tiv_")
         || payment_intent.object != "payment_intent"
         || !payment_intent.id.starts_with("pi_tiv_")
@@ -303,7 +864,6 @@ pub fn parse_succeeded_webhook(
             .currency
             .bytes()
             .all(|byte| byte.is_ascii_lowercase())
-        || payment_intent.status != "succeeded"
         || CheckoutOperation::new(
             &payment_intent.metadata.operation_id,
             payment_intent.amount,
@@ -313,12 +873,16 @@ pub fn parse_succeeded_webhook(
     {
         return Err(ReferenceAppError::InvalidWebhookEvent);
     }
-    Ok(ObservedPaymentIntent {
-        id: payment_intent.id,
-        operation_id: payment_intent.metadata.operation_id,
-        amount_minor: payment_intent.amount,
-        currency: payment_intent.currency,
-        status: payment_intent.status,
+    Ok(ObservedWebhookEvent {
+        id: event.id,
+        provider_created: event.created,
+        payment_intent: ObservedPaymentIntent {
+            id: payment_intent.id,
+            operation_id: payment_intent.metadata.operation_id,
+            amount_minor: payment_intent.amount,
+            currency: payment_intent.currency,
+            status: payment_intent.status,
+        },
     })
 }
 
@@ -327,6 +891,7 @@ pub fn parse_succeeded_webhook(
 struct ProviderEventWire {
     id: String,
     object: String,
+    created: i64,
     #[serde(rename = "type")]
     event_type: String,
     data: ProviderEventDataWire,
@@ -340,6 +905,10 @@ struct ProviderEventDataWire {
 
 const MAX_APP_REQUEST_BODY_BYTES: usize = 16 * 1024;
 const CONTROL_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
+const RECONCILIATION_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const RECONCILIATION_HORIZON: Duration = Duration::from_secs(5);
+const WEBHOOK_TIMESTAMP_TOLERANCE_SECONDS: u64 = 300;
+const WEBHOOK_DELIVERY_IDENTITY_CONSTRAINT: &str = "webhook_deliveries_event_identity_fkey";
 
 type AppResponseBody = Full<Bytes>;
 
@@ -353,6 +922,12 @@ pub struct ReferenceAppConfig {
     postgres_password: String,
     webhook_secret: Vec<u8>,
     control_probe_address: String,
+    retry_key_mode: RetryKeyMode,
+    caller_retry_mode: CallerRetryMode,
+    reconciliation_mode: ReconciliationMode,
+    terminal_state_mode: TerminalStateMode,
+    webhook_effect_mode: WebhookEffectMode,
+    ledger_balance_mode: LedgerBalanceMode,
 }
 
 impl ReferenceAppConfig {
@@ -396,7 +971,108 @@ impl ReferenceAppConfig {
             postgres_password,
             webhook_secret,
             control_probe_address,
+            retry_key_mode: RetryKeyMode::default(),
+            caller_retry_mode: CallerRetryMode::default(),
+            reconciliation_mode: ReconciliationMode::default(),
+            terminal_state_mode: TerminalStateMode::default(),
+            webhook_effect_mode: WebhookEffectMode::default(),
+            ledger_balance_mode: LedgerBalanceMode::default(),
         })
+    }
+
+    #[must_use]
+    pub const fn with_retry_key_mode(mut self, retry_key_mode: RetryKeyMode) -> Self {
+        self.retry_key_mode = retry_key_mode;
+        self
+    }
+
+    #[must_use]
+    pub const fn retry_key_mode(&self) -> RetryKeyMode {
+        self.retry_key_mode
+    }
+
+    #[must_use]
+    pub const fn with_caller_retry_mode(mut self, caller_retry_mode: CallerRetryMode) -> Self {
+        self.caller_retry_mode = caller_retry_mode;
+        self
+    }
+
+    #[must_use]
+    pub const fn caller_retry_mode(&self) -> CallerRetryMode {
+        self.caller_retry_mode
+    }
+
+    #[must_use]
+    pub const fn with_reconciliation_mode(
+        mut self,
+        reconciliation_mode: ReconciliationMode,
+    ) -> Self {
+        self.reconciliation_mode = reconciliation_mode;
+        self
+    }
+
+    #[must_use]
+    pub const fn reconciliation_mode(&self) -> ReconciliationMode {
+        self.reconciliation_mode
+    }
+
+    #[must_use]
+    pub const fn with_terminal_state_mode(
+        mut self,
+        terminal_state_mode: TerminalStateMode,
+    ) -> Self {
+        self.terminal_state_mode = terminal_state_mode;
+        self
+    }
+
+    #[must_use]
+    pub const fn terminal_state_mode(&self) -> TerminalStateMode {
+        self.terminal_state_mode
+    }
+
+    #[must_use]
+    pub const fn with_webhook_effect_mode(
+        mut self,
+        webhook_effect_mode: WebhookEffectMode,
+    ) -> Self {
+        self.webhook_effect_mode = webhook_effect_mode;
+        self
+    }
+
+    #[must_use]
+    pub const fn webhook_effect_mode(&self) -> WebhookEffectMode {
+        self.webhook_effect_mode
+    }
+
+    #[must_use]
+    pub const fn with_ledger_balance_mode(
+        mut self,
+        ledger_balance_mode: LedgerBalanceMode,
+    ) -> Self {
+        self.ledger_balance_mode = ledger_balance_mode;
+        self
+    }
+
+    #[must_use]
+    pub const fn ledger_balance_mode(&self) -> LedgerBalanceMode {
+        self.ledger_balance_mode
+    }
+
+    /// Rejects a mode tuple whose duplicate-delivery faults have contradictory
+    /// precedence.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReferenceAppError::IncompatibleFaultModes`] when both the
+    /// duplicate-effect and one-sided-ledger faults are selected.
+    pub fn validate_modes(&self) -> Result<(), ReferenceAppError> {
+        if self.webhook_effect_mode == WebhookEffectMode::FaultyDuplicateEffect
+            && self.ledger_balance_mode == LedgerBalanceMode::FaultyOneSidedOnDuplicate
+        {
+            Err(ReferenceAppError::IncompatibleFaultModes)
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -411,6 +1087,7 @@ pub struct ReferenceApp {
     config: ReferenceAppConfig,
     http_client: reqwest::Client,
     operations: Mutex<BTreeMap<String, RegisteredOperation>>,
+    settled_payment_intents: Arc<Mutex<BTreeSet<String>>>,
 }
 
 impl ReferenceApp {
@@ -420,6 +1097,7 @@ impl ReferenceApp {
             config,
             http_client: reqwest::Client::new(),
             operations: Mutex::new(BTreeMap::new()),
+            settled_payment_intents: Arc::new(Mutex::new(BTreeSet::new())),
         }
     }
 
@@ -453,14 +1131,51 @@ impl ReferenceApp {
             .lock()
             .await
             .get(observed.operation_id())
-            .cloned()
-            .ok_or(ReferenceAppError::UnknownOperation)?;
+            .cloned();
+        let registered = match registered {
+            Some(registered) => registered,
+            None => self.recover_registered_operation(observed).await?,
+        };
         if registered.operation.amount_minor() != observed.amount_minor()
             || registered.operation.currency() != observed.currency()
         {
             return Err(ReferenceAppError::OperationConflict);
         }
         Ok(registered)
+    }
+
+    async fn recover_registered_operation(
+        &self,
+        observed: &ObservedPaymentIntent,
+    ) -> Result<RegisteredOperation, ReferenceAppError> {
+        let database = ReferenceDatabaseName::from_operation_id(observed.operation_id())
+            .map_err(|_| ReferenceAppError::UnknownOperation)?;
+        let (client, connection) = self.connect_database(&database).await?;
+        let row = client
+            .query_opt(
+                "SELECT amount_minor, currency FROM orders WHERE operation_id = $1",
+                &[&observed.operation_id()],
+            )
+            .await;
+        drop(client);
+        let connection_result = connection.await;
+        let row = row.map_err(|_| ReferenceAppError::Database)?;
+        connection_result
+            .map_err(|_| ReferenceAppError::Database)?
+            .map_err(|_| ReferenceAppError::Database)?;
+        let row = row.ok_or(ReferenceAppError::UnknownOperation)?;
+        let amount_minor = row.get::<_, i64>(0);
+        let currency = row.get::<_, String>(1);
+        if amount_minor != observed.amount_minor() || currency != observed.currency() {
+            return Err(ReferenceAppError::OperationConflict);
+        }
+        let operation = CheckoutOperation::new(observed.operation_id(), amount_minor, currency)?;
+        self.register_operation(database.clone(), operation.clone())
+            .await?;
+        Ok(RegisteredOperation {
+            database,
+            operation,
+        })
     }
 
     async fn persist_checkout(
@@ -473,7 +1188,8 @@ impl ReferenceApp {
             .execute(
                 "INSERT INTO payments \
                      (operation_id, stripe_payment_intent_id, amount_minor, currency, status) \
-                 VALUES ($1, $2, $3, $4, 'pending')",
+                 VALUES ($1, $2, $3, $4, 'pending') \
+                 ON CONFLICT DO NOTHING",
                 &[
                     &payment_intent.operation_id(),
                     &payment_intent.id(),
@@ -484,52 +1200,120 @@ impl ReferenceApp {
             .await;
         drop(client);
         let connection_result = connection.await;
-        result.map_err(|_| ReferenceAppError::Database)?;
+        let inserted = result.map_err(|_| ReferenceAppError::Database)?;
         connection_result
             .map_err(|_| ReferenceAppError::Database)?
             .map_err(|_| ReferenceAppError::Database)?;
+        if inserted == 1 {
+            self.settled_payment_intents
+                .lock()
+                .await
+                .remove(payment_intent.id());
+        }
+        Ok(())
+    }
+
+    async fn start_reconciliation(
+        &self,
+        database: &ReferenceDatabaseName,
+        payment_intent: &ObservedPaymentIntent,
+    ) -> Result<(), ReferenceAppError> {
+        let (database_client, connection) = self.connect_database(database).await?;
+        let http_client = self.http_client.clone();
+        let fixture_base_url = self.config.fixture_base_url.clone();
+        let payment_intent = payment_intent.clone();
+        let reconciliation_mode = self.config.reconciliation_mode;
+        let settled_payment_intents = Arc::clone(&self.settled_payment_intents);
+        std::mem::drop(tokio::spawn(async move {
+            let _result = reconcile_payment_until_horizon(
+                &http_client,
+                &fixture_base_url,
+                &database_client,
+                &payment_intent,
+                reconciliation_mode,
+                &settled_payment_intents,
+            )
+            .await;
+            drop(database_client);
+            let _connection_result = connection.await;
+        }));
         Ok(())
     }
 
     async fn persist_webhook(
         &self,
         database: &ReferenceDatabaseName,
-        payment_intent: &ObservedPaymentIntent,
+        event: &ObservedWebhookEvent,
     ) -> Result<(), ReferenceAppError> {
+        let payment_intent = event.payment_intent();
+        let delivery_id = Uuid::new_v4();
         let (mut client, connection) = self.connect_database(database).await?;
         let result = async {
             let transaction = client.transaction().await?;
-            let updated = transaction
+            let first_processing = transaction
                 .execute(
-                    "UPDATE payments SET status = 'succeeded' \
-                     WHERE operation_id = $1 AND stripe_payment_intent_id = $2",
-                    &[&payment_intent.operation_id(), &payment_intent.id()],
+                    "INSERT INTO processed_webhook_events \
+                     (provider_event_id, operation_id) \
+                     VALUES ($1, $2) \
+                     ON CONFLICT DO NOTHING",
+                    &[&event.id(), &payment_intent.operation_id()],
+                )
+                .await?
+                == 1;
+            transaction
+                .execute(
+                    "INSERT INTO webhook_deliveries \
+                         (delivery_id, provider_event_id, operation_id) \
+                     VALUES ($1, $2, $3)",
+                    &[&delivery_id, &event.id(), &payment_intent.operation_id()],
                 )
                 .await?;
-            if updated == 0 {
+            if first_processing {
+                persist_payment_status_history(
+                    &transaction,
+                    event,
+                    self.config.terminal_state_mode,
+                )
+                .await?;
+            }
+            let is_success = payment_intent.status() == "succeeded";
+            let applies_effect = is_success
+                && (first_processing
+                    || self.config.webhook_effect_mode == WebhookEffectMode::FaultyDuplicateEffect);
+            if applies_effect {
                 transaction
                     .execute(
-                        "INSERT INTO payments \
-                             (operation_id, stripe_payment_intent_id, amount_minor, currency, status) \
-                         VALUES ($1, $2, $3, $4, 'succeeded')",
-                        &[
-                            &payment_intent.operation_id(),
-                            &payment_intent.id(),
-                            &payment_intent.amount_minor(),
-                            &payment_intent.currency(),
-                        ],
+                        "INSERT INTO webhook_effects (provider_event_id, operation_id) \
+                         VALUES ($1, $2)",
+                        &[&event.id(), &payment_intent.operation_id()],
                     )
                     .await?;
+                persist_ledger_entry(&transaction, delivery_id, event, true).await?;
+            } else if is_success
+                && self.config.ledger_balance_mode == LedgerBalanceMode::FaultyOneSidedOnDuplicate
+            {
+                persist_ledger_entry(&transaction, delivery_id, event, false).await?;
             }
             transaction.commit().await
         }
         .await;
         drop(client);
         let connection_result = connection.await;
-        result.map_err(|_| ReferenceAppError::Database)?;
+        result.map_err(|error| classify_webhook_database_error(&error))?;
         connection_result
             .map_err(|_| ReferenceAppError::Database)?
             .map_err(|_| ReferenceAppError::Database)?;
+        if payment_intent.status() == "succeeded" {
+            self.settled_payment_intents
+                .lock()
+                .await
+                .insert(payment_intent.id().to_owned());
+        } else if self.config.terminal_state_mode == TerminalStateMode::FaultyArrivalOrder {
+            self.settled_payment_intents
+                .lock()
+                .await
+                .remove(payment_intent.id());
+        }
         Ok(())
     }
 
@@ -561,6 +1345,183 @@ impl ReferenceApp {
     }
 }
 
+async fn persist_payment_status_history(
+    transaction: &Transaction<'_>,
+    event: &ObservedWebhookEvent,
+    terminal_state_mode: TerminalStateMode,
+) -> Result<(), tokio_postgres::Error> {
+    let payment_intent = event.payment_intent();
+    let observed_status = payment_intent.status();
+    let local_event_status = if observed_status == "succeeded" {
+        "succeeded"
+    } else {
+        "pending"
+    };
+    transaction
+        .execute(
+            "INSERT INTO payments \
+                 (operation_id, stripe_payment_intent_id, amount_minor, currency, status) \
+             VALUES ($1, $2, $3, $4, $5) \
+             ON CONFLICT DO NOTHING",
+            &[
+                &payment_intent.operation_id(),
+                &payment_intent.id(),
+                &payment_intent.amount_minor(),
+                &payment_intent.currency(),
+                &local_event_status,
+            ],
+        )
+        .await?;
+    let current_status = transaction
+        .query_one(
+            "SELECT status FROM payments \
+             WHERE operation_id = $1 AND stripe_payment_intent_id = $2",
+            &[&payment_intent.operation_id(), &payment_intent.id()],
+        )
+        .await?
+        .get::<_, String>(0);
+    let applied = observed_status == "succeeded"
+        || terminal_state_mode == TerminalStateMode::FaultyArrivalOrder
+        || current_status != "succeeded";
+    let local_status_after = if applied {
+        transaction
+            .execute(
+                "UPDATE payments SET status = $3 \
+                 WHERE operation_id = $1 AND stripe_payment_intent_id = $2",
+                &[
+                    &payment_intent.operation_id(),
+                    &payment_intent.id(),
+                    &local_event_status,
+                ],
+            )
+            .await?;
+        local_event_status.to_owned()
+    } else {
+        current_status
+    };
+    transaction
+        .execute(
+            "INSERT INTO payment_status_history \
+                 (provider_event_id, operation_id, stripe_payment_intent_id, \
+                  provider_created, observed_status, applied, local_status_after) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+            &[
+                &event.id(),
+                &payment_intent.operation_id(),
+                &payment_intent.id(),
+                &event.provider_created(),
+                &observed_status,
+                &applied,
+                &local_status_after,
+            ],
+        )
+        .await?;
+    Ok(())
+}
+
+async fn reconcile_payment_until_horizon(
+    http_client: &reqwest::Client,
+    fixture_base_url: &str,
+    database_client: &Client,
+    expected: &ObservedPaymentIntent,
+    reconciliation_mode: ReconciliationMode,
+    settled_payment_intents: &Mutex<BTreeSet<String>>,
+) -> Result<(), ReferenceAppError> {
+    let deadline = tokio::time::Instant::now() + RECONCILIATION_HORIZON;
+    loop {
+        if settled_payment_intents.lock().await.contains(expected.id()) {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(());
+        }
+        let Ok(observed) = tokio::time::timeout_at(
+            deadline,
+            retrieve_payment_intent_for_reconciliation(http_client, fixture_base_url, expected),
+        )
+        .await
+        else {
+            return Ok(());
+        };
+        if let Ok(observed) = observed
+            && observed.status() == "succeeded"
+            && reconciliation_mode == ReconciliationMode::RepairedProviderReconcile
+        {
+            let updated = database_client
+                .execute(
+                    "UPDATE payments SET status = 'succeeded' \
+                     WHERE operation_id = $1 \
+                       AND stripe_payment_intent_id = $2",
+                    &[&observed.operation_id(), &observed.id()],
+                )
+                .await
+                .map_err(|_| ReferenceAppError::Database)?;
+            if updated != 1 {
+                return Err(ReferenceAppError::Database);
+            }
+            settled_payment_intents
+                .lock()
+                .await
+                .insert(observed.id().to_owned());
+            return Ok(());
+        }
+        tokio::time::sleep(RECONCILIATION_POLL_INTERVAL).await;
+    }
+}
+
+async fn persist_ledger_entry(
+    transaction: &Transaction<'_>,
+    delivery_id: Uuid,
+    event: &ObservedWebhookEvent,
+    include_credit: bool,
+) -> Result<(), tokio_postgres::Error> {
+    let entry_id = Uuid::new_v4();
+    let payment_intent = event.payment_intent();
+    transaction
+        .execute(
+            "INSERT INTO ledger_entries \
+                 (entry_id, delivery_id, provider_event_id, operation_id, \
+                  amount_minor, currency, entry_kind) \
+             VALUES ($1, $2, $3, $4, $5, $6, 'payment_succeeded')",
+            &[
+                &entry_id,
+                &delivery_id,
+                &event.id(),
+                &payment_intent.operation_id(),
+                &payment_intent.amount_minor(),
+                &payment_intent.currency(),
+            ],
+        )
+        .await?;
+    transaction
+        .execute(
+            "INSERT INTO ledger_postings \
+                 (entry_id, account_code, entry_side, amount_minor, currency) \
+             VALUES ($1, 'processor_clearing', 'debit', $2, $3)",
+            &[
+                &entry_id,
+                &payment_intent.amount_minor(),
+                &payment_intent.currency(),
+            ],
+        )
+        .await?;
+    if include_credit {
+        transaction
+            .execute(
+                "INSERT INTO ledger_postings \
+                     (entry_id, account_code, entry_side, amount_minor, currency) \
+                 VALUES ($1, 'order_payment_liability', 'credit', $2, $3)",
+                &[
+                    &entry_id,
+                    &payment_intent.amount_minor(),
+                    &payment_intent.currency(),
+                ],
+            )
+            .await?;
+    }
+    Ok(())
+}
+
 type DatabaseConnection = (
     Client,
     tokio::task::JoinHandle<Result<(), tokio_postgres::Error>>,
@@ -586,10 +1547,22 @@ async fn handle_app_request(
     request: Request<Incoming>,
     app: Arc<ReferenceApp>,
 ) -> Result<Response<AppResponseBody>, AppHttpError> {
+    if provider_proxy_payment_intent_id(request.method(), request.uri().path()).is_some() {
+        return handle_provider_proxy(request, &app).await;
+    }
     match (request.method(), request.uri().path()) {
-        (&Method::GET, "/health") => {
-            json_response(StatusCode::OK, &serde_json::json!({"status": "ok"}))
-        }
+        (&Method::GET, "/health") => json_response(
+            StatusCode::OK,
+            &serde_json::json!({
+                "status": "ok",
+                "retry_key_mode": app.config.retry_key_mode.as_str(),
+                "caller_retry_mode": app.config.caller_retry_mode.as_str(),
+                "reconciliation_mode": app.config.reconciliation_mode.as_str(),
+                "terminal_state_mode": app.config.terminal_state_mode.as_str(),
+                "webhook_effect_mode": app.config.webhook_effect_mode.as_str(),
+                "ledger_balance_mode": app.config.ledger_balance_mode.as_str(),
+            }),
+        ),
         (&Method::GET, "/probe-fixture-control") => {
             let reachable = app.control_listener_is_reachable().await;
             json_response(StatusCode::OK, &serde_json::json!({"reachable": reachable}))
@@ -600,10 +1573,98 @@ async fn handle_app_request(
     }
 }
 
+async fn handle_provider_proxy(
+    request: Request<Incoming>,
+    app: &ReferenceApp,
+) -> Result<Response<AppResponseBody>, AppHttpError> {
+    let method = request.method().clone();
+    let path = request.uri().path().to_owned();
+    if request.uri().query().is_some() {
+        return Ok(text_response(
+            StatusCode::BAD_REQUEST,
+            "invalid provider request",
+        ));
+    }
+    if method == Method::POST
+        && request
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            != Some("application/x-www-form-urlencoded")
+    {
+        return Ok(text_response(
+            StatusCode::BAD_REQUEST,
+            "invalid provider request",
+        ));
+    }
+    let body = Limited::new(request.into_body(), MAX_APP_REQUEST_BODY_BYTES)
+        .collect()
+        .await
+        .map_err(|_| AppHttpError::ProviderResponse)?
+        .to_bytes();
+    if !body.is_empty() {
+        return Ok(text_response(
+            StatusCode::BAD_REQUEST,
+            "invalid provider request",
+        ));
+    }
+    let endpoint = format!(
+        "{}{path}",
+        app.config.fixture_base_url.trim_end_matches('/')
+    );
+    let upstream = app
+        .http_client
+        .request(method, endpoint)
+        .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(body)
+        .send()
+        .await
+        .map_err(|_| AppHttpError::ProviderTransport)?;
+    let status = upstream.status();
+    let content_type = upstream.headers().get(CONTENT_TYPE).cloned();
+    let body = upstream
+        .bytes()
+        .await
+        .map_err(|_| AppHttpError::ProviderResponse)?;
+    if body.len() > MAX_APP_REQUEST_BODY_BYTES {
+        return Err(AppHttpError::ProviderResponse);
+    }
+    let mut response = Response::new(Full::new(body));
+    *response.status_mut() = status;
+    if let Some(content_type) = content_type {
+        response.headers_mut().insert(CONTENT_TYPE, content_type);
+    }
+    Ok(response)
+}
+
+fn valid_payment_intent_id(value: &str) -> bool {
+    let Some(suffix) = value.strip_prefix("pi_tiv_") else {
+        return false;
+    };
+    !suffix.is_empty()
+        && suffix.len() <= 255
+        && suffix
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+}
+
+fn provider_proxy_payment_intent_id<'a>(method: &Method, path: &'a str) -> Option<&'a str> {
+    let path = path.strip_prefix("/v1/payment_intents/")?;
+    let payment_intent_id = match *method {
+        Method::GET if !path.contains('/') => path,
+        Method::POST => path.strip_suffix("/confirm")?,
+        _ => return None,
+    };
+    valid_payment_intent_id(payment_intent_id).then_some(payment_intent_id)
+}
+
 async fn handle_checkout(
     request: Request<Incoming>,
     app: &ReferenceApp,
 ) -> Result<Response<AppResponseBody>, AppHttpError> {
+    let Ok(business_request_id) = driver_business_request_id(&request) else {
+        return Ok(text_response(StatusCode::BAD_REQUEST, "invalid action id"));
+    };
     let Some(command) = decode_json::<CheckoutRequest>(request).await else {
         return Ok(text_response(StatusCode::BAD_REQUEST, "invalid checkout"));
     };
@@ -615,6 +1676,9 @@ async fn handle_checkout(
     else {
         return Ok(text_response(StatusCode::BAD_REQUEST, "invalid checkout"));
     };
+    if operation.operation_id() != database.operation_id() {
+        return Ok(text_response(StatusCode::BAD_REQUEST, "invalid checkout"));
+    }
     if app
         .register_operation(database.clone(), operation.clone())
         .await
@@ -625,10 +1689,45 @@ async fn handle_checkout(
             "operation registration conflict",
         ));
     }
-    let Ok(payment_intent) =
-        create_with_changed_retry_key(&app.http_client, &app.config.fixture_base_url, &operation)
+    let payment_intent = match business_request_id {
+        Some(business_request_id) => {
+            let recovered =
+                if app.config.caller_retry_mode == CallerRetryMode::RepairedRecoverOperation {
+                    recover_payment_intent_by_operation(
+                        &app.http_client,
+                        &app.config.fixture_base_url,
+                        &operation,
+                    )
+                    .await
+                } else {
+                    Ok(None)
+                };
+            match recovered {
+                Ok(Some(payment_intent)) => Ok(payment_intent),
+                Ok(None) => {
+                    create_with_retry_key_mode_for_business_request(
+                        &app.http_client,
+                        &app.config.fixture_base_url,
+                        &operation,
+                        business_request_id,
+                        app.config.retry_key_mode,
+                    )
+                    .await
+                }
+                Err(error) => Err(error),
+            }
+        }
+        None => {
+            create_with_retry_key_mode(
+                &app.http_client,
+                &app.config.fixture_base_url,
+                &operation,
+                app.config.retry_key_mode,
+            )
             .await
-    else {
+        }
+    };
+    let Ok(payment_intent) = payment_intent else {
         return Ok(text_response(StatusCode::BAD_GATEWAY, "provider failure"));
     };
     if app
@@ -641,6 +1740,16 @@ async fn handle_checkout(
             "database failure",
         ));
     }
+    if app
+        .start_reconciliation(&database, &payment_intent)
+        .await
+        .is_err()
+    {
+        return Ok(text_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "reconciliation failure",
+        ));
+    }
     json_response(
         StatusCode::OK,
         &CheckoutResponse {
@@ -648,6 +1757,19 @@ async fn handle_checkout(
             operation_id: payment_intent.operation_id(),
         },
     )
+}
+
+fn driver_business_request_id<B>(request: &Request<B>) -> Result<Option<u32>, ()> {
+    let Some(value) = request.headers().get(DRIVER_ACTION_ID_HEADER) else {
+        return Ok(None);
+    };
+    value
+        .to_str()
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|value| *value > 0)
+        .map(Some)
+        .ok_or(())
 }
 
 async fn handle_webhook(
@@ -662,6 +1784,12 @@ async fn handle_webhook(
     let Some(signature) = signature else {
         return Ok(text_response(StatusCode::UNAUTHORIZED, "invalid signature"));
     };
+    let Ok(ingress_capability) = webhook_ingress_capability(&request) else {
+        return Ok(text_response(
+            StatusCode::BAD_REQUEST,
+            "invalid ingress capability",
+        ));
+    };
     let raw_body = match Limited::new(request.into_body(), MAX_APP_REQUEST_BODY_BYTES)
         .collect()
         .await
@@ -674,32 +1802,87 @@ async fn handle_webhook(
             ));
         }
     };
-    let payment_intent =
-        match parse_succeeded_webhook(&raw_body, &signature, &app.config.webhook_secret) {
-            Ok(payment_intent) => payment_intent,
+    let event =
+        match parse_payment_intent_webhook_event(&raw_body, &signature, &app.config.webhook_secret)
+        {
+            Ok(event) => event,
             Err(ReferenceAppError::InvalidWebhookSignature) => {
                 return Ok(text_response(StatusCode::UNAUTHORIZED, "invalid signature"));
             }
             Err(_) => return Ok(text_response(StatusCode::BAD_REQUEST, "invalid event")),
         };
-    let registered = match app.registered_operation(&payment_intent).await {
+    let payment_intent = event.payment_intent();
+    let registered = match app.registered_operation(payment_intent).await {
         Ok(registered) => registered,
         Err(ReferenceAppError::UnknownOperation) => {
             return Ok(text_response(StatusCode::CONFLICT, "unknown operation"));
         }
         Err(_) => return Ok(text_response(StatusCode::BAD_REQUEST, "event mismatch")),
     };
-    if app
-        .persist_webhook(&registered.database, &payment_intent)
-        .await
-        .is_err()
+    if let Some(capability) = ingress_capability {
+        let callback = app
+            .http_client
+            .post(format!(
+                "{}/v1/tiv/webhook-request-forwarded",
+                app.config.fixture_base_url.trim_end_matches('/')
+            ))
+            .header(WEBHOOK_INGRESS_CAPABILITY_HEADER, capability)
+            .body("")
+            .send()
+            .await;
+        if !callback.is_ok_and(|response| response.status() == StatusCode::NO_CONTENT) {
+            return Ok(text_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "webhook ingress cancelled",
+            ));
+        }
+    }
+    match app.persist_webhook(&registered.database, &event).await {
+        Ok(()) => {}
+        Err(ReferenceAppError::WebhookIdentityConflict) => {
+            return Ok(text_response(
+                StatusCode::CONFLICT,
+                "webhook identity conflict",
+            ));
+        }
+        Err(_) => {
+            return Ok(text_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "database failure",
+            ));
+        }
+    }
+    if payment_intent.status() != "succeeded"
+        && app.config.reconciliation_mode == ReconciliationMode::RepairedProviderReconcile
+        && app
+            .start_reconciliation(&registered.database, payment_intent)
+            .await
+            .is_err()
     {
         return Ok(text_response(
             StatusCode::INTERNAL_SERVER_ERROR,
-            "database failure",
+            "reconciliation failure",
         ));
     }
     json_response(StatusCode::OK, &serde_json::json!({"accepted": true}))
+}
+
+fn webhook_ingress_capability<B>(request: &Request<B>) -> Result<Option<String>, ()> {
+    let Some(value) = request.headers().get(WEBHOOK_INGRESS_CAPABILITY_HEADER) else {
+        return Ok(None);
+    };
+    value
+        .to_str()
+        .ok()
+        .filter(|value| {
+            value.len() == 64
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+        .map(str::to_owned)
+        .map(Some)
+        .ok_or(())
 }
 
 async fn decode_json<T>(request: Request<Incoming>) -> Option<T>
@@ -760,11 +1943,29 @@ struct CheckoutResponse<'a> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AppHttpError {
     Serialization,
+    ProviderTransport,
+    ProviderResponse,
+}
+
+fn classify_webhook_database_error(error: &tokio_postgres::Error) -> ReferenceAppError {
+    if error
+        .as_db_error()
+        .and_then(tokio_postgres::error::DbError::constraint)
+        == Some(WEBHOOK_DELIVERY_IDENTITY_CONSTRAINT)
+    {
+        ReferenceAppError::WebhookIdentityConflict
+    } else {
+        ReferenceAppError::Database
+    }
 }
 
 impl fmt::Display for AppHttpError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("reference app response serialization failed")
+        formatter.write_str(match self {
+            Self::Serialization => "reference app response serialization failed",
+            Self::ProviderTransport => "reference app provider transport failed",
+            Self::ProviderResponse => "reference app provider response failed",
+        })
     }
 }
 
@@ -773,6 +1974,7 @@ impl Error for AppHttpError {}
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReferenceAppError {
     Database,
+    IncompatibleFaultModes,
     InvalidDatabaseName,
     InvalidConfiguration,
     InvalidOperation,
@@ -782,12 +1984,14 @@ pub enum ReferenceAppError {
     ProviderResponse,
     ProviderTransport,
     UnknownOperation,
+    WebhookIdentityConflict,
 }
 
 impl fmt::Display for ReferenceAppError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let message = match self {
             Self::Database => "reference database operation failed",
+            Self::IncompatibleFaultModes => "reference application fault modes are incompatible",
             Self::InvalidDatabaseName => "invalid generated reference database name",
             Self::InvalidConfiguration => "invalid reference application configuration",
             Self::InvalidOperation => "invalid checkout operation",
@@ -797,9 +2001,151 @@ impl fmt::Display for ReferenceAppError {
             Self::ProviderResponse => "invalid provider response",
             Self::ProviderTransport => "provider transport failed",
             Self::UnknownOperation => "webhook operation is not registered",
+            Self::WebhookIdentityConflict => {
+                "provider event identity conflicts with prior processing"
+            }
         };
         formatter.write_str(message)
     }
 }
 
 impl Error for ReferenceAppError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reference_app_config_defaults_to_the_fault_and_can_select_the_repaired_control() {
+        let config = ReferenceAppConfig::new(
+            "http://127.0.0.1:12111",
+            "127.0.0.1",
+            5_432,
+            "tiv_app",
+            "synthetic-app-password",
+            "whsec_test_secret",
+            "127.0.0.1:12112",
+        )
+        .expect("the synthetic config is valid");
+        assert_eq!(config.retry_key_mode(), RetryKeyMode::FaultyChangedKey);
+        assert_eq!(
+            config.caller_retry_mode(),
+            CallerRetryMode::FaultyPerRequest
+        );
+        assert_eq!(
+            config.reconciliation_mode(),
+            ReconciliationMode::FaultyWebhookOnly
+        );
+        assert_eq!(
+            config.terminal_state_mode(),
+            TerminalStateMode::FaultyArrivalOrder
+        );
+        assert_eq!(
+            config.webhook_effect_mode(),
+            WebhookEffectMode::RepairedDeduplicate
+        );
+        assert_eq!(
+            config.ledger_balance_mode(),
+            LedgerBalanceMode::RepairedBalancedOnce
+        );
+
+        let repaired = config
+            .with_retry_key_mode(RetryKeyMode::RepairedSameKey)
+            .with_caller_retry_mode(CallerRetryMode::RepairedRecoverOperation)
+            .with_reconciliation_mode(ReconciliationMode::RepairedProviderReconcile)
+            .with_terminal_state_mode(TerminalStateMode::RepairedMonotonic)
+            .with_webhook_effect_mode(WebhookEffectMode::FaultyDuplicateEffect)
+            .with_ledger_balance_mode(LedgerBalanceMode::FaultyOneSidedOnDuplicate);
+        assert_eq!(repaired.retry_key_mode(), RetryKeyMode::RepairedSameKey);
+        assert_eq!(
+            repaired.caller_retry_mode(),
+            CallerRetryMode::RepairedRecoverOperation
+        );
+        assert_eq!(
+            repaired.reconciliation_mode(),
+            ReconciliationMode::RepairedProviderReconcile
+        );
+        assert_eq!(
+            repaired.terminal_state_mode(),
+            TerminalStateMode::RepairedMonotonic
+        );
+        assert_eq!(
+            repaired.webhook_effect_mode(),
+            WebhookEffectMode::FaultyDuplicateEffect
+        );
+        assert_eq!(
+            repaired.ledger_balance_mode(),
+            LedgerBalanceMode::FaultyOneSidedOnDuplicate
+        );
+    }
+
+    #[test]
+    fn driver_action_identity_is_optional_but_strict_when_present() {
+        let absent = Request::new(());
+        assert_eq!(driver_business_request_id(&absent), Ok(None));
+
+        let valid = Request::builder()
+            .header(DRIVER_ACTION_ID_HEADER, "17")
+            .body(())
+            .unwrap();
+        assert_eq!(driver_business_request_id(&valid), Ok(Some(17)));
+
+        for invalid in ["0", "-1", "1.0", "action-1", " 1"] {
+            let request = Request::builder()
+                .header(DRIVER_ACTION_ID_HEADER, invalid)
+                .body(())
+                .unwrap();
+            assert_eq!(driver_business_request_id(&request), Err(()));
+        }
+    }
+
+    #[test]
+    fn webhook_ingress_capability_is_optional_but_strict_when_present() {
+        let absent = Request::new(());
+        assert_eq!(webhook_ingress_capability(&absent), Ok(None));
+
+        let capability = "a".repeat(64);
+        let valid = Request::builder()
+            .header(WEBHOOK_INGRESS_CAPABILITY_HEADER, &capability)
+            .body(())
+            .unwrap();
+        assert_eq!(webhook_ingress_capability(&valid), Ok(Some(capability)));
+
+        for invalid in ["", "abc", &"A".repeat(64), &"g".repeat(64), &"a".repeat(65)] {
+            let request = Request::builder()
+                .header(WEBHOOK_INGRESS_CAPABILITY_HEADER, invalid)
+                .body(())
+                .unwrap();
+            assert_eq!(webhook_ingress_capability(&request), Err(()));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_fresh_process_routes_a_case_derived_webhook_to_durable_state() {
+        let app = ReferenceApp::new(
+            ReferenceAppConfig::new(
+                "http://127.0.0.1:1",
+                "127.0.0.1",
+                1,
+                "tiv_app",
+                "synthetic-app-password",
+                "whsec_test_secret",
+                "127.0.0.1:1",
+            )
+            .expect("the synthetic config is valid"),
+        );
+        let observed = ObservedPaymentIntent {
+            id: "pi_tiv_restart".to_owned(),
+            operation_id: "op_0123456789abcdef".to_owned(),
+            amount_minor: 2_500,
+            currency: "usd".to_owned(),
+            status: "succeeded".to_owned(),
+        };
+
+        assert_eq!(
+            app.registered_operation(&observed).await,
+            Err(ReferenceAppError::Database),
+            "a valid durable identity must reach PostgreSQL instead of being rejected as unknown RAM"
+        );
+    }
+}

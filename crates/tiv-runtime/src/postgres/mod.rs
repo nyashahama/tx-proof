@@ -1,4 +1,7 @@
+pub(crate) mod archive;
 pub mod oracle;
+pub mod probe;
+pub mod quiescence;
 pub mod safety;
-#[cfg(test)]
-mod spike;
+pub mod snapshot;
+pub(crate) mod spike;

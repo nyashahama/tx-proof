@@ -1,5 +1,148 @@
+use std::time::Duration;
+
 use clap::Parser;
-use tiv_cli::{Cli, Command, TraceCommand};
+use tiv_cli::{
+    BaselineArgs, CleanupArgs, Cli, Command, ConfiguredReplayArgs, ConfiguredShrinkArgs,
+    DoctorArgs, MinimizedReplayArgs, ReferenceAppCaseArgs, ReferenceAppEvidenceArgs,
+    ReferenceAppReplayArgs, ReplayCommand, RunArgs, ShrinkCommand, TraceCommand,
+};
+
+#[test]
+fn the_cli_exposes_configured_campaign_run_with_bounded_optional_overrides() {
+    let default = Cli::try_parse_from(["tiv", "run"]).expect("the run command parses");
+    assert_eq!(
+        default.command,
+        Command::Run(RunArgs {
+            config: "tiv.toml".into(),
+            seed: None,
+            cases: None,
+            ci: false,
+        })
+    );
+
+    let explicit = Cli::try_parse_from([
+        "tiv",
+        "run",
+        "--config",
+        "safe/tiv.toml",
+        "--seed",
+        "99",
+        "--cases",
+        "2",
+        "--ci",
+    ])
+    .expect("the bounded run overrides parse");
+    assert_eq!(
+        explicit.command,
+        Command::Run(RunArgs {
+            config: "safe/tiv.toml".into(),
+            seed: Some(99),
+            cases: Some(2),
+            ci: true,
+        })
+    );
+}
+
+#[test]
+fn the_cli_exposes_the_two_stage_customer_baseline_command() {
+    let challenge = Cli::try_parse_from(["tiv", "baseline", "--config", "safe/tiv.toml"])
+        .expect("the baseline challenge command parses");
+    assert_eq!(
+        challenge.command,
+        Command::Baseline(BaselineArgs {
+            config: "safe/tiv.toml".into(),
+            acknowledge_reset: None,
+        })
+    );
+
+    let acknowledged = Cli::try_parse_from([
+        "tiv",
+        "baseline",
+        "--acknowledge-reset",
+        "RESET exact identity",
+    ])
+    .expect("the exact reset acknowledgement parses as one argument");
+    assert_eq!(
+        acknowledged.command,
+        Command::Baseline(BaselineArgs {
+            config: "tiv.toml".into(),
+            acknowledge_reset: Some("RESET exact identity".to_owned()),
+        })
+    );
+}
+
+#[test]
+fn the_cli_exposes_doctor_with_a_safe_default_config_path() {
+    let default = Cli::try_parse_from(["tiv", "doctor"]).expect("the doctor command parses");
+    assert_eq!(
+        default.command,
+        Command::Doctor(DoctorArgs {
+            config: "tiv.toml".into(),
+        })
+    );
+
+    let explicit = Cli::try_parse_from(["tiv", "doctor", "--config", "safe/tiv.toml"])
+        .expect("the explicit doctor config parses");
+    assert_eq!(
+        explicit.command,
+        Command::Doctor(DoctorArgs {
+            config: "safe/tiv.toml".into(),
+        })
+    );
+}
+
+#[test]
+fn the_cli_exposes_init_without_an_implicit_overwrite_flag() {
+    let cli = Cli::try_parse_from(["tiv", "init"]).expect("the init command parses");
+    assert_eq!(cli.command, Command::Init);
+    assert!(Cli::try_parse_from(["tiv", "init", "--force"]).is_err());
+}
+
+#[test]
+fn the_cli_exposes_read_only_complete_artifact_inspection() {
+    let cli = Cli::try_parse_from(["tiv", "inspect", ".tiv/runs/run_deadbeef"])
+        .expect("the documented artifact inspection command parses");
+
+    assert_eq!(
+        cli.command,
+        Command::Inspect {
+            path: ".tiv/runs/run_deadbeef".into(),
+        }
+    );
+}
+
+#[test]
+fn the_cli_exposes_exact_run_cleanup_with_a_safe_default_config_path() {
+    let default = Cli::try_parse_from(["tiv", "cleanup", "--run", "run_deadbeef"])
+        .expect("the cleanup command parses");
+    assert_eq!(
+        default.command,
+        Command::Cleanup(CleanupArgs {
+            config: "tiv.toml".into(),
+            run: "run_deadbeef".to_owned(),
+        })
+    );
+
+    let explicit = Cli::try_parse_from([
+        "tiv",
+        "cleanup",
+        "--config",
+        "safe/tiv.toml",
+        "--run",
+        "run_0123abcd",
+    ])
+    .expect("the configured cleanup command parses");
+    assert_eq!(
+        explicit.command,
+        Command::Cleanup(CleanupArgs {
+            config: "safe/tiv.toml".into(),
+            run: "run_0123abcd".to_owned(),
+        })
+    );
+
+    assert!(Cli::try_parse_from(["tiv", "cleanup"]).is_err());
+    assert!(Cli::try_parse_from(["tiv", "cleanup", "--run", "run_a", "extra"]).is_err());
+}
 
 #[test]
 fn the_cli_exposes_only_the_narrow_trace_validation_command_for_this_slice() {
@@ -12,6 +155,296 @@ fn the_cli_exposes_only_the_narrow_trace_validation_command_for_this_slice() {
             command: TraceCommand::Validate {
                 path: "compiled-trace.json".into(),
             },
+        }
+    );
+}
+
+#[test]
+fn the_cli_exposes_read_only_replay_inspection_for_compiled_traces() {
+    let cli = Cli::try_parse_from(["tiv", "replay", "inspect", "compiled-trace.json"])
+        .expect("the documented replay inspection command parses");
+
+    assert_eq!(
+        cli.command,
+        Command::Replay {
+            command: ReplayCommand::Inspect {
+                path: "compiled-trace.json".into(),
+            },
+        }
+    );
+}
+
+#[test]
+fn the_cli_exposes_exactly_three_attempts_for_one_configured_artifact_case() {
+    let cli = Cli::try_parse_from([
+        "tiv",
+        "replay",
+        "configured",
+        "--artifact",
+        ".tiv/runs/run_1234",
+        "--config",
+        "safe/tiv.toml",
+        "--case",
+        "7",
+    ])
+    .expect("the compatibility-gated configured replay command parses");
+
+    assert_eq!(
+        cli.command,
+        Command::Replay {
+            command: ReplayCommand::Configured(ConfiguredReplayArgs {
+                artifact: ".tiv/runs/run_1234".into(),
+                config: "safe/tiv.toml".into(),
+                case: 7,
+            }),
+        }
+    );
+    assert!(
+        Cli::try_parse_from([
+            "tiv",
+            "replay",
+            "configured",
+            "--artifact",
+            ".tiv/runs/run_1234",
+            "--config",
+            "safe/tiv.toml",
+        ])
+        .is_err()
+    );
+    assert!(
+        Cli::try_parse_from([
+            "tiv",
+            "replay",
+            "configured",
+            "--artifact",
+            ".tiv/runs/run_1234",
+            "--config",
+            "safe/tiv.toml",
+            "--case",
+            "7",
+            "--attempts",
+            "1",
+        ])
+        .is_err()
+    );
+}
+
+#[test]
+fn the_cli_replays_only_the_authority_bound_minimized_trace() {
+    let cli = Cli::try_parse_from([
+        "tiv",
+        "replay",
+        "minimized",
+        "--artifact",
+        ".tiv/runs/run_shrink",
+        "--config",
+        "safe/tiv.toml",
+    ])
+    .expect("the compatibility-gated minimized replay command parses");
+
+    assert_eq!(
+        cli.command,
+        Command::Replay {
+            command: ReplayCommand::Minimized(MinimizedReplayArgs {
+                artifact: ".tiv/runs/run_shrink".into(),
+                config: "safe/tiv.toml".into(),
+            }),
+        }
+    );
+    assert!(
+        Cli::try_parse_from([
+            "tiv",
+            "replay",
+            "minimized",
+            "--artifact",
+            ".tiv/runs/run_shrink",
+            "--case",
+            "1",
+        ])
+        .is_err()
+    );
+    assert!(
+        Cli::try_parse_from([
+            "tiv",
+            "replay",
+            "minimized",
+            "--artifact",
+            ".tiv/runs/run_shrink",
+            "--attempts",
+            "2",
+        ])
+        .is_err()
+    );
+}
+
+#[test]
+fn the_cli_exposes_bounded_configured_shrink_with_safe_defaults() {
+    let default = Cli::try_parse_from([
+        "tiv",
+        "shrink",
+        "configured",
+        "--artifact",
+        ".tiv/runs/run_replay",
+    ])
+    .expect("the configured shrink command parses");
+    assert_eq!(
+        default.command,
+        Command::Shrink {
+            command: ShrinkCommand::Configured(ConfiguredShrinkArgs {
+                artifact: ".tiv/runs/run_replay".into(),
+                config: "tiv.toml".into(),
+                max_candidates: 60,
+                max_time: Duration::from_secs(600),
+            }),
+        }
+    );
+
+    let explicit = Cli::try_parse_from([
+        "tiv",
+        "shrink",
+        "configured",
+        "--artifact",
+        ".tiv/runs/run_replay",
+        "--config",
+        "safe/tiv.toml",
+        "--max-candidates",
+        "7",
+        "--max-time",
+        "90s",
+    ])
+    .unwrap();
+    assert_eq!(
+        explicit.command,
+        Command::Shrink {
+            command: ShrinkCommand::Configured(ConfiguredShrinkArgs {
+                artifact: ".tiv/runs/run_replay".into(),
+                config: "safe/tiv.toml".into(),
+                max_candidates: 7,
+                max_time: Duration::from_secs(90),
+            }),
+        }
+    );
+
+    for invalid in ["0s", "11m", "forever", "1h"] {
+        assert!(
+            Cli::try_parse_from([
+                "tiv",
+                "shrink",
+                "configured",
+                "--artifact",
+                ".tiv/runs/run_replay",
+                "--max-time",
+                invalid,
+            ])
+            .is_err()
+        );
+    }
+}
+
+#[test]
+fn the_cli_exposes_reference_app_replay_execution_for_prepared_case_databases() {
+    let cli = Cli::try_parse_from([
+        "tiv",
+        "replay",
+        "reference-app",
+        "--trace",
+        "compiled-trace.json",
+        "--case-database",
+        "tiv_case_7dc6fb6e",
+        "--reference-app-url",
+        "http://127.0.0.1:18080",
+        "--fixture-control-url",
+        "http://127.0.0.1:12112",
+        "--fixture-control-token",
+        "run-scoped-control-token",
+        "--reset-sequence",
+        "1",
+        "--confirm-sequence",
+        "2",
+    ])
+    .expect("the bounded reference-app replay command parses");
+
+    assert_eq!(
+        cli.command,
+        Command::Replay {
+            command: ReplayCommand::ReferenceApp(ReferenceAppReplayArgs {
+                trace: "compiled-trace.json".into(),
+                case_database: "tiv_case_7dc6fb6e".to_owned(),
+                reference_app_url: "http://127.0.0.1:18080".to_owned(),
+                fixture_control_url: "http://127.0.0.1:12112".to_owned(),
+                fixture_control_token: "run-scoped-control-token".to_owned(),
+                reset_sequence: 1,
+                confirm_sequence: 2,
+                webhook_timestamp: None,
+            }),
+        }
+    );
+}
+
+#[test]
+fn the_cli_exposes_a_self_contained_reference_app_evidence_run() {
+    let cli = Cli::try_parse_from([
+        "tiv",
+        "replay",
+        "reference-app-evidence",
+        "--trace",
+        "compiled-trace.json",
+        "--postgres-port",
+        "15432",
+        "--reference-app-url",
+        "http://127.0.0.1:18080",
+        "--fixture-control-url",
+        "http://127.0.0.1:12112",
+    ])
+    .expect("the self-contained evidence command parses");
+
+    assert_eq!(
+        cli.command,
+        Command::Replay {
+            command: ReplayCommand::ReferenceAppEvidence(ReferenceAppEvidenceArgs {
+                trace: "compiled-trace.json".into(),
+                postgres_port: 15_432,
+                postgres_admin_role: "tiv_admin".to_owned(),
+                reference_app_url: "http://127.0.0.1:18080".to_owned(),
+                fixture_control_url: "http://127.0.0.1:12112".to_owned(),
+            }),
+        }
+    );
+}
+
+#[test]
+fn the_cli_exposes_an_attested_planned_reference_case_run() {
+    let cli = Cli::try_parse_from([
+        "tiv",
+        "replay",
+        "reference-app-case",
+        "--plan",
+        "planned-case.json",
+        "--journal",
+        "artifacts/case.jsonl",
+        "--config",
+        "safe/tiv.toml",
+        "--postgres-port",
+        "15432",
+        "--reference-app-url",
+        "http://127.0.0.1:18080",
+        "--fixture-control-url",
+        "http://127.0.0.1:12112",
+    ])
+    .expect("the planned reference case command parses");
+
+    assert_eq!(
+        cli.command,
+        Command::Replay {
+            command: ReplayCommand::ReferenceAppCase(ReferenceAppCaseArgs {
+                plan: "planned-case.json".into(),
+                journal: "artifacts/case.jsonl".into(),
+                config: Some("safe/tiv.toml".into()),
+                postgres_port: 15_432,
+                postgres_admin_role: "tiv_admin".to_owned(),
+                reference_app_url: "http://127.0.0.1:18080".to_owned(),
+                fixture_control_url: "http://127.0.0.1:12112".to_owned(),
+            }),
         }
     );
 }
