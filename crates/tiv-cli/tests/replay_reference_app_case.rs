@@ -210,14 +210,24 @@ fn client_response_observed_kill_restarts_and_finishes_the_live_case() {
             )
             .unwrap();
             let plan = CasePlanCompiler::compile(&spec).unwrap();
-            matches!(
+            (matches!(
                 plan.actions()
                     .get(1)
                     .map(tiv_core::plan::PlannedAction::kind),
                 Some(PlanActionKind::KillApplication {
                     cut_point: ProcessCutPoint::ClientResponseObserved
                 })
-            )
+            ) && matches!(
+                plan.actions()
+                    .get(2)
+                    .map(tiv_core::plan::PlannedAction::kind),
+                Some(PlanActionKind::RestartAndAwaitHealth)
+            ) && matches!(
+                plan.actions()
+                    .get(3)
+                    .map(tiv_core::plan::PlannedAction::kind),
+                Some(PlanActionKind::RetryBusinessRequest { .. })
+            ))
             .then_some(plan)
         })
         .expect("the bounded seed corpus contains a response-observed first checkout");
@@ -274,7 +284,7 @@ fn client_response_observed_kill_restarts_and_finishes_the_live_case() {
     assert_eq!(value["seed"], plan.seed().value());
     assert_eq!(value["planned_action_count"], plan.actions().len());
     assert_eq!(value["executed_action_count"], plan.actions().len());
-    assert_eq!(value["provider_object_count"], 1);
+    assert_eq!(value["provider_object_count"], 2);
     assert!(
         value["journal_record_count"]
             .as_u64()
@@ -283,8 +293,16 @@ fn client_response_observed_kill_restarts_and_finishes_the_live_case() {
     assert!(
         value["invariant_outcomes"]
             .as_array()
-            .is_some_and(|outcomes| outcomes.len() == 5
-                && outcomes.iter().all(|outcome| outcome["verdict"] == "held"))
+            .is_some_and(|outcomes| {
+                outcomes.len() == 5
+                    && outcomes.iter().all(|outcome| {
+                        if outcome["invariant_id"] == "provider-object-unique" {
+                            outcome["verdict"] == "violated" && outcome["witness_count"] == 1
+                        } else {
+                            outcome["verdict"] == "held" && outcome["witness_count"] == 0
+                        }
+                    })
+            })
     );
     assert!(journal_path.exists());
     std::fs::remove_file(journal_path).unwrap();
