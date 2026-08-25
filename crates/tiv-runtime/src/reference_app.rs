@@ -247,6 +247,12 @@ async fn attest_reference_app_evidence_modes(
             "{{if eq . \"TIV_REFERENCE_APP_CALLER_RETRY_MODE=repaired_recover_operation\"}}",
             "caller_conflict ",
             "{{end}}",
+            "{{if eq . \"TIV_REFERENCE_APP_RECONCILIATION_MODE=faulty_webhook_only\"}}",
+            "reconciliation ",
+            "{{end}}",
+            "{{if eq . \"TIV_REFERENCE_APP_RECONCILIATION_MODE=repaired_provider_reconcile\"}}",
+            "reconciliation_conflict ",
+            "{{end}}",
             "{{if eq . \"TIV_REFERENCE_APP_WEBHOOK_EFFECT_MODE=repaired_deduplicate\"}}",
             "webhook ",
             "{{end}}",
@@ -272,7 +278,7 @@ fn validate_reference_app_evidence_mode_inspection(
 ) -> Result<(), ReferenceAppEvidenceConfigError> {
     let mut markers = inspection.split_whitespace().collect::<Vec<_>>();
     markers.sort_unstable();
-    if markers == ["caller", "ledger", "retry", "webhook"] {
+    if markers == ["caller", "ledger", "reconciliation", "retry", "webhook"] {
         Ok(())
     } else {
         Err(ReferenceAppEvidenceConfigError::ReferenceStackMismatch)
@@ -1209,22 +1215,27 @@ mod tests {
     #[test]
     fn direct_fault_evidence_accepts_only_the_intended_reference_app_mode_set() {
         assert!(
-            validate_reference_app_evidence_mode_inspection("retry caller webhook ledger\n")
-                .is_ok()
+            validate_reference_app_evidence_mode_inspection(
+                "retry caller reconciliation webhook ledger\n"
+            )
+            .is_ok()
         );
         assert!(
-            validate_reference_app_evidence_mode_inspection("ledger retry webhook caller\n")
-                .is_ok()
+            validate_reference_app_evidence_mode_inspection(
+                "ledger retry webhook reconciliation caller\n"
+            )
+            .is_ok()
         );
         for mismatched in [
             "",
             "retry\n",
-            "retry caller webhook\n",
-            "retry caller ledger\n",
-            "caller webhook ledger\n",
-            "retry retry caller webhook ledger\n",
-            "retry caller webhook ledger caller_conflict\n",
-            "retry caller webhook ledger extra\n",
+            "retry caller webhook ledger\n",
+            "retry caller reconciliation webhook\n",
+            "retry caller reconciliation ledger\n",
+            "caller reconciliation webhook ledger\n",
+            "retry retry caller reconciliation webhook ledger\n",
+            "retry caller reconciliation webhook ledger reconciliation_conflict\n",
+            "retry caller reconciliation webhook ledger extra\n",
         ] {
             assert!(matches!(
                 validate_reference_app_evidence_mode_inspection(mismatched),

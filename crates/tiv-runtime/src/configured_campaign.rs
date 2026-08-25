@@ -2123,4 +2123,78 @@ mod tests {
         preflight_reference_planned_case(campaign.cases()[0].plan(), true, true).unwrap();
         assert_eq!(campaign_seed, 422);
     }
+
+    #[test]
+    fn row_five_campaign_seed_isolates_one_dropped_success_event() {
+        let process_faults = ProcessFaultSpec::new(
+            [
+                ProcessCutPoint::ClientRequestForwarded,
+                ProcessCutPoint::ClientResponseObserved,
+                ProcessCutPoint::WebhookRequestForwarded,
+                ProcessCutPoint::WebhookResponseObserved,
+                ProcessCutPoint::SqlProbe,
+            ],
+            1,
+        )
+        .unwrap();
+        let campaign_seed = 359;
+        let spec = CampaignSpec::new_payment_intent_v1(
+            Seed::new(campaign_seed),
+            CaseCount::new(1).unwrap(),
+            ActionBudget::new(40).unwrap(),
+            [
+                ProviderOutcome::Normal,
+                ProviderOutcome::PreExecute429,
+                ProviderOutcome::PreExecute500,
+                ProviderOutcome::PostExecute500,
+                ProviderOutcome::CommitThenClose,
+                ProviderOutcome::CommitThenDelay,
+            ],
+            WebhookFaultSpec::new(3, [0, 10, 100, 1_000, 5_000], true, true).unwrap(),
+            process_faults,
+        )
+        .unwrap();
+        let campaign = CampaignPlanner::compile(&spec).unwrap();
+        let plan = campaign.cases()[0].plan();
+        preflight_reference_planned_case(plan, true, true).unwrap();
+        let actions = plan.actions();
+        let committed = actions
+            .iter()
+            .filter_map(|action| match action.kind() {
+                tiv_core::plan::PlanActionKind::DriveCheckout { provider_script }
+                | tiv_core::plan::PlanActionKind::RetryBusinessRequest { provider_script } => {
+                    Some(usize::from(provider_script.committed_count()))
+                }
+                _ => None,
+            })
+            .sum::<usize>();
+
+        assert_eq!(committed, 1);
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|action| matches!(
+                    action.kind(),
+                    tiv_core::plan::PlanActionKind::GenerateProviderEvent
+                ))
+                .count(),
+            1
+        );
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|action| matches!(
+                    action.kind(),
+                    tiv_core::plan::PlanActionKind::DropWebhook
+                ))
+                .count(),
+            1
+        );
+        assert!(actions.iter().all(|action| !matches!(
+            action.kind(),
+            tiv_core::plan::PlanActionKind::DeliverWebhook
+                | tiv_core::plan::PlanActionKind::DuplicateWebhook
+                | tiv_core::plan::PlanActionKind::KillApplication { .. }
+        )));
+    }
 }

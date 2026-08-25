@@ -149,6 +149,20 @@ fn provider_uniqueness_query_is_led_by_provider_operation_metadata() {
     assert!(query.contains("COUNT(DISTINCT provider.payment_intent_id)"));
 }
 
+#[test]
+fn paid_order_conservation_is_provider_led_and_status_aware() {
+    let query = include_str!(
+        "../../../tests/configured-run-project/invariants/03_paid_order_amount_conservation.sql"
+    );
+
+    assert!(query.contains("FROM tiv_provider_state AS provider"));
+    assert!(query.contains("LEFT JOIN payments"));
+    assert!(query.contains("provider.status = 'succeeded'"));
+    assert!(query.contains("payments.status = 'succeeded'"));
+    assert!(query.contains("provider_succeeded_amount_minor"));
+    assert!(query.contains("local_succeeded_amount_minor"));
+}
+
 fn valid_queries() -> Vec<InvariantQuery> {
     V1_INVARIANT_IDS
         .into_iter()

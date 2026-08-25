@@ -1,8 +1,8 @@
 use std::{env, error::Error, sync::Arc};
 
 use tiv_reference_app::{
-    CallerRetryMode, LedgerBalanceMode, ReferenceApp, ReferenceAppConfig, RetryKeyMode,
-    WebhookEffectMode, serve_http1_connection,
+    CallerRetryMode, LedgerBalanceMode, ReconciliationMode, ReferenceApp, ReferenceAppConfig,
+    RetryKeyMode, WebhookEffectMode, serve_http1_connection,
 };
 use tokio::net::TcpListener;
 
@@ -19,6 +19,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .map_err(|_| "invalid TIV_POSTGRES_PORT")?;
     let retry_key_mode = retry_key_mode_from_env()?;
     let caller_retry_mode = caller_retry_mode_from_env()?;
+    let reconciliation_mode = reconciliation_mode_from_env()?;
     let webhook_effect_mode = webhook_effect_mode_from_env()?;
     let ledger_balance_mode = ledger_balance_mode_from_env()?;
     let config = ReferenceAppConfig::new(
@@ -32,6 +33,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     )?
     .with_retry_key_mode(retry_key_mode)
     .with_caller_retry_mode(caller_retry_mode)
+    .with_reconciliation_mode(reconciliation_mode)
     .with_webhook_effect_mode(webhook_effect_mode)
     .with_ledger_balance_mode(ledger_balance_mode);
     config.validate_modes()?;
@@ -61,6 +63,16 @@ fn caller_retry_mode_from_env() -> Result<CallerRetryMode, Box<dyn Error>> {
         Err(env::VarError::NotPresent) => Ok(CallerRetryMode::default()),
         Err(env::VarError::NotUnicode(_)) => {
             Err("invalid TIV_REFERENCE_APP_CALLER_RETRY_MODE".into())
+        }
+    }
+}
+
+fn reconciliation_mode_from_env() -> Result<ReconciliationMode, Box<dyn Error>> {
+    match env::var("TIV_REFERENCE_APP_RECONCILIATION_MODE") {
+        Ok(value) => value.parse().map_err(Into::into),
+        Err(env::VarError::NotPresent) => Ok(ReconciliationMode::default()),
+        Err(env::VarError::NotUnicode(_)) => {
+            Err("invalid TIV_REFERENCE_APP_RECONCILIATION_MODE".into())
         }
     }
 }

@@ -19,6 +19,9 @@ fn reference_stack_routes_fixture_webhooks_only_over_the_shared_data_network() {
         "TIV_REFERENCE_APP_CALLER_RETRY_MODE: ${TIV_REFERENCE_APP_CALLER_RETRY_MODE:-faulty_per_request}"
     ));
     assert!(compose.contains(
+        "TIV_REFERENCE_APP_RECONCILIATION_MODE: ${TIV_REFERENCE_APP_RECONCILIATION_MODE:-faulty_webhook_only}"
+    ));
+    assert!(compose.contains(
         "TIV_REFERENCE_APP_WEBHOOK_EFFECT_MODE: ${TIV_REFERENCE_APP_WEBHOOK_EFFECT_MODE:-repaired_deduplicate}"
     ));
     assert!(compose.contains(
@@ -56,6 +59,9 @@ fn reference_workflow_fingerprints_and_restores_the_reference_modes() {
     assert!(workflow.contains("reference-app.ledger-faulty.hash"));
     assert!(workflow.contains("reference-app.caller-repaired.hash"));
     assert!(workflow.contains("if .invariant_id == \"provider-object-unique\" then"));
+    assert!(workflow.contains("reference-app.reconciliation-repaired.hash"));
+    assert!(workflow.contains("TIV_REFERENCE_APP_RECONCILIATION_MODE=repaired_provider_reconcile"));
+    assert!(workflow.contains("'TIV_REFERENCE_APP_RECONCILIATION_MODE=faulty_webhook_only'"));
     assert!(workflow.contains("TIV_REFERENCE_APP_CALLER_RETRY_MODE=repaired_recover_operation"));
     assert!(workflow.contains("'TIV_REFERENCE_APP_CALLER_RETRY_MODE=faulty_per_request'"));
     assert!(workflow.contains("TIV_REFERENCE_APP_LEDGER_MODE=faulty_one_sided_duplicate"));

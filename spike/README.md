@@ -99,22 +99,25 @@ through `TIV_REFERENCE_APP_RETRY_KEY_MODE`. The only accepted values are
 mode. Caller retry behavior is independently startup-only through
 `TIV_REFERENCE_APP_CALLER_RETRY_MODE`, with exact values
 `faulty_per_request` and `repaired_recover_operation`; the faulty mode is the
-default. Webhook business-effect behavior is likewise startup-only through
+default. Reconciliation behavior is startup-only through
+`TIV_REFERENCE_APP_RECONCILIATION_MODE`, with exact values
+`faulty_webhook_only` and `repaired_provider_reconcile`; the webhook-only fault
+is the default. Webhook business-effect behavior is likewise startup-only through
 `TIV_REFERENCE_APP_WEBHOOK_EFFECT_MODE`, with exact values
 `faulty_duplicate_effect` and `repaired_deduplicate`; the repaired mode is the
 default. Ledger posting behavior is startup-only through
 `TIV_REFERENCE_APP_LEDGER_MODE`, with exact values
 `faulty_one_sided_duplicate` and `repaired_balanced_once`; the repaired mode is
 the default. There is no request header or route parameter that can switch any
-behavior inside a run. `/health` reports all four non-secret modes, and the
+behavior inside a run. `/health` reports all five non-secret modes, and the
 direct `reference-app-evidence` command additionally attests the exact
-faulty-key, faulty-caller, repaired-effect, repaired-ledger mode set before it
-labels a changed-key counterexample. The duplicate-effect and one-sided-ledger
+faulty-key, faulty-caller, faulty-reconciliation, repaired-effect,
+repaired-ledger mode set before it labels a changed-key counterexample. The duplicate-effect and one-sided-ledger
 faults are mutually exclusive; selecting both fails process startup rather
 than reporting a mode whose behavior is hidden by branch precedence.
 
 The resolved Compose configuration, and therefore its configuration hash,
-includes all four modes. A command inspecting a non-default stack must receive
+includes all five modes. A command inspecting a non-default stack must receive
 the same environment values; evidence from one mode set is intentionally not
 compatible with a stack resolved under another set.
 
@@ -191,6 +194,27 @@ CARGO_INCREMENTAL=0 cargo test -p tiv-cli --test configured_run \
 This is a bounded synthetic recovery contract. The operation lookup is a
 fixture-only Stripe-shaped endpoint, not a claim that the public Stripe API
 supports arbitrary PaymentIntent lookup by metadata.
+
+The row-five pair uses campaign seed `359`. It creates one PaymentIntent,
+confirms it, generates one immutable success event, and drops that event before
+delivery. A checkout-scoped watchdog holds one real `tiv_app` database session
+until the payment is settled or the declared five-second reconciliation horizon
+closes, so the quiescence predicate cannot classify the fault early. In
+webhook-only mode the local payment remains pending and exactly
+`paid-order-amount-conservation` fails after the horizon. Repaired mode polls
+only the exact validated provider object, updates the matching local payment to
+succeeded through the existing least-privilege status grant, and releases the
+session; all five invariants then hold. Source replay and the minimized
+authority are stable 3/3, and shrink rejects removal of the causal drop:
+
+```sh
+CARGO_INCREMENTAL=0 cargo test -p tiv-cli --test configured_run \
+  row_five_dropped_success_fault_violates_and_reconciliation_converges \
+  -- --ignored --exact --nocapture
+```
+
+The five-second window is an explicit compressed reference horizon, not a
+universal correctness deadline for customer systems.
 
 Then run the real application path:
 

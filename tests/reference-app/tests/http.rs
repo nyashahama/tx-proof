@@ -42,6 +42,7 @@ async fn health_and_control_isolation_probe_do_not_touch_postgres() {
     assert_eq!(health["webhook_effect_mode"], "repaired_deduplicate");
     assert_eq!(health["ledger_balance_mode"], "repaired_balanced_once");
     assert_eq!(health["caller_retry_mode"], "faulty_per_request");
+    assert_eq!(health["reconciliation_mode"], "faulty_webhook_only");
     assert_eq!(probe.status(), StatusCode::OK);
     let probe: serde_json::Value = probe.json().await.expect("the probe is JSON");
     assert_eq!(probe["reachable"], false);
@@ -68,6 +69,7 @@ async fn health_reports_the_process_selected_repaired_retry_key_mode() {
     assert_eq!(health["status"], "ok");
     assert_eq!(health["retry_key_mode"], "repaired_same_key");
     assert_eq!(health["caller_retry_mode"], "faulty_per_request");
+    assert_eq!(health["reconciliation_mode"], "faulty_webhook_only");
     assert_eq!(health["webhook_effect_mode"], "faulty_duplicate_effect");
     assert_eq!(health["ledger_balance_mode"], "repaired_balanced_once");
     await_server(server).await;
@@ -179,6 +181,63 @@ async fn process_startup_selects_the_repaired_caller_retry_mode() {
     assert_eq!(
         observed_mode.as_deref(),
         Some("repaired_recover_operation"),
+        "startup stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[tokio::test]
+async fn process_startup_selects_the_repaired_reconciliation_mode() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    drop(listener);
+    let mut child = Command::new(env!("CARGO_BIN_EXE_tiv-reference-app"))
+        .env("TIV_REFERENCE_APP_BIND", address.to_string())
+        .env("TIV_FIXTURE_BASE_URL", "http://127.0.0.1:1")
+        .env("TIV_FIXTURE_CONTROL_PROBE", "127.0.0.1:1")
+        .env("TIV_POSTGRES_HOST", "127.0.0.1")
+        .env("TIV_POSTGRES_PASSWORD", "synthetic-app-password")
+        .env("TIV_POSTGRES_PORT", "1")
+        .env("TIV_POSTGRES_ROLE", "tiv_app")
+        .env("TIV_REFERENCE_APP_RETRY_KEY_MODE", "repaired_same_key")
+        .env("TIV_REFERENCE_APP_CALLER_RETRY_MODE", "faulty_per_request")
+        .env(
+            "TIV_REFERENCE_APP_RECONCILIATION_MODE",
+            "repaired_provider_reconcile",
+        )
+        .env(
+            "TIV_REFERENCE_APP_WEBHOOK_EFFECT_MODE",
+            "repaired_deduplicate",
+        )
+        .env("TIV_REFERENCE_APP_LEDGER_MODE", "repaired_balanced_once")
+        .env("TIV_WEBHOOK_SECRET", "whsec_test_secret")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("the reference-app binary starts");
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let mut observed_mode = None;
+    for _ in 0..100 {
+        if let Ok(response) = client.get(format!("http://{address}/health")).send().await
+            && response.status() == StatusCode::OK
+        {
+            let health: serde_json::Value = response.json().await.unwrap();
+            observed_mode = health["reconciliation_mode"].as_str().map(str::to_owned);
+            break;
+        }
+        if child.try_wait().unwrap().is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let _ = child.kill();
+    let output = child
+        .wait_with_output()
+        .expect("the reference-app process is reaped");
+
+    assert_eq!(
+        observed_mode.as_deref(),
+        Some("repaired_provider_reconcile"),
         "startup stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );

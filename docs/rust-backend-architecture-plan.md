@@ -403,6 +403,19 @@ when no local row represents one. This operation search is a bounded fixture
 protocol for the reference proof, not a statement about a general Stripe
 metadata-search API.
 
+The row-5 reconciliation pair is also startup-only. Every checkout starts a
+bounded watchdog that holds one application-role database session, making the
+repository quiescence predicate false until the payment settles or the
+five-second synthetic horizon closes. Webhook delivery marks the exact provider
+object settled and releases the watchdog immediately, so existing delivered
+event cases do not pay the horizon. In faulty mode a dropped provider success
+leaves the matching payment pending until the horizon and the provider-led
+`paid-order-amount-conservation` query reports succeeded provider value with no
+locally succeeded value. Repaired mode polls only the exact validated provider
+object and updates only the matching payment status through the existing
+least-privilege grant before releasing the watchdog. The compressed five-second
+horizon is reference configuration, not a universal customer deadline.
+
 The implemented action-level control slice uses two exact, sequenced commands:
 `generate-event` confirms the PaymentIntent resolved from the compiled trace and
 captures its immutable event ID; `deliver-event` signs that exact event with a
@@ -975,7 +988,7 @@ One small synthetic checkout application exposes feature flags for these bugs:
 
 Each has a paired corrected mode. Acceptance requires the faulty mode to produce the named invariant and checkpoint, the minimized trace to reproduce at least 2/3, and the corrected mode to pass the same compiled regression.
 
-Current implementation status (2026-08-25): rows 1, 3, 4, and 6 have explicit
+Current implementation status (2026-08-25): rows 1, 3, 4, 5, and 6 have explicit
 startup-only faulty/repaired pairs. Row 1 uses campaign seed `1792` to deliver
 and duplicate one immutable event. Its faulty mode records two durable effect
 applications and violates `webhook-effect-at-most-once`; its repaired mode
@@ -996,7 +1009,13 @@ Its repaired mode searches by immutable operation metadata, recovers exactly
 one provider object without consuming the planned retry create outcome, and
 retains one local payment row with all five invariants held. Source replay and
 the minimized authority are stable 3/3; the bounded shrink retains both the
-response-observed kill and caller retry. Row 6 reuses seed `1792` with repaired
+response-observed kill and caller retry. Row 5 uses campaign seed `359` to
+generate and drop one immutable success event. Its webhook-only mode holds the
+case through the five-second horizon, leaves one pending payment, and violates
+only `paid-order-amount-conservation`; its repaired provider poll converges to
+one succeeded payment with all five invariants held. Source replay and the
+minimized authority are stable 3/3, and the minimized schedule retains the
+causal drop. Row 6 reuses seed `1792` with repaired
 retry/effect modes. Its faulty ledger mode records a balanced first entry and a
 debit-only duplicate, violating only `balanced-ledger`; its repaired mode
 records one balanced entry.
@@ -1004,7 +1023,7 @@ The source, replay, shrink, minimized replay, and repaired artifacts are
 verified; each violation artifact retains the exact bounded ledger row plus its
 witness digest. Both replay forms are stable 3/3, the actual seven-action
 minimized authority retains the duplicate, and the duplicate-removal candidate
-is rejected. Rows 2 and 5 remain unimplemented, so the six-row
+is rejected. Row 2 remains unimplemented, so the six-row
 reference-app release gate is not closed.
 
 ## Implementation sequence

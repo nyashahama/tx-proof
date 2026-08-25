@@ -35,6 +35,9 @@ const REPAIRED_RETRY_KEY_MODE: &str = "repaired_same_key";
 const CALLER_RETRY_MODE_ENV: &str = "TIV_REFERENCE_APP_CALLER_RETRY_MODE";
 const FAULTY_CALLER_RETRY_MODE: &str = "faulty_per_request";
 const REPAIRED_CALLER_RETRY_MODE: &str = "repaired_recover_operation";
+const RECONCILIATION_MODE_ENV: &str = "TIV_REFERENCE_APP_RECONCILIATION_MODE";
+const FAULTY_RECONCILIATION_MODE: &str = "faulty_webhook_only";
+const REPAIRED_RECONCILIATION_MODE: &str = "repaired_provider_reconcile";
 const WEBHOOK_EFFECT_MODE_ENV: &str = "TIV_REFERENCE_APP_WEBHOOK_EFFECT_MODE";
 const FAULTY_WEBHOOK_EFFECT_MODE: &str = "faulty_duplicate_effect";
 const REPAIRED_WEBHOOK_EFFECT_MODE: &str = "repaired_deduplicate";
@@ -491,6 +494,226 @@ async fn row_four_lost_response_caller_retry_fault_violates_and_recovery_holds()
     );
     assert_row_four_trace(repaired_path);
     assert_reference_payment_relation((1, 1)).await;
+
+    cleanup_reference_databases().await;
+    fs::remove_dir_all(ARTIFACT_ROOT).unwrap();
+    recreate_reference_app_in_all_modes(
+        FAULTY_RETRY_KEY_MODE,
+        FAULTY_CALLER_RETRY_MODE,
+        REPAIRED_WEBHOOK_EFFECT_MODE,
+        REPAIRED_LEDGER_BALANCE_MODE,
+    );
+    restore.disarm();
+}
+
+#[tokio::test]
+#[ignore = "requires the isolated reference-app Compose project"]
+#[allow(clippy::too_many_lines)]
+async fn row_five_dropped_success_fault_violates_and_reconciliation_converges() {
+    let _guard = E2E_LOCK.lock().await;
+    let mut restore = ReferenceAppModeRestore::armed();
+    let _ = fs::remove_dir_all(ARTIFACT_ROOT);
+
+    recreate_reference_app_in_reconciliation_mode(FAULTY_RECONCILIATION_MODE);
+    prepare_reference_baseline().await;
+    reset_fixture_process().await;
+    let faulty_output =
+        run_configured_command_in_reconciliation_mode(359, FAULTY_RECONCILIATION_MODE);
+    assert_eq!(
+        faulty_output.status.code(),
+        Some(10),
+        "the dropped webhook without reconciliation must violate: {}",
+        String::from_utf8_lossy(&faulty_output.stderr)
+    );
+    let faulty_receipt: serde_json::Value =
+        serde_json::from_slice(&faulty_output.stdout).expect("faulty stdout is JSON");
+    let faulty_path = Path::new(faulty_receipt["artifact_path"].as_str().unwrap());
+    verify_complete_run_artifact(faulty_path).expect("the faulty artifact verifies");
+    let faulty_summary: serde_json::Value =
+        serde_json::from_slice(&fs::read(faulty_path.join("summary.json")).unwrap()).unwrap();
+    assert_eq!(faulty_summary["cases"][0]["provider_object_count"], 1);
+    assert!(
+        faulty_summary["cases"][0]["invariants"]
+            .as_array()
+            .is_some_and(|invariants| {
+                invariants.len() == 5
+                    && invariants.iter().all(|invariant| {
+                        if invariant["invariant_id"] == "paid-order-amount-conservation" {
+                            invariant["verdict"] == "violated" && invariant["witness_count"] == 1
+                        } else {
+                            invariant["verdict"] == "held" && invariant["witness_count"] == 0
+                        }
+                    })
+            })
+    );
+    assert_row_five_trace(faulty_path);
+    assert_row_five_fault_horizon(faulty_path);
+    assert_reference_payment_status((1, 0)).await;
+
+    let replay_output =
+        configured_replay_command_in_reconciliation_mode(faulty_path, FAULTY_RECONCILIATION_MODE)
+            .output()
+            .expect("the row-five configured replay executes");
+    assert_eq!(
+        replay_output.status.code(),
+        Some(10),
+        "row-five replay failed: {}",
+        String::from_utf8_lossy(&replay_output.stderr)
+    );
+    let replay_receipt: serde_json::Value =
+        serde_json::from_slice(&replay_output.stdout).expect("replay stdout is JSON");
+    assert_eq!(replay_receipt["attempt_count"], 3);
+    assert_eq!(replay_receipt["matching_failure_count"], 3);
+    assert_eq!(replay_receipt["classification"], "stable");
+    let replay_path = Path::new(replay_receipt["artifact_path"].as_str().unwrap());
+    verify_complete_run_artifact(replay_path).expect("the row-five replay artifact verifies");
+    let replay_summary: serde_json::Value =
+        serde_json::from_slice(&fs::read(replay_path.join("summary.json")).unwrap()).unwrap();
+    assert!(
+        replay_summary["attempts"]
+            .as_array()
+            .is_some_and(|attempts| {
+                attempts.len() == 3
+                    && attempts.iter().all(|attempt| {
+                        attempt["verdict"] == "expected_violation"
+                            && exact_invariant_vector(
+                                attempt,
+                                "paid-order-amount-conservation",
+                                true,
+                            )
+                    })
+            })
+    );
+
+    let shrink_output =
+        configured_shrink_command_in_reconciliation_mode(replay_path, FAULTY_RECONCILIATION_MODE)
+            .output()
+            .expect("the row-five configured shrink executes");
+    assert!(
+        matches!(shrink_output.status.code(), Some(10 | 11)),
+        "row-five shrink failed: {}",
+        String::from_utf8_lossy(&shrink_output.stderr)
+    );
+    let shrink_receipt: serde_json::Value =
+        serde_json::from_slice(&shrink_output.stdout).expect("shrink stdout is JSON");
+    assert!(
+        shrink_receipt["evaluated_candidates"]
+            .as_u64()
+            .is_some_and(|count| (1..=3).contains(&count))
+    );
+    assert!(
+        shrink_receipt["accepted_candidates"]
+            .as_u64()
+            .is_some_and(|count| count >= 1)
+    );
+    assert!(
+        shrink_receipt["best_action_count"].as_u64()
+            < shrink_receipt["original_action_count"].as_u64()
+    );
+    let shrink_path = Path::new(shrink_receipt["artifact_path"].as_str().unwrap());
+    verify_complete_run_artifact(shrink_path).expect("the row-five shrink artifact verifies");
+    let shrink_summary: serde_json::Value =
+        serde_json::from_slice(&fs::read(shrink_path.join("summary.json")).unwrap()).unwrap();
+    for candidate in shrink_summary["candidates"].as_array().unwrap() {
+        let candidate_id = candidate["candidate_id"].as_str().unwrap();
+        let candidate_trace: serde_json::Value = serde_json::from_slice(
+            &fs::read(
+                shrink_path
+                    .join("candidates")
+                    .join(candidate_id)
+                    .join("candidate.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let retains_drop = candidate_trace["schedule"]
+            .as_array()
+            .is_some_and(|schedule| {
+                schedule
+                    .iter()
+                    .any(|action| action["kind"]["kind"] == "drop_webhook")
+            });
+        if !retains_drop {
+            assert_eq!(candidate["accepted"], false);
+        }
+    }
+    let minimized_authority: serde_json::Value =
+        serde_json::from_slice(&fs::read(shrink_path.join("trace.minimized.json")).unwrap())
+            .unwrap();
+    assert!(
+        minimized_authority["candidate"]["schedule"]
+            .as_array()
+            .is_some_and(|schedule| {
+                schedule
+                    .iter()
+                    .any(|action| action["kind"]["kind"] == "drop_webhook")
+            }),
+        "the minimized authority must retain the dropped success event"
+    );
+
+    let minimized_output = configured_minimized_replay_command_in_reconciliation_mode(
+        shrink_path,
+        FAULTY_RECONCILIATION_MODE,
+    )
+    .output()
+    .expect("the row-five minimized replay executes");
+    assert_eq!(
+        minimized_output.status.code(),
+        Some(10),
+        "row-five minimized replay failed: {}",
+        String::from_utf8_lossy(&minimized_output.stderr)
+    );
+    let minimized_receipt: serde_json::Value =
+        serde_json::from_slice(&minimized_output.stdout).expect("minimized stdout is JSON");
+    assert_eq!(minimized_receipt["attempt_count"], 3);
+    assert_eq!(minimized_receipt["matching_failure_count"], 3);
+    assert_eq!(minimized_receipt["classification"], "stable");
+    let minimized_path = Path::new(minimized_receipt["artifact_path"].as_str().unwrap());
+    verify_complete_run_artifact(minimized_path)
+        .expect("the row-five minimized replay artifact verifies");
+    let minimized_summary: serde_json::Value =
+        serde_json::from_slice(&fs::read(minimized_path.join("summary.json")).unwrap()).unwrap();
+    assert!(
+        minimized_summary["attempts"]
+            .as_array()
+            .is_some_and(|attempts| {
+                attempts.len() == 3
+                    && attempts.iter().all(|attempt| {
+                        exact_invariant_vector(attempt, "paid-order-amount-conservation", true)
+                    })
+            })
+    );
+
+    recreate_reference_app_in_reconciliation_mode(REPAIRED_RECONCILIATION_MODE);
+    prepare_reference_baseline().await;
+    reset_fixture_process().await;
+    let repaired_output =
+        run_configured_command_in_reconciliation_mode(359, REPAIRED_RECONCILIATION_MODE);
+    assert_eq!(
+        repaired_output.status.code(),
+        Some(0),
+        "the provider reconciliation control must converge: {}",
+        String::from_utf8_lossy(&repaired_output.stderr)
+    );
+    let repaired_receipt: serde_json::Value =
+        serde_json::from_slice(&repaired_output.stdout).expect("repaired stdout is JSON");
+    let repaired_path = Path::new(repaired_receipt["artifact_path"].as_str().unwrap());
+    verify_complete_run_artifact(repaired_path).expect("the repaired artifact verifies");
+    let repaired_summary: serde_json::Value =
+        serde_json::from_slice(&fs::read(repaired_path.join("summary.json")).unwrap()).unwrap();
+    assert_eq!(repaired_summary["cases"][0]["provider_object_count"], 1);
+    assert!(
+        repaired_summary["cases"][0]["invariants"]
+            .as_array()
+            .is_some_and(|invariants| {
+                invariants.len() == 5
+                    && invariants
+                        .iter()
+                        .all(|invariant| invariant["verdict"] == "held")
+            })
+    );
+    assert_row_five_trace(repaired_path);
+    assert_reference_payment_status((0, 1)).await;
 
     cleanup_reference_databases().await;
     fs::remove_dir_all(ARTIFACT_ROOT).unwrap();
@@ -1930,6 +2153,21 @@ fn run_configured_command_in_all_modes(
         .expect("the mode-bound configured campaign command executes")
 }
 
+fn run_configured_command_in_reconciliation_mode(
+    seed: u64,
+    reconciliation_mode: &str,
+) -> std::process::Output {
+    require_reference_app_reconciliation_mode(reconciliation_mode);
+    configured_command(seed, 1)
+        .env(RETRY_KEY_MODE_ENV, REPAIRED_RETRY_KEY_MODE)
+        .env(CALLER_RETRY_MODE_ENV, FAULTY_CALLER_RETRY_MODE)
+        .env(RECONCILIATION_MODE_ENV, reconciliation_mode)
+        .env(WEBHOOK_EFFECT_MODE_ENV, REPAIRED_WEBHOOK_EFFECT_MODE)
+        .env(LEDGER_BALANCE_MODE_ENV, REPAIRED_LEDGER_BALANCE_MODE)
+        .output()
+        .expect("the reconciliation-mode configured campaign command executes")
+}
+
 fn configured_command(seed: u64, cases: u32) -> Command {
     configured_command_with_config(seed, cases, Path::new(CONFIG))
 }
@@ -1948,6 +2186,7 @@ fn configured_command_with_config(seed: u64, cases: u32, config: &Path) -> Comma
         .env("DATABASE_URL", CASE_URL)
         .env("TIV_STRIPE_WEBHOOK_SECRET", "whsec_test_secret")
         .env("TIV_FIXTURE_CONTROL_TOKEN", "run-scoped-control-token")
+        .env(RECONCILIATION_MODE_ENV, FAULTY_RECONCILIATION_MODE)
         .env("DOCKER_HOST", "tcp://127.0.0.1:9")
         .env("DOCKER_CONTEXT", "intentionally-remote")
         .env("HTTP_PROXY", "http://127.0.0.1:9")
@@ -1997,6 +2236,21 @@ fn configured_replay_command_in_all_modes(
     command
 }
 
+fn configured_replay_command_in_reconciliation_mode(
+    artifact: &Path,
+    reconciliation_mode: &str,
+) -> Command {
+    require_reference_app_reconciliation_mode(reconciliation_mode);
+    let mut command = configured_replay_command(artifact);
+    command
+        .env(RETRY_KEY_MODE_ENV, REPAIRED_RETRY_KEY_MODE)
+        .env(CALLER_RETRY_MODE_ENV, FAULTY_CALLER_RETRY_MODE)
+        .env(RECONCILIATION_MODE_ENV, reconciliation_mode)
+        .env(WEBHOOK_EFFECT_MODE_ENV, REPAIRED_WEBHOOK_EFFECT_MODE)
+        .env(LEDGER_BALANCE_MODE_ENV, REPAIRED_LEDGER_BALANCE_MODE);
+    command
+}
+
 fn configured_shrink_command(artifact: &Path) -> Command {
     configured_shrink_command_with_limit(artifact, 1)
 }
@@ -2015,6 +2269,7 @@ fn configured_shrink_command_with_limit(artifact: &Path, max_candidates: u32) ->
         .env("DATABASE_URL", CASE_URL)
         .env("TIV_STRIPE_WEBHOOK_SECRET", "whsec_test_secret")
         .env("TIV_FIXTURE_CONTROL_TOKEN", "run-scoped-control-token")
+        .env(RECONCILIATION_MODE_ENV, FAULTY_RECONCILIATION_MODE)
         .env("DOCKER_HOST", "tcp://127.0.0.1:9")
         .env("DOCKER_CONTEXT", "intentionally-remote")
         .env("HTTP_PROXY", "http://127.0.0.1:9")
@@ -2060,6 +2315,21 @@ fn configured_shrink_command_in_all_modes(
     command
 }
 
+fn configured_shrink_command_in_reconciliation_mode(
+    artifact: &Path,
+    reconciliation_mode: &str,
+) -> Command {
+    require_reference_app_reconciliation_mode(reconciliation_mode);
+    let mut command = configured_shrink_command_with_limit(artifact, 3);
+    command
+        .env(RETRY_KEY_MODE_ENV, REPAIRED_RETRY_KEY_MODE)
+        .env(CALLER_RETRY_MODE_ENV, FAULTY_CALLER_RETRY_MODE)
+        .env(RECONCILIATION_MODE_ENV, reconciliation_mode)
+        .env(WEBHOOK_EFFECT_MODE_ENV, REPAIRED_WEBHOOK_EFFECT_MODE)
+        .env(LEDGER_BALANCE_MODE_ENV, REPAIRED_LEDGER_BALANCE_MODE);
+    command
+}
+
 fn configured_minimized_replay_command(artifact: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_tiv"));
     command
@@ -2071,6 +2341,7 @@ fn configured_minimized_replay_command(artifact: &Path) -> Command {
         .env("DATABASE_URL", CASE_URL)
         .env("TIV_STRIPE_WEBHOOK_SECRET", "whsec_test_secret")
         .env("TIV_FIXTURE_CONTROL_TOKEN", "run-scoped-control-token")
+        .env(RECONCILIATION_MODE_ENV, FAULTY_RECONCILIATION_MODE)
         .env("DOCKER_HOST", "tcp://127.0.0.1:9")
         .env("DOCKER_CONTEXT", "intentionally-remote")
         .env("HTTP_PROXY", "http://127.0.0.1:9")
@@ -2116,6 +2387,21 @@ fn configured_minimized_replay_command_in_all_modes(
     command
 }
 
+fn configured_minimized_replay_command_in_reconciliation_mode(
+    artifact: &Path,
+    reconciliation_mode: &str,
+) -> Command {
+    require_reference_app_reconciliation_mode(reconciliation_mode);
+    let mut command = configured_minimized_replay_command(artifact);
+    command
+        .env(RETRY_KEY_MODE_ENV, REPAIRED_RETRY_KEY_MODE)
+        .env(CALLER_RETRY_MODE_ENV, FAULTY_CALLER_RETRY_MODE)
+        .env(RECONCILIATION_MODE_ENV, reconciliation_mode)
+        .env(WEBHOOK_EFFECT_MODE_ENV, REPAIRED_WEBHOOK_EFFECT_MODE)
+        .env(LEDGER_BALANCE_MODE_ENV, REPAIRED_LEDGER_BALANCE_MODE);
+    command
+}
+
 fn configured_replay_command_with_config(artifact: &Path, config: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_tiv"));
     command
@@ -2128,6 +2414,7 @@ fn configured_replay_command_with_config(artifact: &Path, config: &Path) -> Comm
         .env("DATABASE_URL", CASE_URL)
         .env("TIV_STRIPE_WEBHOOK_SECRET", "whsec_test_secret")
         .env("TIV_FIXTURE_CONTROL_TOKEN", "run-scoped-control-token")
+        .env(RECONCILIATION_MODE_ENV, FAULTY_RECONCILIATION_MODE)
         .env("DOCKER_HOST", "tcp://127.0.0.1:9")
         .env("DOCKER_CONTEXT", "intentionally-remote")
         .env("HTTP_PROXY", "http://127.0.0.1:9")
@@ -2190,6 +2477,82 @@ fn assert_row_four_trace(artifact: &Path) {
             .filter(|action| action["kind"]["kind"] == "kill_application")
             .count(),
         1
+    );
+}
+
+fn assert_row_five_trace(artifact: &Path) {
+    let campaign: serde_json::Value =
+        serde_json::from_slice(&fs::read(artifact.join("campaign-plan.json")).unwrap())
+            .expect("the campaign plan is JSON");
+    assert_eq!(campaign["spec"]["campaign_seed"], 359);
+    let trace: serde_json::Value =
+        serde_json::from_slice(&fs::read(artifact.join("cases/case_0001/trace.json")).unwrap())
+            .expect("the configured case trace is JSON");
+    let action_kinds = trace["planned_case"]["actions"]
+        .as_array()
+        .expect("planned actions are recorded")
+        .iter()
+        .filter_map(|action| action["kind"]["kind"].as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        action_kinds
+            .iter()
+            .filter(|kind| **kind == "generate_provider_event")
+            .count(),
+        1
+    );
+    assert_eq!(
+        action_kinds
+            .iter()
+            .filter(|kind| **kind == "drop_webhook")
+            .count(),
+        1
+    );
+    assert!(action_kinds.iter().all(|kind| !matches!(
+        *kind,
+        "deliver_webhook" | "duplicate_webhook" | "kill_application"
+    )));
+    let generated = action_kinds
+        .iter()
+        .position(|kind| *kind == "generate_provider_event")
+        .expect("one provider event is generated");
+    let dropped = action_kinds
+        .iter()
+        .position(|kind| *kind == "drop_webhook")
+        .expect("the success event is dropped");
+    let quiescence = action_kinds
+        .iter()
+        .position(|kind| *kind == "wait_for_quiescence")
+        .expect("the declared horizon reaches quiescence");
+    assert!(generated < dropped && dropped < quiescence);
+}
+
+fn assert_row_five_fault_horizon(artifact: &Path) {
+    let trace: serde_json::Value =
+        serde_json::from_slice(&fs::read(artifact.join("cases/case_0001/trace.json")).unwrap())
+            .expect("the configured case trace is JSON");
+    let wait_action_id = trace["planned_case"]["actions"]
+        .as_array()
+        .and_then(|actions| {
+            actions
+                .iter()
+                .find(|action| action["kind"]["kind"] == "wait_for_quiescence")
+        })
+        .map(|action| action["id"].clone())
+        .expect("the row-five trace has a quiescence action");
+    let journal = fs::read_to_string(artifact.join("cases/case_0001/observations.ndjson"))
+        .expect("the row-five observation journal is readable");
+    let wait_outcome_micros = journal
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .find(|record| {
+            record["action_id"] == wait_action_id && record["observation_kind"] == "action_outcome"
+        })
+        .and_then(|record| record["monotonic_elapsed_micros"].as_u64())
+        .expect("the quiescence outcome is durably journaled");
+    assert!(
+        wait_outcome_micros >= 5_000_000,
+        "the dropped success must not fail before the five-second horizon"
     );
 }
 
@@ -2496,6 +2859,26 @@ async fn assert_reference_payment_relation(expected: (i64, i64)) {
         )
         .await
         .expect("the local payment relation is readable");
+    drop(client);
+    connection.await.unwrap().unwrap();
+    assert_eq!((row.get::<_, i64>(0), row.get::<_, i64>(1)), expected);
+}
+
+async fn assert_reference_payment_status(expected: (i64, i64)) {
+    let case_url = ADMIN_URL.replace("/postgres", "/tiv_case_deadbeef");
+    let (client, connection) = tokio_postgres::connect(&case_url, NoTls)
+        .await
+        .expect("the test admin connects to the generated case");
+    let connection = tokio::spawn(connection);
+    let row = client
+        .query_one(
+            "SELECT COUNT(*) FILTER (WHERE status = 'pending')::bigint, \
+                    COUNT(*) FILTER (WHERE status = 'succeeded')::bigint \
+             FROM payments",
+            &[],
+        )
+        .await
+        .expect("the local payment statuses are readable");
     drop(client);
     connection.await.unwrap().unwrap();
     assert_eq!((row.get::<_, i64>(0), row.get::<_, i64>(1)), expected);
@@ -2810,6 +3193,7 @@ fn recreate_reference_app_in_all_modes(
 
     let expected_retry = format!("{RETRY_KEY_MODE_ENV}={retry_key_mode}");
     let expected_caller = format!("{CALLER_RETRY_MODE_ENV}={caller_retry_mode}");
+    let expected_reconciliation = format!("{RECONCILIATION_MODE_ENV}={FAULTY_RECONCILIATION_MODE}");
     let expected_webhook = format!("{WEBHOOK_EFFECT_MODE_ENV}={webhook_effect_mode}");
     let expected_ledger = format!("{LEDGER_BALANCE_MODE_ENV}={ledger_balance_mode}");
     let conflicting_retry = format!(
@@ -2828,6 +3212,8 @@ fn recreate_reference_app_in_all_modes(
             FAULTY_CALLER_RETRY_MODE
         }
     );
+    let conflicting_reconciliation =
+        format!("{RECONCILIATION_MODE_ENV}={REPAIRED_RECONCILIATION_MODE}");
     let conflicting_webhook = format!(
         "{WEBHOOK_EFFECT_MODE_ENV}={}",
         if webhook_effect_mode == FAULTY_WEBHOOK_EFFECT_MODE {
@@ -2845,7 +3231,7 @@ fn recreate_reference_app_in_all_modes(
         }
     );
     let template = format!(
-        "{{{{range .Config.Env}}}}{{{{if eq . \"{expected_retry}\"}}}}retry {{{{end}}}}{{{{if eq . \"{conflicting_retry}\"}}}}retry_conflict {{{{end}}}}{{{{if eq . \"{expected_caller}\"}}}}caller {{{{end}}}}{{{{if eq . \"{conflicting_caller}\"}}}}caller_conflict {{{{end}}}}{{{{if eq . \"{expected_webhook}\"}}}}webhook {{{{end}}}}{{{{if eq . \"{conflicting_webhook}\"}}}}webhook_conflict {{{{end}}}}{{{{if eq . \"{expected_ledger}\"}}}}ledger {{{{end}}}}{{{{if eq . \"{conflicting_ledger}\"}}}}ledger_conflict {{{{end}}}}{{{{end}}}}"
+        "{{{{range .Config.Env}}}}{{{{if eq . \"{expected_retry}\"}}}}retry {{{{end}}}}{{{{if eq . \"{conflicting_retry}\"}}}}retry_conflict {{{{end}}}}{{{{if eq . \"{expected_caller}\"}}}}caller {{{{end}}}}{{{{if eq . \"{conflicting_caller}\"}}}}caller_conflict {{{{end}}}}{{{{if eq . \"{expected_reconciliation}\"}}}}reconciliation {{{{end}}}}{{{{if eq . \"{conflicting_reconciliation}\"}}}}reconciliation_conflict {{{{end}}}}{{{{if eq . \"{expected_webhook}\"}}}}webhook {{{{end}}}}{{{{if eq . \"{conflicting_webhook}\"}}}}webhook_conflict {{{{end}}}}{{{{if eq . \"{expected_ledger}\"}}}}ledger {{{{end}}}}{{{{if eq . \"{conflicting_ledger}\"}}}}ledger_conflict {{{{end}}}}{{{{end}}}}"
     );
     let inspection = Command::new("docker")
         .args([
@@ -2864,8 +3250,57 @@ fn recreate_reference_app_in_all_modes(
     observed.sort_unstable();
     assert_eq!(
         observed,
-        ["caller", "ledger", "retry", "webhook"],
+        ["caller", "ledger", "reconciliation", "retry", "webhook"],
         "all selected reference-app modes must be present"
+    );
+}
+
+fn recreate_reference_app_in_reconciliation_mode(reconciliation_mode: &str) {
+    require_reference_app_reconciliation_mode(reconciliation_mode);
+    let mut command = reference_app_recreate_command_in_all_modes(
+        REPAIRED_RETRY_KEY_MODE,
+        FAULTY_CALLER_RETRY_MODE,
+        REPAIRED_WEBHOOK_EFFECT_MODE,
+        REPAIRED_LEDGER_BALANCE_MODE,
+    );
+    let output = command
+        .env(RECONCILIATION_MODE_ENV, reconciliation_mode)
+        .output()
+        .expect("Docker Compose recreates the reconciliation-mode application");
+    assert!(
+        output.status.success(),
+        "reference app recreation failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_reference_app_healthy();
+
+    let expected = format!("{RECONCILIATION_MODE_ENV}={reconciliation_mode}");
+    let conflict = format!(
+        "{RECONCILIATION_MODE_ENV}={}",
+        if reconciliation_mode == FAULTY_RECONCILIATION_MODE {
+            REPAIRED_RECONCILIATION_MODE
+        } else {
+            FAULTY_RECONCILIATION_MODE
+        }
+    );
+    let template = format!(
+        "{{{{range .Config.Env}}}}{{{{if eq . \"{expected}\"}}}}expected {{{{end}}}}{{{{if eq . \"{conflict}\"}}}}conflict {{{{end}}}}{{{{end}}}}"
+    );
+    let inspection = Command::new("docker")
+        .args([
+            "--host",
+            "unix:///var/run/docker.sock",
+            "inspect",
+            "--format",
+            &template,
+            "tiv-reference-app-spike-reference-app-1",
+        ])
+        .output()
+        .expect("Docker inspects the selected reconciliation mode");
+    assert!(inspection.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&inspection.stdout).trim(),
+        "expected"
     );
 }
 
@@ -2918,6 +3353,7 @@ fn reference_app_recreate_command_in_all_modes(
         ])
         .env(RETRY_KEY_MODE_ENV, retry_key_mode)
         .env(CALLER_RETRY_MODE_ENV, caller_retry_mode)
+        .env(RECONCILIATION_MODE_ENV, FAULTY_RECONCILIATION_MODE)
         .env(WEBHOOK_EFFECT_MODE_ENV, webhook_effect_mode)
         .env(LEDGER_BALANCE_MODE_ENV, ledger_balance_mode)
         .env_remove("DOCKER_HOST")
@@ -2954,6 +3390,13 @@ fn require_reference_app_all_modes(
             || ledger_balance_mode != FAULTY_LEDGER_BALANCE_MODE,
         "effect-duplication and one-sided-ledger faults are mutually exclusive"
     );
+}
+
+fn require_reference_app_reconciliation_mode(reconciliation_mode: &str) {
+    assert!(matches!(
+        reconciliation_mode,
+        "faulty_webhook_only" | "repaired_provider_reconcile"
+    ));
 }
 
 async fn reset_fixture_process() {

@@ -13,8 +13,8 @@ use tiv_core::{
     },
 };
 use tiv_reference_app::{
-    CallerRetryMode, CheckoutOperation, LedgerBalanceMode, ReferenceDatabaseName, RetryKeyMode,
-    WebhookEffectMode, create_with_changed_retry_key,
+    CallerRetryMode, CheckoutOperation, LedgerBalanceMode, ReconciliationMode,
+    ReferenceDatabaseName, RetryKeyMode, WebhookEffectMode, create_with_changed_retry_key,
     create_with_changed_retry_key_for_business_request, create_with_retry_key_mode,
     parse_succeeded_webhook_event, verify_webhook_signature,
 };
@@ -114,6 +114,30 @@ fn caller_retry_mode_accepts_only_the_fault_and_repaired_contract_values() {
         assert!(
             invalid.parse::<CallerRetryMode>().is_err(),
             "{invalid:?} must not select a caller-retry mode"
+        );
+    }
+}
+
+#[test]
+fn reconciliation_mode_accepts_only_webhook_only_and_provider_repair_values() {
+    assert_eq!(
+        "faulty_webhook_only".parse::<ReconciliationMode>(),
+        Ok(ReconciliationMode::FaultyWebhookOnly)
+    );
+    assert_eq!(
+        "repaired_provider_reconcile".parse::<ReconciliationMode>(),
+        Ok(ReconciliationMode::RepairedProviderReconcile)
+    );
+    for invalid in [
+        "",
+        "faulty",
+        "repaired",
+        "FAULTY_WEBHOOK_ONLY",
+        "repaired_provider_reconcile ",
+    ] {
+        assert!(
+            invalid.parse::<ReconciliationMode>().is_err(),
+            "{invalid:?} must not select a reconciliation mode"
         );
     }
 }

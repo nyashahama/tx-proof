@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     error::Error,
     fmt,
     str::FromStr,
@@ -224,6 +224,50 @@ impl fmt::Display for InvalidCallerRetryMode {
 }
 
 impl Error for InvalidCallerRetryMode {}
+
+/// Controls whether provider success depends only on webhook delivery or is
+/// also reconciled from provider state within a bounded horizon.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ReconciliationMode {
+    /// Reproduces the bug by leaving a dropped success event unreconciled.
+    #[default]
+    FaultyWebhookOnly,
+    /// Polls the exact provider object and converges local payment state.
+    RepairedProviderReconcile,
+}
+
+impl ReconciliationMode {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::FaultyWebhookOnly => "faulty_webhook_only",
+            Self::RepairedProviderReconcile => "repaired_provider_reconcile",
+        }
+    }
+}
+
+impl FromStr for ReconciliationMode {
+    type Err = InvalidReconciliationMode;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "faulty_webhook_only" => Ok(Self::FaultyWebhookOnly),
+            "repaired_provider_reconcile" => Ok(Self::RepairedProviderReconcile),
+            _ => Err(InvalidReconciliationMode),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InvalidReconciliationMode;
+
+impl fmt::Display for InvalidReconciliationMode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("invalid reference-app reconciliation mode")
+    }
+}
+
+impl Error for InvalidReconciliationMode {}
 
 /// Controls whether repeated delivery of one authenticated provider event
 /// applies its business effect again or is durably deduplicated.
@@ -536,11 +580,19 @@ fn observed_payment_intent(
     response: PaymentIntentWire,
     operation: &CheckoutOperation,
 ) -> Result<ObservedPaymentIntent, ReferenceAppError> {
+    observed_payment_intent_with_statuses(response, operation, &["requires_confirmation"])
+}
+
+fn observed_payment_intent_with_statuses(
+    response: PaymentIntentWire,
+    operation: &CheckoutOperation,
+    allowed_statuses: &[&str],
+) -> Result<ObservedPaymentIntent, ReferenceAppError> {
     if response.object != "payment_intent"
         || !response.id.starts_with("pi_tiv_")
         || response.amount != operation.amount_minor()
         || response.currency != operation.currency()
-        || response.status != "requires_confirmation"
+        || !allowed_statuses.contains(&response.status.as_str())
         || response.metadata.operation_id != operation.operation_id()
     {
         return Err(ReferenceAppError::ProviderResponse);
@@ -552,6 +604,43 @@ fn observed_payment_intent(
         currency: response.currency,
         status: response.status,
     })
+}
+
+async fn retrieve_payment_intent_for_reconciliation(
+    client: &reqwest::Client,
+    fixture_base_url: &str,
+    expected: &ObservedPaymentIntent,
+) -> Result<ObservedPaymentIntent, ReferenceAppError> {
+    let operation = CheckoutOperation::new(
+        expected.operation_id(),
+        expected.amount_minor(),
+        expected.currency(),
+    )?;
+    let response = client
+        .get(format!(
+            "{}/v1/payment_intents/{}",
+            fixture_base_url.trim_end_matches('/'),
+            expected.id()
+        ))
+        .send()
+        .await
+        .map_err(|_| ReferenceAppError::ProviderTransport)?;
+    if response.status() != StatusCode::OK {
+        return Err(ReferenceAppError::ProviderResponse);
+    }
+    let response = response
+        .json::<PaymentIntentWire>()
+        .await
+        .map_err(|_| ReferenceAppError::ProviderResponse)?;
+    let observed = observed_payment_intent_with_statuses(
+        response,
+        &operation,
+        &["requires_confirmation", "succeeded"],
+    )?;
+    if observed.id() != expected.id() {
+        return Err(ReferenceAppError::ProviderResponse);
+    }
+    Ok(observed)
 }
 
 async fn recover_payment_intent_by_operation(
@@ -746,6 +835,8 @@ struct ProviderEventDataWire {
 
 const MAX_APP_REQUEST_BODY_BYTES: usize = 16 * 1024;
 const CONTROL_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
+const RECONCILIATION_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const RECONCILIATION_HORIZON: Duration = Duration::from_secs(5);
 const WEBHOOK_TIMESTAMP_TOLERANCE_SECONDS: u64 = 300;
 const WEBHOOK_DELIVERY_IDENTITY_CONSTRAINT: &str = "webhook_deliveries_event_identity_fkey";
 
@@ -763,6 +854,7 @@ pub struct ReferenceAppConfig {
     control_probe_address: String,
     retry_key_mode: RetryKeyMode,
     caller_retry_mode: CallerRetryMode,
+    reconciliation_mode: ReconciliationMode,
     webhook_effect_mode: WebhookEffectMode,
     ledger_balance_mode: LedgerBalanceMode,
 }
@@ -810,6 +902,7 @@ impl ReferenceAppConfig {
             control_probe_address,
             retry_key_mode: RetryKeyMode::default(),
             caller_retry_mode: CallerRetryMode::default(),
+            reconciliation_mode: ReconciliationMode::default(),
             webhook_effect_mode: WebhookEffectMode::default(),
             ledger_balance_mode: LedgerBalanceMode::default(),
         })
@@ -835,6 +928,20 @@ impl ReferenceAppConfig {
     #[must_use]
     pub const fn caller_retry_mode(&self) -> CallerRetryMode {
         self.caller_retry_mode
+    }
+
+    #[must_use]
+    pub const fn with_reconciliation_mode(
+        mut self,
+        reconciliation_mode: ReconciliationMode,
+    ) -> Self {
+        self.reconciliation_mode = reconciliation_mode;
+        self
+    }
+
+    #[must_use]
+    pub const fn reconciliation_mode(&self) -> ReconciliationMode {
+        self.reconciliation_mode
     }
 
     #[must_use]
@@ -894,6 +1001,7 @@ pub struct ReferenceApp {
     config: ReferenceAppConfig,
     http_client: reqwest::Client,
     operations: Mutex<BTreeMap<String, RegisteredOperation>>,
+    settled_payment_intents: Arc<Mutex<BTreeSet<String>>>,
 }
 
 impl ReferenceApp {
@@ -903,6 +1011,7 @@ impl ReferenceApp {
             config,
             http_client: reqwest::Client::new(),
             operations: Mutex::new(BTreeMap::new()),
+            settled_payment_intents: Arc::new(Mutex::new(BTreeSet::new())),
         }
     }
 
@@ -1005,10 +1114,43 @@ impl ReferenceApp {
             .await;
         drop(client);
         let connection_result = connection.await;
-        result.map_err(|_| ReferenceAppError::Database)?;
+        let inserted = result.map_err(|_| ReferenceAppError::Database)?;
         connection_result
             .map_err(|_| ReferenceAppError::Database)?
             .map_err(|_| ReferenceAppError::Database)?;
+        if inserted == 1 {
+            self.settled_payment_intents
+                .lock()
+                .await
+                .remove(payment_intent.id());
+        }
+        Ok(())
+    }
+
+    async fn start_reconciliation(
+        &self,
+        database: &ReferenceDatabaseName,
+        payment_intent: &ObservedPaymentIntent,
+    ) -> Result<(), ReferenceAppError> {
+        let (database_client, connection) = self.connect_database(database).await?;
+        let http_client = self.http_client.clone();
+        let fixture_base_url = self.config.fixture_base_url.clone();
+        let payment_intent = payment_intent.clone();
+        let reconciliation_mode = self.config.reconciliation_mode;
+        let settled_payment_intents = Arc::clone(&self.settled_payment_intents);
+        std::mem::drop(tokio::spawn(async move {
+            let _result = reconcile_payment_until_horizon(
+                &http_client,
+                &fixture_base_url,
+                &database_client,
+                &payment_intent,
+                reconciliation_mode,
+                &settled_payment_intents,
+            )
+            .await;
+            drop(database_client);
+            let _connection_result = connection.await;
+        }));
         Ok(())
     }
 
@@ -1093,6 +1235,10 @@ impl ReferenceApp {
         connection_result
             .map_err(|_| ReferenceAppError::Database)?
             .map_err(|_| ReferenceAppError::Database)?;
+        self.settled_payment_intents
+            .lock()
+            .await
+            .insert(payment_intent.id().to_owned());
         Ok(())
     }
 
@@ -1121,6 +1267,56 @@ impl ReferenceApp {
         )
         .await
         .is_ok_and(|result| result.is_ok())
+    }
+}
+
+async fn reconcile_payment_until_horizon(
+    http_client: &reqwest::Client,
+    fixture_base_url: &str,
+    database_client: &Client,
+    expected: &ObservedPaymentIntent,
+    reconciliation_mode: ReconciliationMode,
+    settled_payment_intents: &Mutex<BTreeSet<String>>,
+) -> Result<(), ReferenceAppError> {
+    let deadline = tokio::time::Instant::now() + RECONCILIATION_HORIZON;
+    loop {
+        if settled_payment_intents.lock().await.contains(expected.id()) {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(());
+        }
+        let Ok(observed) = tokio::time::timeout_at(
+            deadline,
+            retrieve_payment_intent_for_reconciliation(http_client, fixture_base_url, expected),
+        )
+        .await
+        else {
+            return Ok(());
+        };
+        if let Ok(observed) = observed
+            && observed.status() == "succeeded"
+            && reconciliation_mode == ReconciliationMode::RepairedProviderReconcile
+        {
+            let updated = database_client
+                .execute(
+                    "UPDATE payments SET status = 'succeeded' \
+                     WHERE operation_id = $1 \
+                       AND stripe_payment_intent_id = $2",
+                    &[&observed.operation_id(), &observed.id()],
+                )
+                .await
+                .map_err(|_| ReferenceAppError::Database)?;
+            if updated != 1 {
+                return Err(ReferenceAppError::Database);
+            }
+            settled_payment_intents
+                .lock()
+                .await
+                .insert(observed.id().to_owned());
+            return Ok(());
+        }
+        tokio::time::sleep(RECONCILIATION_POLL_INTERVAL).await;
     }
 }
 
@@ -1212,6 +1408,7 @@ async fn handle_app_request(
                 "status": "ok",
                 "retry_key_mode": app.config.retry_key_mode.as_str(),
                 "caller_retry_mode": app.config.caller_retry_mode.as_str(),
+                "reconciliation_mode": app.config.reconciliation_mode.as_str(),
                 "webhook_effect_mode": app.config.webhook_effect_mode.as_str(),
                 "ledger_balance_mode": app.config.ledger_balance_mode.as_str(),
             }),
@@ -1391,6 +1588,16 @@ async fn handle_checkout(
         return Ok(text_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             "database failure",
+        ));
+    }
+    if app
+        .start_reconciliation(&database, &payment_intent)
+        .await
+        .is_err()
+    {
+        return Ok(text_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "reconciliation failure",
         ));
     }
     json_response(
@@ -1663,6 +1870,10 @@ mod tests {
             CallerRetryMode::FaultyPerRequest
         );
         assert_eq!(
+            config.reconciliation_mode(),
+            ReconciliationMode::FaultyWebhookOnly
+        );
+        assert_eq!(
             config.webhook_effect_mode(),
             WebhookEffectMode::RepairedDeduplicate
         );
@@ -1674,12 +1885,17 @@ mod tests {
         let repaired = config
             .with_retry_key_mode(RetryKeyMode::RepairedSameKey)
             .with_caller_retry_mode(CallerRetryMode::RepairedRecoverOperation)
+            .with_reconciliation_mode(ReconciliationMode::RepairedProviderReconcile)
             .with_webhook_effect_mode(WebhookEffectMode::FaultyDuplicateEffect)
             .with_ledger_balance_mode(LedgerBalanceMode::FaultyOneSidedOnDuplicate);
         assert_eq!(repaired.retry_key_mode(), RetryKeyMode::RepairedSameKey);
         assert_eq!(
             repaired.caller_retry_mode(),
             CallerRetryMode::RepairedRecoverOperation
+        );
+        assert_eq!(
+            repaired.reconciliation_mode(),
+            ReconciliationMode::RepairedProviderReconcile
         );
         assert_eq!(
             repaired.webhook_effect_mode(),
