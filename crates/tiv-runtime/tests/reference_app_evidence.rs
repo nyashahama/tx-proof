@@ -46,8 +46,18 @@ fn webhook_identity_is_validated_before_any_payment_mutation() {
         .find("INSERT INTO webhook_deliveries")
         .expect("every delivery validates its durable event/operation identity");
     let payment_mutation = persistence
-        .find("UPDATE payments SET status = $3")
-        .expect("the successful payment relation remains explicit");
+        .find("persist_payment_status_history(")
+        .expect("payment state changes remain behind one explicit helper boundary");
+
+    let history_persistence = source
+        .split_once("async fn persist_payment_status_history(")
+        .and_then(|(_, suffix)| suffix.split_once("async fn reconcile_payment_until_horizon("))
+        .map(|(body, _)| body)
+        .expect("the bounded payment-status persistence helper remains inspectable");
+    assert!(
+        history_persistence.contains("UPDATE payments SET status = $3"),
+        "the payment-status helper retains the explicit state mutation"
+    );
 
     assert!(
         identity_validation < payment_mutation,
