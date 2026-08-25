@@ -14,9 +14,9 @@ use tiv_core::{
 };
 use tiv_reference_app::{
     CallerRetryMode, CheckoutOperation, LedgerBalanceMode, ReconciliationMode,
-    ReferenceDatabaseName, RetryKeyMode, WebhookEffectMode, create_with_changed_retry_key,
-    create_with_changed_retry_key_for_business_request, create_with_retry_key_mode,
-    parse_succeeded_webhook_event, verify_webhook_signature,
+    ReferenceDatabaseName, RetryKeyMode, TerminalStateMode, WebhookEffectMode,
+    create_with_changed_retry_key, create_with_changed_retry_key_for_business_request,
+    create_with_retry_key_mode, parse_succeeded_webhook_event, verify_webhook_signature,
 };
 use tiv_stripe_pi::{
     CreatePaymentIntent, FaultOutcome, IdempotencyKey, ManagedFixture, OperationId,
@@ -138,6 +138,30 @@ fn reconciliation_mode_accepts_only_webhook_only_and_provider_repair_values() {
         assert!(
             invalid.parse::<ReconciliationMode>().is_err(),
             "{invalid:?} must not select a reconciliation mode"
+        );
+    }
+}
+
+#[test]
+fn terminal_state_mode_accepts_only_arrival_order_and_monotonic_values() {
+    assert_eq!(
+        "faulty_arrival_order".parse::<TerminalStateMode>(),
+        Ok(TerminalStateMode::FaultyArrivalOrder)
+    );
+    assert_eq!(
+        "repaired_monotonic".parse::<TerminalStateMode>(),
+        Ok(TerminalStateMode::RepairedMonotonic)
+    );
+    for invalid in [
+        "",
+        "faulty",
+        "repaired",
+        "FAULTY_ARRIVAL_ORDER",
+        "repaired_monotonic ",
+    ] {
+        assert!(
+            invalid.parse::<TerminalStateMode>().is_err(),
+            "{invalid:?} must not select a terminal-state mode"
         );
     }
 }

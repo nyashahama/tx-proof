@@ -186,6 +186,8 @@ struct RawWebhookFaultConfig {
     duplicate_max: u32,
     allow_reorder: bool,
     allow_drop: bool,
+    #[serde(default)]
+    allow_stale_event: bool,
     delay_ms: Vec<u64>,
 }
 
@@ -1232,7 +1234,8 @@ fn campaign_spec(raw: &RawConfig) -> Result<CampaignSpec, ConfigError> {
         raw.faults.webhooks.allow_reorder,
         raw.faults.webhooks.allow_drop,
     )
-    .map_err(|_| ConfigError::UnsafeFaultBudget)?;
+    .map_err(|_| ConfigError::UnsafeFaultBudget)?
+    .with_stale_event(raw.faults.webhooks.allow_stale_event);
     let max_kills = u8::try_from(raw.faults.process.max_kills_per_case)
         .map_err(|_| ConfigError::UnsafeFaultBudget)?;
     let process_faults = ProcessFaultSpec::new(

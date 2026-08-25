@@ -32,6 +32,7 @@ pub struct WebhookHttpConfig {
     control_sequence: u64,
     next_timestamp: i64,
     timeout: Duration,
+    stale_event_history: bool,
 }
 
 impl WebhookHttpConfig {
@@ -72,7 +73,14 @@ impl WebhookHttpConfig {
             control_sequence,
             next_timestamp: first_timestamp,
             timeout,
+            stale_event_history: false,
         })
+    }
+
+    #[must_use]
+    pub const fn with_stale_event_history(mut self, stale_event_history: bool) -> Self {
+        self.stale_event_history = stale_event_history;
+        self
     }
 }
 
@@ -225,6 +233,16 @@ impl WebhookHttpAdapter {
         let output = require_event_output(request.expected_outputs())?;
         let payment_intent_id = payment_intent_input(request)?;
         let next_sequence = self.next_control_sequence()?;
+        let prior_snapshots = self
+            .generated_events
+            .values()
+            .filter(|generated_for| generated_for.as_str() == payment_intent_id)
+            .count();
+        let snapshot = if self.config.stale_event_history && prior_snapshots == 0 {
+            "requires_confirmation"
+        } else {
+            "succeeded"
+        };
         let response = self
             .client
             .post(self.control_endpoint("/v1/control/generate-event"))
@@ -232,6 +250,7 @@ impl WebhookHttpAdapter {
             .json(&serde_json::json!({
                 "command_sequence": next_sequence,
                 "payment_intent_id": payment_intent_id,
+                "snapshot": snapshot,
             }))
             .send()
             .await
@@ -243,6 +262,7 @@ impl WebhookHttpAdapter {
             .map_err(WebhookHttpError::ControlRequest)?;
         if generated.command_sequence != next_sequence
             || generated.payment_intent_id != payment_intent_id
+            || generated.snapshot != snapshot
             || matches!(
                 self.generated_events.get(&generated.event_id),
                 Some(existing_payment_intent_id)
@@ -868,6 +888,7 @@ struct GeneratedEventResponse {
     command_sequence: u64,
     event_id: String,
     payment_intent_id: String,
+    snapshot: String,
 }
 
 #[derive(Deserialize)]

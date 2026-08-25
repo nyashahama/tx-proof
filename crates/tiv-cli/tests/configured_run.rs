@@ -25,6 +25,10 @@ const CONFIG: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../tests/configured-run-project/tiv.toml"
 );
+const ROW_TWO_CONFIG: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../tests/configured-run-project/tiv-row-two.toml"
+);
 const ARTIFACT_ROOT: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../tests/configured-run-project/.tiv"
@@ -38,6 +42,9 @@ const REPAIRED_CALLER_RETRY_MODE: &str = "repaired_recover_operation";
 const RECONCILIATION_MODE_ENV: &str = "TIV_REFERENCE_APP_RECONCILIATION_MODE";
 const FAULTY_RECONCILIATION_MODE: &str = "faulty_webhook_only";
 const REPAIRED_RECONCILIATION_MODE: &str = "repaired_provider_reconcile";
+const TERMINAL_STATE_MODE_ENV: &str = "TIV_REFERENCE_APP_TERMINAL_STATE_MODE";
+const FAULTY_TERMINAL_STATE_MODE: &str = "faulty_arrival_order";
+const REPAIRED_TERMINAL_STATE_MODE: &str = "repaired_monotonic";
 const WEBHOOK_EFFECT_MODE_ENV: &str = "TIV_REFERENCE_APP_WEBHOOK_EFFECT_MODE";
 const FAULTY_WEBHOOK_EFFECT_MODE: &str = "faulty_duplicate_effect";
 const REPAIRED_WEBHOOK_EFFECT_MODE: &str = "repaired_deduplicate";
@@ -713,6 +720,237 @@ async fn row_five_dropped_success_fault_violates_and_reconciliation_converges() 
             })
     );
     assert_row_five_trace(repaired_path);
+    assert_reference_payment_status((0, 1)).await;
+
+    cleanup_reference_databases().await;
+    fs::remove_dir_all(ARTIFACT_ROOT).unwrap();
+    recreate_reference_app_in_all_modes(
+        FAULTY_RETRY_KEY_MODE,
+        FAULTY_CALLER_RETRY_MODE,
+        REPAIRED_WEBHOOK_EFFECT_MODE,
+        REPAIRED_LEDGER_BALANCE_MODE,
+    );
+    restore.disarm();
+}
+
+#[tokio::test]
+#[ignore = "requires the isolated reference-app Compose project"]
+#[allow(clippy::too_many_lines)]
+async fn row_two_older_event_regresses_success_and_monotonic_repair_holds() {
+    let _guard = E2E_LOCK.lock().await;
+    let mut restore = ReferenceAppModeRestore::armed();
+    let _ = fs::remove_dir_all(ARTIFACT_ROOT);
+
+    recreate_reference_app_in_terminal_state_mode(FAULTY_TERMINAL_STATE_MODE);
+    prepare_reference_baseline().await;
+    reset_fixture_process().await;
+    let faulty_output =
+        run_configured_command_in_terminal_state_mode(329, FAULTY_TERMINAL_STATE_MODE);
+    assert_eq!(
+        faulty_output.status.code(),
+        Some(10),
+        "the older event arrival must regress terminal success: {}",
+        String::from_utf8_lossy(&faulty_output.stderr)
+    );
+    let faulty_receipt: serde_json::Value =
+        serde_json::from_slice(&faulty_output.stdout).expect("faulty stdout is JSON");
+    let faulty_path = Path::new(faulty_receipt["artifact_path"].as_str().unwrap());
+    verify_complete_run_artifact(faulty_path).expect("the faulty artifact verifies");
+    let faulty_summary: serde_json::Value =
+        serde_json::from_slice(&fs::read(faulty_path.join("summary.json")).unwrap()).unwrap();
+    assert_eq!(faulty_summary["cases"][0]["provider_object_count"], 1);
+    assert!(
+        faulty_summary["cases"][0]["invariants"]
+            .as_array()
+            .is_some_and(|invariants| {
+                invariants.len() == 5
+                    && invariants.iter().all(|invariant| {
+                        if invariant["invariant_id"] == "terminal-success-monotonic" {
+                            invariant["verdict"] == "violated" && invariant["witness_count"] == 1
+                        } else {
+                            invariant["verdict"] == "held" && invariant["witness_count"] == 0
+                        }
+                    })
+            })
+    );
+    assert_row_two_trace(faulty_path);
+    assert_reference_terminal_history(true, "pending").await;
+    assert_reference_payment_status((0, 1)).await;
+    assert_terminal_history_witness_artifact(
+        &faulty_path.join("cases/case_0001/invariants/witnesses.json"),
+    );
+
+    let replay_output =
+        configured_replay_command_in_terminal_state_mode(faulty_path, FAULTY_TERMINAL_STATE_MODE)
+            .output()
+            .expect("the row-two configured replay executes");
+    assert_eq!(
+        replay_output.status.code(),
+        Some(10),
+        "row-two replay failed: {}",
+        String::from_utf8_lossy(&replay_output.stderr)
+    );
+    let replay_receipt: serde_json::Value =
+        serde_json::from_slice(&replay_output.stdout).expect("replay stdout is JSON");
+    assert_eq!(replay_receipt["attempt_count"], 3);
+    assert_eq!(replay_receipt["matching_failure_count"], 3);
+    assert_eq!(replay_receipt["classification"], "stable");
+    let replay_path = Path::new(replay_receipt["artifact_path"].as_str().unwrap());
+    verify_complete_run_artifact(replay_path).expect("the row-two replay artifact verifies");
+    let replay_summary: serde_json::Value =
+        serde_json::from_slice(&fs::read(replay_path.join("summary.json")).unwrap()).unwrap();
+    assert!(
+        replay_summary["attempts"]
+            .as_array()
+            .is_some_and(|attempts| {
+                attempts.len() == 3
+                    && attempts.iter().all(|attempt| {
+                        attempt["verdict"] == "expected_violation"
+                            && exact_invariant_vector(attempt, "terminal-success-monotonic", true)
+                    })
+            })
+    );
+    for attempt in 1..=3 {
+        assert_terminal_history_witness_artifact(&replay_path.join(format!(
+            "attempts/attempt_{attempt:04}/invariants/witnesses.json"
+        )));
+    }
+
+    let shrink_output =
+        configured_shrink_command_in_terminal_state_mode(replay_path, FAULTY_TERMINAL_STATE_MODE)
+            .output()
+            .expect("the row-two configured shrink executes");
+    assert!(
+        matches!(shrink_output.status.code(), Some(10 | 11)),
+        "row-two shrink failed: {}",
+        String::from_utf8_lossy(&shrink_output.stderr)
+    );
+    let shrink_receipt: serde_json::Value =
+        serde_json::from_slice(&shrink_output.stdout).expect("shrink stdout is JSON");
+    assert!(
+        shrink_receipt["evaluated_candidates"]
+            .as_u64()
+            .is_some_and(|count| (1..=3).contains(&count))
+    );
+    assert!(
+        shrink_receipt["best_action_count"].as_u64()
+            <= shrink_receipt["original_action_count"].as_u64()
+    );
+    let shrink_path = Path::new(shrink_receipt["artifact_path"].as_str().unwrap());
+    verify_complete_run_artifact(shrink_path).expect("the row-two shrink artifact verifies");
+    let shrink_summary: serde_json::Value =
+        serde_json::from_slice(&fs::read(shrink_path.join("summary.json")).unwrap()).unwrap();
+    for candidate in shrink_summary["candidates"].as_array().unwrap() {
+        let candidate_id = candidate["candidate_id"].as_str().unwrap();
+        let candidate_trace: serde_json::Value = serde_json::from_slice(
+            &fs::read(
+                shrink_path
+                    .join("candidates")
+                    .join(candidate_id)
+                    .join("candidate.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let schedule = candidate_trace["schedule"].as_array().unwrap();
+        let retains_reorder = schedule
+            .iter()
+            .any(|action| action["kind"]["kind"] == "reorder_webhooks");
+        let delivery_count = schedule
+            .iter()
+            .filter(|action| action["kind"]["kind"] == "deliver_webhook")
+            .count();
+        if !retains_reorder || delivery_count < 2 {
+            assert_eq!(candidate["accepted"], false);
+        }
+    }
+    let minimized_authority: serde_json::Value =
+        serde_json::from_slice(&fs::read(shrink_path.join("trace.minimized.json")).unwrap())
+            .unwrap();
+    let minimized_schedule = minimized_authority["candidate"]["schedule"]
+        .as_array()
+        .expect("the row-two minimized authority retains a schedule");
+    assert!(
+        minimized_schedule
+            .iter()
+            .any(|action| action["kind"]["kind"] == "reorder_webhooks")
+    );
+    assert_eq!(
+        minimized_schedule
+            .iter()
+            .filter(|action| action["kind"]["kind"] == "deliver_webhook")
+            .count(),
+        2
+    );
+
+    let minimized_output = configured_minimized_replay_command_in_terminal_state_mode(
+        shrink_path,
+        FAULTY_TERMINAL_STATE_MODE,
+    )
+    .output()
+    .expect("the row-two minimized replay executes");
+    assert_eq!(
+        minimized_output.status.code(),
+        Some(10),
+        "row-two minimized replay failed: {}",
+        String::from_utf8_lossy(&minimized_output.stderr)
+    );
+    let minimized_receipt: serde_json::Value =
+        serde_json::from_slice(&minimized_output.stdout).expect("minimized stdout is JSON");
+    assert_eq!(minimized_receipt["attempt_count"], 3);
+    assert_eq!(minimized_receipt["matching_failure_count"], 3);
+    assert_eq!(minimized_receipt["classification"], "stable");
+    let minimized_path = Path::new(minimized_receipt["artifact_path"].as_str().unwrap());
+    verify_complete_run_artifact(minimized_path)
+        .expect("the row-two minimized replay artifact verifies");
+    let minimized_summary: serde_json::Value =
+        serde_json::from_slice(&fs::read(minimized_path.join("summary.json")).unwrap()).unwrap();
+    assert!(
+        minimized_summary["attempts"]
+            .as_array()
+            .is_some_and(|attempts| {
+                attempts.len() == 3
+                    && attempts.iter().all(|attempt| {
+                        exact_invariant_vector(attempt, "terminal-success-monotonic", true)
+                    })
+            })
+    );
+    for attempt in 1..=3 {
+        assert_terminal_history_witness_artifact(&minimized_path.join(format!(
+            "attempts/attempt_{attempt:04}/invariants/witnesses.json"
+        )));
+    }
+
+    recreate_reference_app_in_terminal_state_mode(REPAIRED_TERMINAL_STATE_MODE);
+    prepare_reference_baseline().await;
+    reset_fixture_process().await;
+    let repaired_output =
+        run_configured_command_in_terminal_state_mode(329, REPAIRED_TERMINAL_STATE_MODE);
+    assert_eq!(
+        repaired_output.status.code(),
+        Some(0),
+        "the monotonic terminal-state control must hold: {}",
+        String::from_utf8_lossy(&repaired_output.stderr)
+    );
+    let repaired_receipt: serde_json::Value =
+        serde_json::from_slice(&repaired_output.stdout).expect("repaired stdout is JSON");
+    let repaired_path = Path::new(repaired_receipt["artifact_path"].as_str().unwrap());
+    verify_complete_run_artifact(repaired_path).expect("the repaired artifact verifies");
+    let repaired_summary: serde_json::Value =
+        serde_json::from_slice(&fs::read(repaired_path.join("summary.json")).unwrap()).unwrap();
+    assert_eq!(repaired_summary["cases"][0]["provider_object_count"], 1);
+    assert!(
+        repaired_summary["cases"][0]["invariants"]
+            .as_array()
+            .is_some_and(|invariants| {
+                invariants.len() == 5
+                    && invariants
+                        .iter()
+                        .all(|invariant| invariant["verdict"] == "held")
+            })
+    );
+    assert_row_two_trace(repaired_path);
+    assert_reference_terminal_history(false, "succeeded").await;
     assert_reference_payment_status((0, 1)).await;
 
     cleanup_reference_databases().await;
@@ -2174,6 +2412,22 @@ fn run_configured_command_in_reconciliation_mode(
         .expect("the reconciliation-mode configured campaign command executes")
 }
 
+fn run_configured_command_in_terminal_state_mode(
+    seed: u64,
+    terminal_state_mode: &str,
+) -> std::process::Output {
+    require_reference_app_terminal_state_mode(terminal_state_mode);
+    configured_command_with_config(seed, 1, Path::new(ROW_TWO_CONFIG))
+        .env(RETRY_KEY_MODE_ENV, FAULTY_RETRY_KEY_MODE)
+        .env(CALLER_RETRY_MODE_ENV, FAULTY_CALLER_RETRY_MODE)
+        .env(RECONCILIATION_MODE_ENV, REPAIRED_RECONCILIATION_MODE)
+        .env(TERMINAL_STATE_MODE_ENV, terminal_state_mode)
+        .env(WEBHOOK_EFFECT_MODE_ENV, REPAIRED_WEBHOOK_EFFECT_MODE)
+        .env(LEDGER_BALANCE_MODE_ENV, REPAIRED_LEDGER_BALANCE_MODE)
+        .output()
+        .expect("the terminal-state configured campaign command executes")
+}
+
 fn configured_command(seed: u64, cases: u32) -> Command {
     configured_command_with_config(seed, cases, Path::new(CONFIG))
 }
@@ -2193,6 +2447,7 @@ fn configured_command_with_config(seed: u64, cases: u32, config: &Path) -> Comma
         .env("TIV_STRIPE_WEBHOOK_SECRET", "whsec_test_secret")
         .env("TIV_FIXTURE_CONTROL_TOKEN", "run-scoped-control-token")
         .env(RECONCILIATION_MODE_ENV, FAULTY_RECONCILIATION_MODE)
+        .env(TERMINAL_STATE_MODE_ENV, FAULTY_TERMINAL_STATE_MODE)
         .env("DOCKER_HOST", "tcp://127.0.0.1:9")
         .env("DOCKER_CONTEXT", "intentionally-remote")
         .env("HTTP_PROXY", "http://127.0.0.1:9")
@@ -2257,17 +2512,41 @@ fn configured_replay_command_in_reconciliation_mode(
     command
 }
 
+fn configured_replay_command_in_terminal_state_mode(
+    artifact: &Path,
+    terminal_state_mode: &str,
+) -> Command {
+    require_reference_app_terminal_state_mode(terminal_state_mode);
+    let mut command = configured_replay_command_with_config(artifact, Path::new(ROW_TWO_CONFIG));
+    command
+        .env(RETRY_KEY_MODE_ENV, FAULTY_RETRY_KEY_MODE)
+        .env(CALLER_RETRY_MODE_ENV, FAULTY_CALLER_RETRY_MODE)
+        .env(RECONCILIATION_MODE_ENV, REPAIRED_RECONCILIATION_MODE)
+        .env(TERMINAL_STATE_MODE_ENV, terminal_state_mode)
+        .env(WEBHOOK_EFFECT_MODE_ENV, REPAIRED_WEBHOOK_EFFECT_MODE)
+        .env(LEDGER_BALANCE_MODE_ENV, REPAIRED_LEDGER_BALANCE_MODE);
+    command
+}
+
 fn configured_shrink_command(artifact: &Path) -> Command {
     configured_shrink_command_with_limit(artifact, 1)
 }
 
 fn configured_shrink_command_with_limit(artifact: &Path, max_candidates: u32) -> Command {
+    configured_shrink_command_with_config_and_limit(artifact, Path::new(CONFIG), max_candidates)
+}
+
+fn configured_shrink_command_with_config_and_limit(
+    artifact: &Path,
+    config: &Path,
+    max_candidates: u32,
+) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_tiv"));
     command
         .args(["shrink", "configured", "--artifact"])
         .arg(artifact)
         .arg("--config")
-        .arg(CONFIG)
+        .arg(config)
         .arg("--max-candidates")
         .arg(max_candidates.to_string())
         .args(["--max-time", "10m"])
@@ -2276,6 +2555,7 @@ fn configured_shrink_command_with_limit(artifact: &Path, max_candidates: u32) ->
         .env("TIV_STRIPE_WEBHOOK_SECRET", "whsec_test_secret")
         .env("TIV_FIXTURE_CONTROL_TOKEN", "run-scoped-control-token")
         .env(RECONCILIATION_MODE_ENV, FAULTY_RECONCILIATION_MODE)
+        .env(TERMINAL_STATE_MODE_ENV, FAULTY_TERMINAL_STATE_MODE)
         .env("DOCKER_HOST", "tcp://127.0.0.1:9")
         .env("DOCKER_CONTEXT", "intentionally-remote")
         .env("HTTP_PROXY", "http://127.0.0.1:9")
@@ -2336,18 +2616,40 @@ fn configured_shrink_command_in_reconciliation_mode(
     command
 }
 
+fn configured_shrink_command_in_terminal_state_mode(
+    artifact: &Path,
+    terminal_state_mode: &str,
+) -> Command {
+    require_reference_app_terminal_state_mode(terminal_state_mode);
+    let mut command =
+        configured_shrink_command_with_config_and_limit(artifact, Path::new(ROW_TWO_CONFIG), 3);
+    command
+        .env(RETRY_KEY_MODE_ENV, FAULTY_RETRY_KEY_MODE)
+        .env(CALLER_RETRY_MODE_ENV, FAULTY_CALLER_RETRY_MODE)
+        .env(RECONCILIATION_MODE_ENV, REPAIRED_RECONCILIATION_MODE)
+        .env(TERMINAL_STATE_MODE_ENV, terminal_state_mode)
+        .env(WEBHOOK_EFFECT_MODE_ENV, REPAIRED_WEBHOOK_EFFECT_MODE)
+        .env(LEDGER_BALANCE_MODE_ENV, REPAIRED_LEDGER_BALANCE_MODE);
+    command
+}
+
 fn configured_minimized_replay_command(artifact: &Path) -> Command {
+    configured_minimized_replay_command_with_config(artifact, Path::new(CONFIG))
+}
+
+fn configured_minimized_replay_command_with_config(artifact: &Path, config: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_tiv"));
     command
         .args(["replay", "minimized", "--artifact"])
         .arg(artifact)
         .arg("--config")
-        .arg(CONFIG)
+        .arg(config)
         .env("TIV_POSTGRES_ADMIN_URL", ADMIN_URL)
         .env("DATABASE_URL", CASE_URL)
         .env("TIV_STRIPE_WEBHOOK_SECRET", "whsec_test_secret")
         .env("TIV_FIXTURE_CONTROL_TOKEN", "run-scoped-control-token")
         .env(RECONCILIATION_MODE_ENV, FAULTY_RECONCILIATION_MODE)
+        .env(TERMINAL_STATE_MODE_ENV, FAULTY_TERMINAL_STATE_MODE)
         .env("DOCKER_HOST", "tcp://127.0.0.1:9")
         .env("DOCKER_CONTEXT", "intentionally-remote")
         .env("HTTP_PROXY", "http://127.0.0.1:9")
@@ -2408,6 +2710,23 @@ fn configured_minimized_replay_command_in_reconciliation_mode(
     command
 }
 
+fn configured_minimized_replay_command_in_terminal_state_mode(
+    artifact: &Path,
+    terminal_state_mode: &str,
+) -> Command {
+    require_reference_app_terminal_state_mode(terminal_state_mode);
+    let mut command =
+        configured_minimized_replay_command_with_config(artifact, Path::new(ROW_TWO_CONFIG));
+    command
+        .env(RETRY_KEY_MODE_ENV, FAULTY_RETRY_KEY_MODE)
+        .env(CALLER_RETRY_MODE_ENV, FAULTY_CALLER_RETRY_MODE)
+        .env(RECONCILIATION_MODE_ENV, REPAIRED_RECONCILIATION_MODE)
+        .env(TERMINAL_STATE_MODE_ENV, terminal_state_mode)
+        .env(WEBHOOK_EFFECT_MODE_ENV, REPAIRED_WEBHOOK_EFFECT_MODE)
+        .env(LEDGER_BALANCE_MODE_ENV, REPAIRED_LEDGER_BALANCE_MODE);
+    command
+}
+
 fn configured_replay_command_with_config(artifact: &Path, config: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_tiv"));
     command
@@ -2421,6 +2740,7 @@ fn configured_replay_command_with_config(artifact: &Path, config: &Path) -> Comm
         .env("TIV_STRIPE_WEBHOOK_SECRET", "whsec_test_secret")
         .env("TIV_FIXTURE_CONTROL_TOKEN", "run-scoped-control-token")
         .env(RECONCILIATION_MODE_ENV, FAULTY_RECONCILIATION_MODE)
+        .env(TERMINAL_STATE_MODE_ENV, FAULTY_TERMINAL_STATE_MODE)
         .env("DOCKER_HOST", "tcp://127.0.0.1:9")
         .env("DOCKER_CONTEXT", "intentionally-remote")
         .env("HTTP_PROXY", "http://127.0.0.1:9")
@@ -2456,6 +2776,47 @@ fn assert_row_three_trace(artifact: &Path) {
             "first": "commit_then_close",
             "retry": "normal"
         })]
+    );
+}
+
+fn assert_row_two_trace(artifact: &Path) {
+    let campaign: serde_json::Value =
+        serde_json::from_slice(&fs::read(artifact.join("campaign-plan.json")).unwrap())
+            .expect("the campaign plan is JSON");
+    assert_eq!(campaign["spec"]["campaign_seed"], 329);
+    assert_eq!(
+        campaign["spec"]["webhook_faults"]["allow_stale_event"],
+        true
+    );
+    let trace: serde_json::Value =
+        serde_json::from_slice(&fs::read(artifact.join("cases/case_0001/trace.json")).unwrap())
+            .expect("the configured case trace is JSON");
+    let action_kinds = trace["planned_case"]["actions"]
+        .as_array()
+        .expect("planned actions are recorded")
+        .iter()
+        .filter_map(|action| action["kind"]["kind"].as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        action_kinds
+            .iter()
+            .filter(|kind| **kind == "generate_provider_event")
+            .count(),
+        2
+    );
+    assert_eq!(
+        action_kinds
+            .iter()
+            .filter(|kind| **kind == "reorder_webhooks")
+            .count(),
+        1
+    );
+    assert_eq!(
+        action_kinds
+            .iter()
+            .filter(|kind| **kind == "deliver_webhook")
+            .count(),
+        2
     );
 }
 
@@ -2890,6 +3251,34 @@ async fn assert_reference_payment_status(expected: (i64, i64)) {
     assert_eq!((row.get::<_, i64>(0), row.get::<_, i64>(1)), expected);
 }
 
+async fn assert_reference_terminal_history(older_applied: bool, final_status: &str) {
+    let case_url = ADMIN_URL.replace("/postgres", "/tiv_case_deadbeef");
+    let (client, connection) = tokio_postgres::connect(&case_url, NoTls)
+        .await
+        .expect("the test admin connects to the generated case");
+    let connection = tokio::spawn(connection);
+    let rows = client
+        .query(
+            "SELECT provider_created, observed_status, applied, local_status_after \
+             FROM payment_status_history ORDER BY history_id",
+            &[],
+        )
+        .await
+        .expect("the terminal-state history is readable");
+    drop(client);
+    connection.await.unwrap().unwrap();
+
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].get::<_, i64>(0), 1);
+    assert_eq!(rows[0].get::<_, String>(1), "succeeded");
+    assert!(rows[0].get::<_, bool>(2));
+    assert_eq!(rows[0].get::<_, String>(3), "succeeded");
+    assert_eq!(rows[1].get::<_, i64>(0), 0);
+    assert_eq!(rows[1].get::<_, String>(1), "requires_confirmation");
+    assert_eq!(rows[1].get::<_, bool>(2), older_applied);
+    assert_eq!(rows[1].get::<_, String>(3), final_status);
+}
+
 async fn assert_reference_webhook_delivery_count(expected: i64) {
     let case_url = ADMIN_URL.replace("/postgres", "/tiv_case_deadbeef");
     let (client, connection) = tokio_postgres::connect(&case_url, NoTls)
@@ -3010,6 +3399,60 @@ fn assert_balanced_ledger_witness_artifact(path: &Path, expected_imbalance: i64)
     assert_eq!(row["debit_total_minor"], 2_500);
     assert_eq!(row["credit_total_minor"], 0);
     assert_eq!(row["imbalance_minor"], expected_imbalance);
+}
+
+fn assert_terminal_history_witness_artifact(path: &Path) {
+    let bundle: serde_json::Value = serde_json::from_slice(
+        &fs::read(path).expect("the terminal-history witness artifact is retained"),
+    )
+    .expect("the terminal-history witness artifact is JSON");
+    assert_eq!(bundle["schema_version"], 1);
+    let witness = bundle["invariants"]
+        .as_array()
+        .and_then(|invariants| {
+            invariants
+                .iter()
+                .find(|invariant| invariant["invariant_id"] == "terminal-success-monotonic")
+        })
+        .expect("the bundle retains the terminal-history violation");
+    assert_eq!(witness["checkpoint_id"], "checkout-quiescent");
+    assert_eq!(witness["witness_count"], 1);
+    assert_eq!(
+        witness["projection"],
+        "reference_terminal_history_allowlist"
+    );
+    assert_eq!(witness["retained_row_count"], 1);
+    assert_eq!(witness["omitted_row_count"], 0);
+    assert_eq!(witness["rows_truncated"], false);
+    let rows = witness["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        witness["witness_digest"],
+        blake3::hash(&serde_json::to_vec(rows).unwrap())
+            .to_hex()
+            .as_str()
+    );
+    let row = &rows[0];
+    assert_eq!(row["operation_id"], "op_deadbeef");
+    assert!(
+        row["stripe_payment_intent_id"]
+            .as_str()
+            .is_some_and(|value| value.starts_with("pi_tiv_"))
+    );
+    assert!(
+        row["success_event_id"]
+            .as_str()
+            .is_some_and(|value| value.starts_with("evt_tiv_"))
+    );
+    assert!(
+        row["older_event_id"]
+            .as_str()
+            .is_some_and(|value| value.starts_with("evt_tiv_"))
+    );
+    assert!(row["older_history_id"].as_i64() > row["success_history_id"].as_i64());
+    assert!(row["older_provider_created"].as_i64() < row["success_provider_created"].as_i64());
+    assert_eq!(row["success_local_status_after"], "succeeded");
+    assert_eq!(row["older_local_status_after"], "pending");
 }
 
 fn current_unix_timestamp() -> i64 {
@@ -3200,6 +3643,7 @@ fn recreate_reference_app_in_all_modes(
     let expected_retry = format!("{RETRY_KEY_MODE_ENV}={retry_key_mode}");
     let expected_caller = format!("{CALLER_RETRY_MODE_ENV}={caller_retry_mode}");
     let expected_reconciliation = format!("{RECONCILIATION_MODE_ENV}={FAULTY_RECONCILIATION_MODE}");
+    let expected_terminal = format!("{TERMINAL_STATE_MODE_ENV}={FAULTY_TERMINAL_STATE_MODE}");
     let expected_webhook = format!("{WEBHOOK_EFFECT_MODE_ENV}={webhook_effect_mode}");
     let expected_ledger = format!("{LEDGER_BALANCE_MODE_ENV}={ledger_balance_mode}");
     let conflicting_retry = format!(
@@ -3220,6 +3664,7 @@ fn recreate_reference_app_in_all_modes(
     );
     let conflicting_reconciliation =
         format!("{RECONCILIATION_MODE_ENV}={REPAIRED_RECONCILIATION_MODE}");
+    let conflicting_terminal = format!("{TERMINAL_STATE_MODE_ENV}={REPAIRED_TERMINAL_STATE_MODE}");
     let conflicting_webhook = format!(
         "{WEBHOOK_EFFECT_MODE_ENV}={}",
         if webhook_effect_mode == FAULTY_WEBHOOK_EFFECT_MODE {
@@ -3237,7 +3682,7 @@ fn recreate_reference_app_in_all_modes(
         }
     );
     let template = format!(
-        "{{{{range .Config.Env}}}}{{{{if eq . \"{expected_retry}\"}}}}retry {{{{end}}}}{{{{if eq . \"{conflicting_retry}\"}}}}retry_conflict {{{{end}}}}{{{{if eq . \"{expected_caller}\"}}}}caller {{{{end}}}}{{{{if eq . \"{conflicting_caller}\"}}}}caller_conflict {{{{end}}}}{{{{if eq . \"{expected_reconciliation}\"}}}}reconciliation {{{{end}}}}{{{{if eq . \"{conflicting_reconciliation}\"}}}}reconciliation_conflict {{{{end}}}}{{{{if eq . \"{expected_webhook}\"}}}}webhook {{{{end}}}}{{{{if eq . \"{conflicting_webhook}\"}}}}webhook_conflict {{{{end}}}}{{{{if eq . \"{expected_ledger}\"}}}}ledger {{{{end}}}}{{{{if eq . \"{conflicting_ledger}\"}}}}ledger_conflict {{{{end}}}}{{{{end}}}}"
+        "{{{{range .Config.Env}}}}{{{{if eq . \"{expected_retry}\"}}}}retry {{{{end}}}}{{{{if eq . \"{conflicting_retry}\"}}}}retry_conflict {{{{end}}}}{{{{if eq . \"{expected_caller}\"}}}}caller {{{{end}}}}{{{{if eq . \"{conflicting_caller}\"}}}}caller_conflict {{{{end}}}}{{{{if eq . \"{expected_reconciliation}\"}}}}reconciliation {{{{end}}}}{{{{if eq . \"{conflicting_reconciliation}\"}}}}reconciliation_conflict {{{{end}}}}{{{{if eq . \"{expected_terminal}\"}}}}terminal {{{{end}}}}{{{{if eq . \"{conflicting_terminal}\"}}}}terminal_conflict {{{{end}}}}{{{{if eq . \"{expected_webhook}\"}}}}webhook {{{{end}}}}{{{{if eq . \"{conflicting_webhook}\"}}}}webhook_conflict {{{{end}}}}{{{{if eq . \"{expected_ledger}\"}}}}ledger {{{{end}}}}{{{{if eq . \"{conflicting_ledger}\"}}}}ledger_conflict {{{{end}}}}{{{{end}}}}"
     );
     let inspection = Command::new("docker")
         .args([
@@ -3256,7 +3701,14 @@ fn recreate_reference_app_in_all_modes(
     observed.sort_unstable();
     assert_eq!(
         observed,
-        ["caller", "ledger", "reconciliation", "retry", "webhook"],
+        [
+            "caller",
+            "ledger",
+            "reconciliation",
+            "retry",
+            "terminal",
+            "webhook",
+        ],
         "all selected reference-app modes must be present"
     );
 }
@@ -3303,6 +3755,56 @@ fn recreate_reference_app_in_reconciliation_mode(reconciliation_mode: &str) {
         ])
         .output()
         .expect("Docker inspects the selected reconciliation mode");
+    assert!(inspection.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&inspection.stdout).trim(),
+        "expected"
+    );
+}
+
+fn recreate_reference_app_in_terminal_state_mode(terminal_state_mode: &str) {
+    require_reference_app_terminal_state_mode(terminal_state_mode);
+    let mut command = reference_app_recreate_command_in_all_modes(
+        FAULTY_RETRY_KEY_MODE,
+        FAULTY_CALLER_RETRY_MODE,
+        REPAIRED_WEBHOOK_EFFECT_MODE,
+        REPAIRED_LEDGER_BALANCE_MODE,
+    );
+    let output = command
+        .env(RECONCILIATION_MODE_ENV, REPAIRED_RECONCILIATION_MODE)
+        .env(TERMINAL_STATE_MODE_ENV, terminal_state_mode)
+        .output()
+        .expect("Docker Compose recreates the terminal-state application");
+    assert!(
+        output.status.success(),
+        "reference app recreation failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_reference_app_healthy();
+
+    let expected = format!("{TERMINAL_STATE_MODE_ENV}={terminal_state_mode}");
+    let conflict = format!(
+        "{TERMINAL_STATE_MODE_ENV}={}",
+        if terminal_state_mode == FAULTY_TERMINAL_STATE_MODE {
+            REPAIRED_TERMINAL_STATE_MODE
+        } else {
+            FAULTY_TERMINAL_STATE_MODE
+        }
+    );
+    let template = format!(
+        "{{{{range .Config.Env}}}}{{{{if eq . \"{expected}\"}}}}expected {{{{end}}}}{{{{if eq . \"{conflict}\"}}}}conflict {{{{end}}}}{{{{end}}}}"
+    );
+    let inspection = Command::new("docker")
+        .args([
+            "--host",
+            "unix:///var/run/docker.sock",
+            "inspect",
+            "--format",
+            &template,
+            "tiv-reference-app-spike-reference-app-1",
+        ])
+        .output()
+        .expect("Docker inspects the selected terminal-state mode");
     assert!(inspection.status.success());
     assert_eq!(
         String::from_utf8_lossy(&inspection.stdout).trim(),
@@ -3360,6 +3862,7 @@ fn reference_app_recreate_command_in_all_modes(
         .env(RETRY_KEY_MODE_ENV, retry_key_mode)
         .env(CALLER_RETRY_MODE_ENV, caller_retry_mode)
         .env(RECONCILIATION_MODE_ENV, FAULTY_RECONCILIATION_MODE)
+        .env(TERMINAL_STATE_MODE_ENV, FAULTY_TERMINAL_STATE_MODE)
         .env(WEBHOOK_EFFECT_MODE_ENV, webhook_effect_mode)
         .env(LEDGER_BALANCE_MODE_ENV, ledger_balance_mode)
         .env_remove("DOCKER_HOST")
@@ -3402,6 +3905,13 @@ fn require_reference_app_reconciliation_mode(reconciliation_mode: &str) {
     assert!(matches!(
         reconciliation_mode,
         "faulty_webhook_only" | "repaired_provider_reconcile"
+    ));
+}
+
+fn require_reference_app_terminal_state_mode(terminal_state_mode: &str) {
+    assert!(matches!(
+        terminal_state_mode,
+        "faulty_arrival_order" | "repaired_monotonic"
     ));
 }
 
@@ -3507,6 +4017,23 @@ async fn prepare_reference_baseline() {
                  operation_id text NOT NULL REFERENCES orders(operation_id), \
                  UNIQUE (provider_event_id, operation_id) \
              ); \
+             CREATE TABLE payment_status_history ( \
+                 history_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, \
+                 provider_event_id text NOT NULL UNIQUE, \
+                 operation_id text NOT NULL, \
+                 stripe_payment_intent_id text NOT NULL, \
+                 provider_created bigint NOT NULL CHECK (provider_created >= 0), \
+                 observed_status text NOT NULL \
+                     CHECK (observed_status IN ('requires_confirmation', 'succeeded')), \
+                 applied boolean NOT NULL, \
+                 local_status_after text NOT NULL \
+                     CHECK (local_status_after IN ('pending', 'succeeded')), \
+                 FOREIGN KEY (provider_event_id, operation_id) \
+                     REFERENCES processed_webhook_events \
+                         (provider_event_id, operation_id), \
+                 FOREIGN KEY (operation_id, stripe_payment_intent_id) \
+                     REFERENCES payments (operation_id, stripe_payment_intent_id) \
+             ); \
              CREATE TABLE webhook_deliveries ( \
                  delivery_id uuid PRIMARY KEY, \
                  provider_event_id text NOT NULL, \
@@ -3573,22 +4100,27 @@ async fn prepare_reference_baseline() {
              REVOKE ALL ON SCHEMA public FROM PUBLIC; \
              GRANT USAGE ON SCHEMA public TO tiv_app, tiv_invariant; \
              REVOKE ALL ON TABLE tiv_verifier_marker, orders, payments, \
-                 processed_webhook_events, webhook_deliveries, webhook_effects, \
+                 processed_webhook_events, payment_status_history, \
+                 webhook_deliveries, webhook_effects, \
                  ledger_entries, ledger_postings \
                  FROM PUBLIC, tiv_app, tiv_invariant; \
              REVOKE ALL ON SEQUENCE orders_id_seq, payments_id_seq, \
+                 payment_status_history_history_id_seq, \
                  webhook_effects_id_seq, ledger_postings_posting_id_seq \
                  FROM PUBLIC, tiv_app, tiv_invariant; \
              GRANT SELECT (operation_id, amount_minor, currency) ON TABLE orders TO tiv_app; \
              GRANT INSERT ON TABLE payments TO tiv_app; \
-             GRANT SELECT (operation_id, stripe_payment_intent_id), \
+             GRANT SELECT (operation_id, stripe_payment_intent_id, status), \
                    UPDATE (status) ON TABLE payments TO tiv_app; \
-             GRANT INSERT ON TABLE processed_webhook_events, webhook_deliveries, \
-                 webhook_effects, ledger_entries, ledger_postings TO tiv_app; \
-             GRANT USAGE ON SEQUENCE payments_id_seq, webhook_effects_id_seq, \
+             GRANT INSERT ON TABLE processed_webhook_events, payment_status_history, \
+                 webhook_deliveries, webhook_effects, ledger_entries, ledger_postings \
+                 TO tiv_app; \
+             GRANT USAGE ON SEQUENCE payments_id_seq, \
+                 payment_status_history_history_id_seq, webhook_effects_id_seq, \
                  ledger_postings_posting_id_seq TO tiv_app; \
              GRANT SELECT ON TABLE orders, payments, processed_webhook_events, \
-                 webhook_deliveries, webhook_effects, ledger_entries, ledger_postings \
+                 payment_status_history, webhook_deliveries, webhook_effects, \
+                 ledger_entries, ledger_postings \
                  TO tiv_invariant; \
              INSERT INTO orders (operation_id, amount_minor, currency, status) \
                  VALUES ('op_deadbeef', 2500, 'usd', 'pending')",

@@ -240,6 +240,56 @@ async fn aliased_payment_intent_attempts_reuse_one_immutable_provider_event() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stale_history_reorders_success_before_the_older_snapshot() {
+    let (target_address, mut deliveries, target_server) = start_webhook_target().await;
+    let (fixture, payment_intent_ids) = prepared_fixture(2, 1).await;
+    let (control_address, control_server) =
+        start_control_server(Arc::clone(&fixture), target_address).await;
+    let config = WebhookHttpConfig::new(
+        format!("http://{control_address}"),
+        "case-control-token",
+        1,
+        current_timestamp(),
+        Duration::from_secs(2),
+    )
+    .unwrap()
+    .with_stale_event_history(true);
+    let mut adapter = CompletingAdapter {
+        webhook_http: WebhookHttpAdapter::new(config).unwrap(),
+        payment_intent_ids,
+    };
+    let plan = stale_webhook_plan();
+    let journal_path = journal_path();
+
+    execute_planned_case("run_2", "case_2", &plan, &journal_path, &mut adapter)
+        .await
+        .expect("the reversed stale-event schedule completes");
+    let first = timeout(Duration::from_secs(2), deliveries.recv())
+        .await
+        .unwrap()
+        .unwrap()
+        .json();
+    let second = timeout(Duration::from_secs(2), deliveries.recv())
+        .await
+        .unwrap()
+        .unwrap()
+        .json();
+
+    assert_eq!(first["type"], "payment_intent.succeeded");
+    assert_eq!(first["data"]["object"]["status"], "succeeded");
+    assert_eq!(second["type"], "payment_intent.requires_confirmation");
+    assert_eq!(second["data"]["object"]["status"], "requires_confirmation");
+    assert!(second["created"].as_i64() < first["created"].as_i64());
+
+    drop(adapter);
+    control_server.abort();
+    let _ = control_server.await;
+    target_server.abort();
+    let _ = target_server.await;
+    tokio::fs::remove_file(journal_path).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_nonzero_planned_delay_defers_the_next_real_delivery() {
     let (target_address, mut deliveries, target_server) = start_webhook_target().await;
     let (fixture, payment_intent_ids) = prepared_fixture(7, 1).await;
@@ -439,6 +489,20 @@ fn delayed_webhook_plan() -> tiv_core::plan::PlannedCase {
         ActionBudget::new(40).unwrap(),
         [ProviderOutcome::Normal],
         WebhookFaultSpec::new(0, [100], false, false).unwrap(),
+        ProcessFaultSpec::new([], 0).unwrap(),
+    )
+    .unwrap();
+    CasePlanCompiler::compile(&spec).unwrap()
+}
+
+fn stale_webhook_plan() -> tiv_core::plan::PlannedCase {
+    let spec = PlanSpec::new_payment_intent_v1(
+        Seed::new(2),
+        ActionBudget::new(40).unwrap(),
+        [ProviderOutcome::Normal],
+        WebhookFaultSpec::new(0, [], true, false)
+            .unwrap()
+            .with_stale_event(true),
         ProcessFaultSpec::new([], 0).unwrap(),
     )
     .unwrap();

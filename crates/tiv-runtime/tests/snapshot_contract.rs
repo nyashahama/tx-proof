@@ -163,6 +163,20 @@ fn paid_order_conservation_is_provider_led_and_status_aware() {
     assert!(query.contains("local_succeeded_amount_minor"));
 }
 
+#[test]
+fn terminal_success_monotonicity_is_proven_from_durable_event_history() {
+    let query = include_str!(
+        "../../../tests/configured-run-project/invariants/04_terminal_success_monotonic.sql"
+    );
+
+    assert!(query.contains("FROM payment_status_history AS success"));
+    assert!(query.contains("JOIN payment_status_history AS older"));
+    assert!(query.contains("older.history_id > success.history_id"));
+    assert!(query.contains("older.provider_created < success.provider_created"));
+    assert!(query.contains("older.applied"));
+    assert!(query.contains("older.local_status_after = 'pending'"));
+}
+
 fn valid_queries() -> Vec<InvariantQuery> {
     V1_INVARIANT_IDS
         .into_iter()

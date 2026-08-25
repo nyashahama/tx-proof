@@ -346,9 +346,13 @@ pub(crate) async fn run_configured_shrink_candidate_with_process(
         CaseHttpAdapter::new(
             ProviderHttpAdapter::new(config.provider)?
                 .with_client_response_cut_points(client_response_cut_points),
-            WebhookHttpAdapter::new(config.webhook)?
-                .with_webhook_request_cut_points(webhook_request_cut_points)
-                .with_webhook_response_cut_points(webhook_response_cut_points),
+            WebhookHttpAdapter::new(
+                config
+                    .webhook
+                    .with_stale_event_history(candidate.source().allows_stale_event_history()),
+            )?
+            .with_webhook_request_cut_points(webhook_request_cut_points)
+            .with_webhook_response_cut_points(webhook_response_cut_points),
         ),
         Some(process),
         sql_probe,
@@ -386,9 +390,13 @@ async fn run_reference_planned_case_inner(
         CaseHttpAdapter::new(
             ProviderHttpAdapter::new(config.provider)?
                 .with_client_response_cut_points(client_response_cut_points),
-            WebhookHttpAdapter::new(config.webhook)?
-                .with_webhook_request_cut_points(webhook_request_cut_points)
-                .with_webhook_response_cut_points(webhook_response_cut_points),
+            WebhookHttpAdapter::new(
+                config
+                    .webhook
+                    .with_stale_event_history(planned_case.allows_stale_event_history()),
+            )?
+            .with_webhook_request_cut_points(webhook_request_cut_points)
+            .with_webhook_response_cut_points(webhook_response_cut_points),
         ),
         process,
         sql_probe,
@@ -651,7 +659,11 @@ fn sql_probe_cut_point_actions(
         ) {
             continue;
         }
-        if matches!(actions[0].kind(), PlanActionKind::DriveCheckout { .. }) {
+        if matches!(
+            actions[0].kind(),
+            PlanActionKind::DriveCheckout { provider_script }
+                if provider_script.terminal_outcome() == ProviderOutcome::Normal
+        ) {
             action_ids.insert(actions[0].id());
         } else {
             return Err(ReferenceCaseRunError::UnsupportedProcessFault);
@@ -1370,6 +1382,44 @@ mod tests {
         ));
         preflight_reference_planned_case(&plan, true, true)
             .expect("a real read-only payment probe can own this cut point");
+    }
+
+    #[test]
+    fn sql_probe_rejects_a_checkout_whose_response_is_still_held() {
+        let plan = (0..4_096)
+            .find_map(|seed| {
+                let spec = PlanSpec::new_payment_intent_v1(
+                    Seed::new(seed),
+                    ActionBudget::new(40).unwrap(),
+                    [ProviderOutcome::Normal, ProviderOutcome::CommitThenDelay],
+                    WebhookFaultSpec::new(0, [], false, false).unwrap(),
+                    ProcessFaultSpec::new([ProcessCutPoint::SqlProbe], 1).unwrap(),
+                )
+                .unwrap();
+                let plan = CasePlanCompiler::compile(&spec).unwrap();
+                plan.actions()
+                    .windows(2)
+                    .any(|actions| {
+                        matches!(
+                            actions[0].kind(),
+                            PlanActionKind::DriveCheckout { provider_script }
+                                if provider_script.terminal_outcome()
+                                    == ProviderOutcome::CommitThenDelay
+                        ) && matches!(
+                            actions[1].kind(),
+                            PlanActionKind::KillApplication {
+                                cut_point: ProcessCutPoint::SqlProbe
+                            }
+                        )
+                    })
+                    .then_some(plan)
+            })
+            .expect("the seed corpus reaches the held checkout SQL-probe shape");
+
+        assert!(matches!(
+            preflight_reference_planned_case(&plan, true, true),
+            Err(ReferenceCaseRunError::UnsupportedProcessFault)
+        ));
     }
 
     #[test]

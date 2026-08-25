@@ -1187,13 +1187,18 @@ fn materialize_case_actions(
                 }
             }
             PlanActionKind::GenerateProviderEvent => {
-                let source = provider_objects
-                    .get(generated_provider_events)
-                    .copied()
+                let source_index = generated_provider_events
+                    .checked_rem(provider_objects.len())
                     .ok_or(CaseTraceMaterializationError::MissingDynamicSource {
                         action_id: planned.id(),
                         input: CaseInputSlot::PaymentIntentId,
                     })?;
+                let source = provider_objects.get(source_index).copied().ok_or(
+                    CaseTraceMaterializationError::MissingDynamicSource {
+                        action_id: planned.id(),
+                        input: CaseInputSlot::PaymentIntentId,
+                    },
+                )?;
                 generated_provider_events += 1;
                 inputs.push(CaseActionInput {
                     slot: CaseInputSlot::PaymentIntentId,

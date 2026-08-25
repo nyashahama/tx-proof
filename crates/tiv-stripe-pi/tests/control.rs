@@ -5,7 +5,7 @@ use serde_json::json;
 use tiv_core::decision::Seed;
 use tiv_stripe_pi::{
     CreatePaymentIntent, FaultOutcome, FixtureServiceError, IdempotencyKey,
-    ManagedDataPlaneDisposition, ManagedFixture, OperationId,
+    ManagedDataPlaneDisposition, ManagedFixture, OperationId, PaymentIntentStatus,
     control::{ControlToken, WebhookSigningSecret, WebhookTarget, serve_http1_connection},
     http::serve_managed_http1_connection,
 };
@@ -33,6 +33,38 @@ fn fault_outcome_wire_names_match_the_campaign_plan_contract() {
             FaultOutcome::CommitThenClose,
             FaultOutcome::CommitThenDelay,
         ]
+    );
+}
+
+#[test]
+fn managed_generation_exposes_older_then_succeeded_snapshots_for_one_object() {
+    let mut fixture = ManagedFixture::new(Seed::new(42));
+    fixture
+        .reset(1, Seed::new(42), vec![FaultOutcome::Normal])
+        .unwrap();
+    fixture
+        .create_data_plane(
+            IdempotencyKey::new("op-42-attempt-1").unwrap(),
+            valid_create(),
+        )
+        .unwrap();
+    let payment_intent_id = fixture.snapshot().payment_intents()[0].id().to_owned();
+
+    let older = fixture
+        .generate_event_snapshot(
+            2,
+            &payment_intent_id,
+            PaymentIntentStatus::RequiresConfirmation,
+        )
+        .unwrap();
+    let succeeded = fixture
+        .generate_event_snapshot(3, &payment_intent_id, PaymentIntentStatus::Succeeded)
+        .unwrap();
+
+    assert_ne!(older.event_id(), succeeded.event_id());
+    assert_eq!(
+        fixture.snapshot().payment_intents()[0].status(),
+        "succeeded"
     );
 }
 

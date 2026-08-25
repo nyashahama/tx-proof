@@ -253,6 +253,13 @@ pub struct WebhookFaultSpec {
     delays_millis: BTreeSet<u64>,
     allow_reorder: bool,
     allow_drop: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    allow_stale_event: bool,
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+const fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl WebhookFaultSpec {
@@ -276,9 +283,16 @@ impl WebhookFaultSpec {
             delays_millis: delays_millis.into_iter().collect(),
             allow_reorder,
             allow_drop,
+            allow_stale_event: false,
         };
         spec.validate()?;
         Ok(spec)
+    }
+
+    #[must_use]
+    pub const fn with_stale_event(mut self, allow_stale_event: bool) -> Self {
+        self.allow_stale_event = allow_stale_event;
+        self
     }
 
     fn validate(&self) -> Result<(), PlanValidationError> {
@@ -355,6 +369,7 @@ impl PlanSpec {
                 delays_millis: BTreeSet::from([0, 10, 100, 1_000, 5_000]),
                 allow_reorder: true,
                 allow_drop: true,
+                allow_stale_event: false,
             },
             process_faults: ProcessFaultSpec {
                 cut_points: BTreeSet::from([
@@ -505,6 +520,11 @@ impl PlannedCase {
     #[must_use]
     pub const fn provider_adapter(&self) -> ProviderAdapter {
         self.spec.provider_adapter
+    }
+
+    #[must_use]
+    pub const fn allows_stale_event_history(&self) -> bool {
+        self.spec.webhook_faults.allow_stale_event
     }
 
     #[must_use]
@@ -833,7 +853,13 @@ fn retry_outcomes(spec: &PlanSpec, attempts: u8) -> impl Iterator<Item = Provide
 }
 
 fn event_actions(events: EventState, provider_objects: u8, spec: &PlanSpec) -> Vec<PlanActionKind> {
-    if events.generated < provider_objects {
+    let events_per_provider = if spec.webhook_faults.allow_stale_event {
+        2
+    } else {
+        1
+    };
+    let target_events = provider_objects.saturating_mul(events_per_provider);
+    if events.generated < target_events {
         return vec![PlanActionKind::GenerateProviderEvent];
     }
     let mut actions = Vec::new();

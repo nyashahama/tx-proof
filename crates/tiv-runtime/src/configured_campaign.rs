@@ -222,6 +222,7 @@ impl ConfiguredInvariantOutcome {
 pub(crate) enum WitnessProjectionPolicy {
     DigestOnly,
     ReferenceLedgerAllowlist,
+    ReferenceTerminalHistoryAllowlist,
 }
 
 #[derive(Serialize)]
@@ -268,14 +269,22 @@ pub(crate) fn write_invariant_witness_artifacts(
     for outcome in outcomes.iter().filter(|outcome| outcome.violated()) {
         let rows = outcome.witnesses();
         let encoded = serde_json::to_vec(rows).map_err(ArtifactError::Serialize)?;
-        let reference_rows_allowed = policy == WitnessProjectionPolicy::ReferenceLedgerAllowlist
-            && outcome.identity().invariant().as_str() == "balanced-ledger"
-            && rows.iter().all(reference_ledger_witness_row);
-        let projection = if reference_rows_allowed {
-            WitnessProjectionPolicy::ReferenceLedgerAllowlist
-        } else {
-            WitnessProjectionPolicy::DigestOnly
+        let projection = match outcome.identity().invariant().as_str() {
+            "balanced-ledger"
+                if policy == WitnessProjectionPolicy::ReferenceLedgerAllowlist
+                    && rows.iter().all(reference_ledger_witness_row) =>
+            {
+                WitnessProjectionPolicy::ReferenceLedgerAllowlist
+            }
+            "terminal-success-monotonic"
+                if policy == WitnessProjectionPolicy::ReferenceLedgerAllowlist
+                    && rows.iter().all(reference_terminal_history_witness_row) =>
+            {
+                WitnessProjectionPolicy::ReferenceTerminalHistoryAllowlist
+            }
+            _ => WitnessProjectionPolicy::DigestOnly,
         };
+        let reference_rows_allowed = projection != WitnessProjectionPolicy::DigestOnly;
         let mut retained_rows = Vec::new();
         if reference_rows_allowed {
             for row in rows {
@@ -375,6 +384,50 @@ fn reference_ledger_witness_row(row: &Map<String, Value>) -> bool {
         && debit_total >= 0
         && credit_total >= 0
         && debit_total.checked_sub(credit_total) == Some(imbalance)
+}
+
+fn reference_terminal_history_witness_row(row: &Map<String, Value>) -> bool {
+    const EXPECTED_COLUMNS: [&str; 10] = [
+        "older_event_id",
+        "older_history_id",
+        "older_local_status_after",
+        "older_provider_created",
+        "operation_id",
+        "stripe_payment_intent_id",
+        "success_event_id",
+        "success_history_id",
+        "success_local_status_after",
+        "success_provider_created",
+    ];
+    let columns = row.keys().map(String::as_str).collect::<BTreeSet<_>>();
+    if columns != BTreeSet::from(EXPECTED_COLUMNS) {
+        return false;
+    }
+    let string = |name| row.get(name).and_then(Value::as_str);
+    let integer = |name| row.get(name).and_then(Value::as_i64);
+    let Some(success_history_id) = integer("success_history_id") else {
+        return false;
+    };
+    let Some(older_history_id) = integer("older_history_id") else {
+        return false;
+    };
+    let Some(success_created) = integer("success_provider_created") else {
+        return false;
+    };
+    let Some(older_created) = integer("older_provider_created") else {
+        return false;
+    };
+    string("operation_id").is_some_and(|value| value.starts_with("op_"))
+        && string("stripe_payment_intent_id").is_some_and(|value| value.starts_with("pi_tiv_"))
+        && string("success_event_id").is_some_and(|value| value.starts_with("evt_tiv_"))
+        && string("older_event_id").is_some_and(|value| value.starts_with("evt_tiv_"))
+        && string("success_local_status_after") == Some("succeeded")
+        && string("older_local_status_after") == Some("pending")
+        && success_history_id > 0
+        && older_history_id > success_history_id
+        && success_created >= 0
+        && older_created >= 0
+        && older_created < success_created
 }
 
 fn valid_reference_identifier(value: &str, prefix: &str) -> bool {
@@ -1518,7 +1571,7 @@ mod tests {
         CampaignSummary, CaseArtifact, ConfiguredCampaignError, ConfiguredCampaignFailureClass,
         ConfiguredCampaignOptions, ConfiguredCampaignOptionsError, ConfiguredCampaignVerdict,
         InvariantArtifact, MAX_PERSISTED_WITNESS_BYTES_PER_ATTEMPT, completed_campaign_report,
-        reference_ledger_witness_row,
+        reference_ledger_witness_row, reference_terminal_history_witness_row,
     };
 
     #[test]
@@ -1553,6 +1606,35 @@ mod tests {
             assert!(MAX_PERSISTED_WITNESS_BYTES_PER_ATTEMPT * 500 < 5 * 1024 * 1024);
             assert!(MAX_PERSISTED_WITNESS_BYTES_PER_ATTEMPT * 183 < 2 * 1024 * 1024);
         }
+    }
+
+    #[test]
+    fn reference_terminal_history_allowlist_is_exact_and_causal() {
+        let valid = serde_json::json!({
+            "operation_id": "op_deadbeef",
+            "stripe_payment_intent_id": "pi_tiv_contract",
+            "success_event_id": "evt_tiv_success",
+            "older_event_id": "evt_tiv_older",
+            "success_history_id": 1,
+            "older_history_id": 2,
+            "success_provider_created": 1,
+            "older_provider_created": 0,
+            "success_local_status_after": "succeeded",
+            "older_local_status_after": "pending"
+        });
+        let valid = valid.as_object().unwrap();
+        assert!(reference_terminal_history_witness_row(valid));
+
+        let mut reversed_arrival = valid.clone();
+        reversed_arrival.insert("older_history_id".to_owned(), serde_json::json!(0));
+        assert!(!reference_terminal_history_witness_row(&reversed_arrival));
+
+        let mut unexpected = valid.clone();
+        unexpected.insert(
+            "secret".to_owned(),
+            serde_json::Value::String("must-not-persist".to_owned()),
+        );
+        assert!(!reference_terminal_history_witness_row(&unexpected));
     }
     use crate::{
         compatibility::{CompatibilityCaptureError, CompatibilityError},
@@ -2196,5 +2278,73 @@ mod tests {
                 | tiv_core::plan::PlanActionKind::DuplicateWebhook
                 | tiv_core::plan::PlanActionKind::KillApplication { .. }
         )));
+    }
+
+    #[test]
+    fn row_two_campaign_seed_isolates_reversed_terminal_history() {
+        let process_faults = ProcessFaultSpec::new(
+            [
+                ProcessCutPoint::ClientRequestForwarded,
+                ProcessCutPoint::ClientResponseObserved,
+                ProcessCutPoint::WebhookRequestForwarded,
+                ProcessCutPoint::WebhookResponseObserved,
+                ProcessCutPoint::SqlProbe,
+            ],
+            1,
+        )
+        .unwrap();
+        let campaign_seed = 329;
+        let spec = CampaignSpec::new_payment_intent_v1(
+            Seed::new(campaign_seed),
+            CaseCount::new(1).unwrap(),
+            ActionBudget::new(10).unwrap(),
+            [
+                ProviderOutcome::Normal,
+                ProviderOutcome::PreExecute429,
+                ProviderOutcome::PreExecute500,
+                ProviderOutcome::PostExecute500,
+                ProviderOutcome::CommitThenClose,
+                ProviderOutcome::CommitThenDelay,
+            ],
+            WebhookFaultSpec::new(3, [0, 10, 100, 1_000, 5_000], true, true)
+                .unwrap()
+                .with_stale_event(true),
+            process_faults,
+        )
+        .unwrap();
+        let campaign = CampaignPlanner::compile(&spec).unwrap();
+        let plan = campaign.cases()[0].plan();
+        preflight_reference_planned_case(plan, true, true).unwrap();
+        let actions = plan.actions();
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|action| matches!(
+                    action.kind(),
+                    tiv_core::plan::PlanActionKind::GenerateProviderEvent
+                ))
+                .count(),
+            2
+        );
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|action| matches!(
+                    action.kind(),
+                    tiv_core::plan::PlanActionKind::ReorderWebhooks
+                ))
+                .count(),
+            1
+        );
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|action| matches!(
+                    action.kind(),
+                    tiv_core::plan::PlanActionKind::DeliverWebhook
+                ))
+                .count(),
+            2
+        );
     }
 }

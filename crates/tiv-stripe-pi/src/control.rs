@@ -251,10 +251,11 @@ async fn handle_request(
             let Some(command) = decode_json::<GenerateEventCommand>(request).await else {
                 return Ok(text_response(StatusCode::BAD_REQUEST, "invalid command"));
             };
-            let result = fixture
-                .lock()
-                .await
-                .generate_event(command.command_sequence, &command.payment_intent_id);
+            let result = fixture.lock().await.generate_event_snapshot(
+                command.command_sequence,
+                &command.payment_intent_id,
+                command.snapshot.into(),
+            );
             service_result(result)
         }
         (&Method::POST, "/v1/control/deliver-event") => {
@@ -520,6 +521,25 @@ struct ConfirmAllCommand {
 struct GenerateEventCommand {
     command_sequence: u64,
     payment_intent_id: String,
+    #[serde(default)]
+    snapshot: EventSnapshotWire,
+}
+
+#[derive(Clone, Copy, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum EventSnapshotWire {
+    RequiresConfirmation,
+    #[default]
+    Succeeded,
+}
+
+impl From<EventSnapshotWire> for crate::PaymentIntentStatus {
+    fn from(snapshot: EventSnapshotWire) -> Self {
+        match snapshot {
+            EventSnapshotWire::RequiresConfirmation => Self::RequiresConfirmation,
+            EventSnapshotWire::Succeeded => Self::Succeeded,
+        }
+    }
 }
 
 #[derive(Deserialize)]

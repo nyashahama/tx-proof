@@ -269,6 +269,49 @@ impl fmt::Display for InvalidReconciliationMode {
 
 impl Error for InvalidReconciliationMode {}
 
+/// Controls whether webhook arrival order may regress a terminal success.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum TerminalStateMode {
+    /// Reproduces the bug by applying every event snapshot in arrival order.
+    #[default]
+    FaultyArrivalOrder,
+    /// Preserves terminal success when an older non-terminal snapshot arrives.
+    RepairedMonotonic,
+}
+
+impl TerminalStateMode {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::FaultyArrivalOrder => "faulty_arrival_order",
+            Self::RepairedMonotonic => "repaired_monotonic",
+        }
+    }
+}
+
+impl FromStr for TerminalStateMode {
+    type Err = InvalidTerminalStateMode;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "faulty_arrival_order" => Ok(Self::FaultyArrivalOrder),
+            "repaired_monotonic" => Ok(Self::RepairedMonotonic),
+            _ => Err(InvalidTerminalStateMode),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InvalidTerminalStateMode;
+
+impl fmt::Display for InvalidTerminalStateMode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("invalid reference-app terminal-state mode")
+    }
+}
+
+impl Error for InvalidTerminalStateMode {}
+
 /// Controls whether repeated delivery of one authenticated provider event
 /// applies its business effect again or is durably deduplicated.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -395,6 +438,7 @@ impl ObservedPaymentIntent {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ObservedWebhookEvent {
     id: String,
+    provider_created: i64,
     payment_intent: ObservedPaymentIntent,
 }
 
@@ -402,6 +446,11 @@ impl ObservedWebhookEvent {
     #[must_use]
     pub fn id(&self) -> &str {
         &self.id
+    }
+
+    #[must_use]
+    pub const fn provider_created(&self) -> i64 {
+        self.provider_created
     }
 
     #[must_use]
@@ -780,12 +829,32 @@ pub fn parse_succeeded_webhook_event(
     signature_header: &str,
     secret: &[u8],
 ) -> Result<ObservedWebhookEvent, ReferenceAppError> {
+    let event = parse_payment_intent_webhook_event(raw_body, signature_header, secret)?;
+    if event.payment_intent().status() != "succeeded" {
+        return Err(ReferenceAppError::InvalidWebhookEvent);
+    }
+    Ok(event)
+}
+
+fn parse_payment_intent_webhook_event(
+    raw_body: &[u8],
+    signature_header: &str,
+    secret: &[u8],
+) -> Result<ObservedWebhookEvent, ReferenceAppError> {
     verify_webhook_signature(raw_body, signature_header, secret)?;
     let event = serde_json::from_slice::<ProviderEventWire>(raw_body)
         .map_err(|_| ReferenceAppError::InvalidWebhookEvent)?;
     let payment_intent = event.data.object;
+    let supported_transition = matches!(
+        (event.event_type.as_str(), payment_intent.status.as_str()),
+        (
+            "payment_intent.requires_confirmation",
+            "requires_confirmation"
+        ) | ("payment_intent.succeeded", "succeeded")
+    );
     if event.object != "event"
-        || event.event_type != "payment_intent.succeeded"
+        || event.created < 0
+        || !supported_transition
         || !event.id.starts_with("evt_tiv_")
         || payment_intent.object != "payment_intent"
         || !payment_intent.id.starts_with("pi_tiv_")
@@ -795,7 +864,6 @@ pub fn parse_succeeded_webhook_event(
             .currency
             .bytes()
             .all(|byte| byte.is_ascii_lowercase())
-        || payment_intent.status != "succeeded"
         || CheckoutOperation::new(
             &payment_intent.metadata.operation_id,
             payment_intent.amount,
@@ -807,6 +875,7 @@ pub fn parse_succeeded_webhook_event(
     }
     Ok(ObservedWebhookEvent {
         id: event.id,
+        provider_created: event.created,
         payment_intent: ObservedPaymentIntent {
             id: payment_intent.id,
             operation_id: payment_intent.metadata.operation_id,
@@ -822,6 +891,7 @@ pub fn parse_succeeded_webhook_event(
 struct ProviderEventWire {
     id: String,
     object: String,
+    created: i64,
     #[serde(rename = "type")]
     event_type: String,
     data: ProviderEventDataWire,
@@ -855,6 +925,7 @@ pub struct ReferenceAppConfig {
     retry_key_mode: RetryKeyMode,
     caller_retry_mode: CallerRetryMode,
     reconciliation_mode: ReconciliationMode,
+    terminal_state_mode: TerminalStateMode,
     webhook_effect_mode: WebhookEffectMode,
     ledger_balance_mode: LedgerBalanceMode,
 }
@@ -903,6 +974,7 @@ impl ReferenceAppConfig {
             retry_key_mode: RetryKeyMode::default(),
             caller_retry_mode: CallerRetryMode::default(),
             reconciliation_mode: ReconciliationMode::default(),
+            terminal_state_mode: TerminalStateMode::default(),
             webhook_effect_mode: WebhookEffectMode::default(),
             ledger_balance_mode: LedgerBalanceMode::default(),
         })
@@ -942,6 +1014,20 @@ impl ReferenceAppConfig {
     #[must_use]
     pub const fn reconciliation_mode(&self) -> ReconciliationMode {
         self.reconciliation_mode
+    }
+
+    #[must_use]
+    pub const fn with_terminal_state_mode(
+        mut self,
+        terminal_state_mode: TerminalStateMode,
+    ) -> Self {
+        self.terminal_state_mode = terminal_state_mode;
+        self
+    }
+
+    #[must_use]
+    pub const fn terminal_state_mode(&self) -> TerminalStateMode {
+        self.terminal_state_mode
     }
 
     #[must_use]
@@ -1179,39 +1265,21 @@ impl ReferenceApp {
                     "INSERT INTO webhook_deliveries \
                          (delivery_id, provider_event_id, operation_id) \
                      VALUES ($1, $2, $3)",
-                    &[
-                        &delivery_id,
-                        &event.id(),
-                        &payment_intent.operation_id(),
-                    ],
+                    &[&delivery_id, &event.id(), &payment_intent.operation_id()],
                 )
                 .await?;
             if first_processing {
-                let updated = transaction
-                    .execute(
-                        "UPDATE payments SET status = 'succeeded' \
-                         WHERE operation_id = $1 AND stripe_payment_intent_id = $2",
-                        &[&payment_intent.operation_id(), &payment_intent.id()],
-                    )
-                    .await?;
-                if updated == 0 {
-                    transaction
-                        .execute(
-                            "INSERT INTO payments \
-                                 (operation_id, stripe_payment_intent_id, amount_minor, currency, status) \
-                             VALUES ($1, $2, $3, $4, 'succeeded')",
-                            &[
-                                &payment_intent.operation_id(),
-                                &payment_intent.id(),
-                                &payment_intent.amount_minor(),
-                                &payment_intent.currency(),
-                            ],
-                        )
-                        .await?;
-                }
+                persist_payment_status_history(
+                    &transaction,
+                    event,
+                    self.config.terminal_state_mode,
+                )
+                .await?;
             }
-            let applies_effect = first_processing
-                || self.config.webhook_effect_mode == WebhookEffectMode::FaultyDuplicateEffect;
+            let is_success = payment_intent.status() == "succeeded";
+            let applies_effect = is_success
+                && (first_processing
+                    || self.config.webhook_effect_mode == WebhookEffectMode::FaultyDuplicateEffect);
             if applies_effect {
                 transaction
                     .execute(
@@ -1221,8 +1289,8 @@ impl ReferenceApp {
                     )
                     .await?;
                 persist_ledger_entry(&transaction, delivery_id, event, true).await?;
-            } else if self.config.ledger_balance_mode
-                == LedgerBalanceMode::FaultyOneSidedOnDuplicate
+            } else if is_success
+                && self.config.ledger_balance_mode == LedgerBalanceMode::FaultyOneSidedOnDuplicate
             {
                 persist_ledger_entry(&transaction, delivery_id, event, false).await?;
             }
@@ -1235,10 +1303,17 @@ impl ReferenceApp {
         connection_result
             .map_err(|_| ReferenceAppError::Database)?
             .map_err(|_| ReferenceAppError::Database)?;
-        self.settled_payment_intents
-            .lock()
-            .await
-            .insert(payment_intent.id().to_owned());
+        if payment_intent.status() == "succeeded" {
+            self.settled_payment_intents
+                .lock()
+                .await
+                .insert(payment_intent.id().to_owned());
+        } else if self.config.terminal_state_mode == TerminalStateMode::FaultyArrivalOrder {
+            self.settled_payment_intents
+                .lock()
+                .await
+                .remove(payment_intent.id());
+        }
         Ok(())
     }
 
@@ -1268,6 +1343,80 @@ impl ReferenceApp {
         .await
         .is_ok_and(|result| result.is_ok())
     }
+}
+
+async fn persist_payment_status_history(
+    transaction: &Transaction<'_>,
+    event: &ObservedWebhookEvent,
+    terminal_state_mode: TerminalStateMode,
+) -> Result<(), tokio_postgres::Error> {
+    let payment_intent = event.payment_intent();
+    let observed_status = payment_intent.status();
+    let local_event_status = if observed_status == "succeeded" {
+        "succeeded"
+    } else {
+        "pending"
+    };
+    transaction
+        .execute(
+            "INSERT INTO payments \
+                 (operation_id, stripe_payment_intent_id, amount_minor, currency, status) \
+             VALUES ($1, $2, $3, $4, $5) \
+             ON CONFLICT DO NOTHING",
+            &[
+                &payment_intent.operation_id(),
+                &payment_intent.id(),
+                &payment_intent.amount_minor(),
+                &payment_intent.currency(),
+                &local_event_status,
+            ],
+        )
+        .await?;
+    let current_status = transaction
+        .query_one(
+            "SELECT status FROM payments \
+             WHERE operation_id = $1 AND stripe_payment_intent_id = $2",
+            &[&payment_intent.operation_id(), &payment_intent.id()],
+        )
+        .await?
+        .get::<_, String>(0);
+    let applied = observed_status == "succeeded"
+        || terminal_state_mode == TerminalStateMode::FaultyArrivalOrder
+        || current_status != "succeeded";
+    let local_status_after = if applied {
+        transaction
+            .execute(
+                "UPDATE payments SET status = $3 \
+                 WHERE operation_id = $1 AND stripe_payment_intent_id = $2",
+                &[
+                    &payment_intent.operation_id(),
+                    &payment_intent.id(),
+                    &local_event_status,
+                ],
+            )
+            .await?;
+        local_event_status.to_owned()
+    } else {
+        current_status
+    };
+    transaction
+        .execute(
+            "INSERT INTO payment_status_history \
+                 (provider_event_id, operation_id, stripe_payment_intent_id, \
+                  provider_created, observed_status, applied, local_status_after) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+            &[
+                &event.id(),
+                &payment_intent.operation_id(),
+                &payment_intent.id(),
+                &event.provider_created(),
+                &observed_status,
+                &applied,
+                &local_status_after,
+            ],
+        )
+        .await?;
+    Ok(())
 }
 
 async fn reconcile_payment_until_horizon(
@@ -1409,6 +1558,7 @@ async fn handle_app_request(
                 "retry_key_mode": app.config.retry_key_mode.as_str(),
                 "caller_retry_mode": app.config.caller_retry_mode.as_str(),
                 "reconciliation_mode": app.config.reconciliation_mode.as_str(),
+                "terminal_state_mode": app.config.terminal_state_mode.as_str(),
                 "webhook_effect_mode": app.config.webhook_effect_mode.as_str(),
                 "ledger_balance_mode": app.config.ledger_balance_mode.as_str(),
             }),
@@ -1653,7 +1803,8 @@ async fn handle_webhook(
         }
     };
     let event =
-        match parse_succeeded_webhook_event(&raw_body, &signature, &app.config.webhook_secret) {
+        match parse_payment_intent_webhook_event(&raw_body, &signature, &app.config.webhook_secret)
+        {
             Ok(event) => event,
             Err(ReferenceAppError::InvalidWebhookSignature) => {
                 return Ok(text_response(StatusCode::UNAUTHORIZED, "invalid signature"));
@@ -1700,6 +1851,18 @@ async fn handle_webhook(
                 "database failure",
             ));
         }
+    }
+    if payment_intent.status() != "succeeded"
+        && app.config.reconciliation_mode == ReconciliationMode::RepairedProviderReconcile
+        && app
+            .start_reconciliation(&registered.database, payment_intent)
+            .await
+            .is_err()
+    {
+        return Ok(text_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "reconciliation failure",
+        ));
     }
     json_response(StatusCode::OK, &serde_json::json!({"accepted": true}))
 }
@@ -1874,6 +2037,10 @@ mod tests {
             ReconciliationMode::FaultyWebhookOnly
         );
         assert_eq!(
+            config.terminal_state_mode(),
+            TerminalStateMode::FaultyArrivalOrder
+        );
+        assert_eq!(
             config.webhook_effect_mode(),
             WebhookEffectMode::RepairedDeduplicate
         );
@@ -1886,6 +2053,7 @@ mod tests {
             .with_retry_key_mode(RetryKeyMode::RepairedSameKey)
             .with_caller_retry_mode(CallerRetryMode::RepairedRecoverOperation)
             .with_reconciliation_mode(ReconciliationMode::RepairedProviderReconcile)
+            .with_terminal_state_mode(TerminalStateMode::RepairedMonotonic)
             .with_webhook_effect_mode(WebhookEffectMode::FaultyDuplicateEffect)
             .with_ledger_balance_mode(LedgerBalanceMode::FaultyOneSidedOnDuplicate);
         assert_eq!(repaired.retry_key_mode(), RetryKeyMode::RepairedSameKey);
@@ -1896,6 +2064,10 @@ mod tests {
         assert_eq!(
             repaired.reconciliation_mode(),
             ReconciliationMode::RepairedProviderReconcile
+        );
+        assert_eq!(
+            repaired.terminal_state_mode(),
+            TerminalStateMode::RepairedMonotonic
         );
         assert_eq!(
             repaired.webhook_effect_mode(),

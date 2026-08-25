@@ -416,6 +416,20 @@ object and updates only the matching payment status through the existing
 least-privilege grant before releasing the watchdog. The compressed five-second
 horizon is reference configuration, not a universal customer deadline.
 
+The row-2 terminal-state pair uses a dedicated stale-event capability that is
+off by default. For one provider object the fixture retains two immutable event
+snapshots with explicit provider-created order: non-terminal at `0`, success at
+`1`. A ten-action full-capability campaign generates both and reorders their
+delivery so success arrives before the older snapshot. Each first-seen event is
+recorded in `payment_status_history` with provider-created order, application
+arrival identity, whether the transition was applied, and local status after
+the decision. Faulty mode applies arrival order and records a durable success
+to pending regression; repaired mode records the older event without applying
+it. Repaired provider reconciliation is held constant so current value
+converges and `terminal-success-monotonic` is decided from exact causal history.
+The strict synthetic allowlist retains that history witness row under the same
+per-attempt evidence budget as ledger witnesses.
+
 The implemented action-level control slice uses two exact, sequenced commands:
 `generate-event` confirms the PaymentIntent resolved from the compiled trace and
 captures its immutable event ID; `deliver-event` signs that exact event with a
@@ -988,7 +1002,7 @@ One small synthetic checkout application exposes feature flags for these bugs:
 
 Each has a paired corrected mode. Acceptance requires the faulty mode to produce the named invariant and checkpoint, the minimized trace to reproduce at least 2/3, and the corrected mode to pass the same compiled regression.
 
-Current implementation status (2026-08-25): rows 1, 3, 4, 5, and 6 have explicit
+Current implementation status (2026-08-25): all six rows have explicit
 startup-only faulty/repaired pairs. Row 1 uses campaign seed `1792` to deliver
 and duplicate one immutable event. Its faulty mode records two durable effect
 applications and violates `webhook-effect-at-most-once`; its repaired mode
@@ -996,6 +1010,13 @@ atomically deduplicates through the provider event ID and records one effect.
 The faulty trace reproduces on 3/3 fresh baselines; bounded shrink rejects a
 candidate that removes the duplicate, accepts a seven-action trace within
 three candidates, and that minimized authority reproduces 3/3.
+Row 2 uses its stale-history configuration with campaign seed `329` and a
+ten-action budget. One PaymentIntent yields older and succeeded immutable
+snapshots; reorder delivers success first. Faulty mode applies the older event
+later and violates only `terminal-success-monotonic`; repaired mode records it
+as unapplied and holds all five invariants. Source and minimized replay are
+stable 3/3, the simplification audit retains reorder plus both deliveries, and
+each violation artifact retains the exact bounded history witness.
 Row 3 uses campaign seed `69` for one checkout script (`commit_then_close`, then
 `normal`). Its faulty mode creates two provider objects and violates
 `provider-object-unique`; its repaired mode preserves both planned attempt
@@ -1023,8 +1044,9 @@ The source, replay, shrink, minimized replay, and repaired artifacts are
 verified; each violation artifact retains the exact bounded ledger row plus its
 witness digest. Both replay forms are stable 3/3, the actual seven-action
 minimized authority retains the duplicate, and the duplicate-removal candidate
-is rejected. Row 2 remains unimplemented, so the six-row
-reference-app release gate is not closed.
+is rejected. The six-row reference application implementation gate is closed;
+release still requires the branch-level quality, PostgreSQL, and Compose jobs
+to pass on the integrated stack.
 
 ## Implementation sequence
 

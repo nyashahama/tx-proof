@@ -102,22 +102,25 @@ mode. Caller retry behavior is independently startup-only through
 default. Reconciliation behavior is startup-only through
 `TIV_REFERENCE_APP_RECONCILIATION_MODE`, with exact values
 `faulty_webhook_only` and `repaired_provider_reconcile`; the webhook-only fault
-is the default. Webhook business-effect behavior is likewise startup-only through
+is the default. Terminal-state application is startup-only through
+`TIV_REFERENCE_APP_TERMINAL_STATE_MODE`, with exact values
+`faulty_arrival_order` and `repaired_monotonic`; arrival-order application is
+the default. Webhook business-effect behavior is likewise startup-only through
 `TIV_REFERENCE_APP_WEBHOOK_EFFECT_MODE`, with exact values
 `faulty_duplicate_effect` and `repaired_deduplicate`; the repaired mode is the
 default. Ledger posting behavior is startup-only through
 `TIV_REFERENCE_APP_LEDGER_MODE`, with exact values
 `faulty_one_sided_duplicate` and `repaired_balanced_once`; the repaired mode is
 the default. There is no request header or route parameter that can switch any
-behavior inside a run. `/health` reports all five non-secret modes, and the
+behavior inside a run. `/health` reports all six non-secret modes, and the
 direct `reference-app-evidence` command additionally attests the exact
-faulty-key, faulty-caller, faulty-reconciliation, repaired-effect,
+faulty-key, faulty-caller, faulty-reconciliation, faulty-terminal, repaired-effect,
 repaired-ledger mode set before it labels a changed-key counterexample. The duplicate-effect and one-sided-ledger
 faults are mutually exclusive; selecting both fails process startup rather
 than reporting a mode whose behavior is hidden by branch precedence.
 
 The resolved Compose configuration, and therefore its configuration hash,
-includes all five modes. A command inspecting a non-default stack must receive
+includes all six modes. A command inspecting a non-default stack must receive
 the same environment values; evidence from one mode set is intentionally not
 compatible with a stack resolved under another set.
 
@@ -215,6 +218,29 @@ CARGO_INCREMENTAL=0 cargo test -p tiv-cli --test configured_run \
 
 The five-second window is an explicit compressed reference horizon, not a
 universal correctness deadline for customer systems.
+
+The row-two pair uses the dedicated stale-history configuration and campaign
+seed `329` under a ten-action budget. The fixture retains an older immutable
+`requires_confirmation` snapshot (`created = 0`) and the current succeeded
+snapshot (`created = 1`) for one PaymentIntent. The compiled schedule generates
+both, reorders the pending queue, and delivers success before the older event.
+Faulty arrival-order mode durably records and applies the later-arriving older
+snapshot, producing one `terminal-success-monotonic` witness. Repaired mode
+records the same history row as unapplied and preserves success. Repaired
+provider reconciliation is held constant across both modes so current paid
+value reconverges and the history invariant remains isolated. Source and
+minimized replay are stable 3/3, and the bounded simplification audit rejects
+removing the reorder or either delivery. Every violating artifact retains the
+exact bounded success/older history row and its digest:
+
+```sh
+CARGO_INCREMENTAL=0 cargo test -p tiv-cli --test configured_run \
+  row_two_older_event_regresses_success_and_monotonic_repair_holds \
+  -- --ignored --exact --nocapture
+```
+
+The stale-history capability is off by default, so the other reference rows and
+their pinned seeds are unchanged.
 
 Then run the real application path:
 

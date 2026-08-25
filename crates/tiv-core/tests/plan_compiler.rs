@@ -440,3 +440,40 @@ fn response_observed_crash_makes_a_new_caller_request_eligible() {
     assert!(plan.validate().is_ok());
     assert_eq!(plan.seed().value(), 1);
 }
+
+#[test]
+fn stale_event_capability_can_compile_two_snapshots_and_a_reversed_delivery() {
+    let webhook_faults = WebhookFaultSpec::new(0, [], true, false)
+        .unwrap()
+        .with_stale_event(true);
+    let plan = (0..512)
+        .find_map(|seed| {
+            let spec = PlanSpec::new_payment_intent_v1(
+                Seed::new(seed),
+                ActionBudget::new(40).unwrap(),
+                [ProviderOutcome::Normal],
+                webhook_faults.clone(),
+                ProcessFaultSpec::new([], 0).unwrap(),
+            )
+            .unwrap();
+            let plan = CasePlanCompiler::compile(&spec).ok()?;
+            let actions = plan.actions();
+            let generated = actions
+                .iter()
+                .filter(|action| matches!(action.kind(), PlanActionKind::GenerateProviderEvent))
+                .count();
+            let reordered = actions
+                .iter()
+                .filter(|action| matches!(action.kind(), PlanActionKind::ReorderWebhooks))
+                .count();
+            let delivered = actions
+                .iter()
+                .filter(|action| matches!(action.kind(), PlanActionKind::DeliverWebhook))
+                .count();
+            (generated == 2 && reordered == 1 && delivered == 2).then_some(plan)
+        })
+        .expect("the bounded seed corpus reaches reversed event history");
+
+    assert!(plan.validate().is_ok());
+    assert_eq!(plan.seed().value(), 2);
+}

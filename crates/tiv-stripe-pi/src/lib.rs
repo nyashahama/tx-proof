@@ -169,6 +169,16 @@ pub enum PaymentIntentStatus {
     Succeeded,
 }
 
+impl PaymentIntentStatus {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::RequiresConfirmation => "requires_confirmation",
+            Self::Succeeded => "succeeded",
+        }
+    }
+}
+
 /// An exact provider response retained by the idempotency cache.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DataPlaneResponse {
@@ -369,13 +379,38 @@ impl GateSignal {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EventKind {
+    PaymentIntentRequiresConfirmation,
     PaymentIntentSucceeded,
+}
+
+impl EventKind {
+    const fn event_type(self) -> &'static str {
+        match self {
+            Self::PaymentIntentRequiresConfirmation => "payment_intent.requires_confirmation",
+            Self::PaymentIntentSucceeded => "payment_intent.succeeded",
+        }
+    }
+
+    const fn status(self) -> &'static str {
+        match self {
+            Self::PaymentIntentRequiresConfirmation => "requires_confirmation",
+            Self::PaymentIntentSucceeded => "succeeded",
+        }
+    }
+
+    const fn created(self) -> i64 {
+        match self {
+            Self::PaymentIntentRequiresConfirmation => 0,
+            Self::PaymentIntentSucceeded => 1,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProviderEvent {
     id: String,
     kind: EventKind,
+    created: i64,
     payment_intent_id: String,
     raw_body: Vec<u8>,
 }
@@ -394,6 +429,11 @@ impl ProviderEvent {
     #[must_use]
     pub fn payment_intent_id(&self) -> &str {
         &self.payment_intent_id
+    }
+
+    #[must_use]
+    pub const fn created(&self) -> i64 {
+        self.created
     }
 
     /// Signs a delivery attempt over the immutable raw event bytes.
@@ -467,6 +507,7 @@ impl WebhookAttempt {
 struct EventWire<'a> {
     id: &'a str,
     object: &'static str,
+    created: i64,
     #[serde(rename = "type")]
     event_type: &'static str,
     data: EventDataWire<'a>,
@@ -924,21 +965,36 @@ impl ManagedFixture {
         command_sequence: u64,
         payment_intent_id: &str,
     ) -> Result<GeneratedEvent, FixtureServiceError> {
+        self.generate_event_snapshot(
+            command_sequence,
+            payment_intent_id,
+            PaymentIntentStatus::Succeeded,
+        )
+    }
+
+    /// Exposes one exact immutable provider-state event snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an out-of-order command, an unknown provider
+    /// object, or an unexpected fixture failure.
+    pub fn generate_event_snapshot(
+        &mut self,
+        command_sequence: u64,
+        payment_intent_id: &str,
+        status: PaymentIntentStatus,
+    ) -> Result<GeneratedEvent, FixtureServiceError> {
         self.require_next_sequence(command_sequence)?;
-        self.fixture
-            .confirm(payment_intent_id)
-            .map_err(FixtureServiceError::Fixture)?;
         let event = self
             .fixture
-            .events()
-            .iter()
-            .find(|event| event.payment_intent_id() == payment_intent_id)
-            .ok_or(FixtureServiceError::EventNotFound)?;
+            .event_snapshot(payment_intent_id, status)
+            .map_err(FixtureServiceError::Fixture)?;
         self.command_sequence = command_sequence;
         Ok(GeneratedEvent {
             command_sequence,
             event_id: event.id().to_owned(),
             payment_intent_id: payment_intent_id.to_owned(),
+            snapshot: status.as_str(),
         })
     }
 
@@ -1195,6 +1251,7 @@ pub struct GeneratedEvent {
     command_sequence: u64,
     event_id: String,
     payment_intent_id: String,
+    snapshot: &'static str,
 }
 
 impl GeneratedEvent {
@@ -1211,6 +1268,11 @@ impl GeneratedEvent {
     #[must_use]
     pub fn payment_intent_id(&self) -> &str {
         &self.payment_intent_id
+    }
+
+    #[must_use]
+    pub const fn snapshot(&self) -> &'static str {
+        self.snapshot
     }
 }
 
@@ -1443,35 +1505,82 @@ impl PaymentIntentFixture {
             .ok_or(FixtureError::NotFound)?;
         if self.payment_intents[index].status != PaymentIntentStatus::Succeeded {
             self.payment_intents[index].status = PaymentIntentStatus::Succeeded;
-            let event_sequence = self.events.len() as u64 + 1;
-            let event_id = self.provider_event_id(event_sequence);
-            let payment_intent = &self.payment_intents[index];
-            let raw_body = serde_json::to_vec(&EventWire {
-                id: &event_id,
-                object: "event",
-                event_type: "payment_intent.succeeded",
-                data: EventDataWire {
-                    object: PaymentIntentWire {
-                        id: &payment_intent.id,
-                        object: "payment_intent",
-                        amount: payment_intent.amount_minor,
-                        currency: &payment_intent.currency,
-                        status: "succeeded",
-                        metadata: PaymentIntentMetadataWire {
-                            operation_id: payment_intent.operation_id(),
-                        },
-                    },
-                },
-            })
-            .map_err(|_| FixtureError::Serialization)?;
-            self.events.push(ProviderEvent {
-                id: event_id,
-                kind: EventKind::PaymentIntentSucceeded,
-                payment_intent_id: id.to_owned(),
-                raw_body,
-            });
+            self.ensure_event(index, EventKind::PaymentIntentSucceeded)?;
         }
         Ok(self.payment_intents[index].clone())
+    }
+
+    /// Returns one immutable event snapshot without regressing provider state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FixtureError::NotFound`] for an unknown provider object or a
+    /// serialization error if the immutable event cannot be encoded.
+    pub fn event_snapshot(
+        &mut self,
+        id: &str,
+        status: PaymentIntentStatus,
+    ) -> Result<ProviderEvent, FixtureError> {
+        let index = self
+            .payment_intents
+            .iter()
+            .position(|payment_intent| payment_intent.id == id)
+            .ok_or(FixtureError::NotFound)?;
+        let kind = match status {
+            PaymentIntentStatus::RequiresConfirmation => {
+                EventKind::PaymentIntentRequiresConfirmation
+            }
+            PaymentIntentStatus::Succeeded => {
+                self.confirm(id)?;
+                EventKind::PaymentIntentSucceeded
+            }
+        };
+        self.ensure_event(index, kind)?;
+        self.events
+            .iter()
+            .find(|event| event.payment_intent_id == id && event.kind == kind)
+            .cloned()
+            .ok_or(FixtureError::NotFound)
+    }
+
+    fn ensure_event(&mut self, index: usize, kind: EventKind) -> Result<(), FixtureError> {
+        let payment_intent = &self.payment_intents[index];
+        if self
+            .events
+            .iter()
+            .any(|event| event.payment_intent_id == payment_intent.id && event.kind == kind)
+        {
+            return Ok(());
+        }
+        let event_sequence = self.events.len() as u64 + 1;
+        let event_id = self.provider_event_id(event_sequence);
+        let raw_body = serde_json::to_vec(&EventWire {
+            id: &event_id,
+            object: "event",
+            created: kind.created(),
+            event_type: kind.event_type(),
+            data: EventDataWire {
+                object: PaymentIntentWire {
+                    id: &payment_intent.id,
+                    object: "payment_intent",
+                    amount: payment_intent.amount_minor,
+                    currency: &payment_intent.currency,
+                    status: kind.status(),
+                    metadata: PaymentIntentMetadataWire {
+                        operation_id: payment_intent.operation_id(),
+                    },
+                },
+            },
+        })
+        .map_err(|_| FixtureError::Serialization)?;
+        self.events.push(ProviderEvent {
+            id: event_id,
+            kind,
+            created: kind.created(),
+            payment_intent_id: payment_intent.id.clone(),
+            raw_body,
+        });
+        Ok(())
     }
 
     /// Retrieves a `PaymentIntent` from fixture state.

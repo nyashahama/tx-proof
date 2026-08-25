@@ -43,6 +43,7 @@ async fn health_and_control_isolation_probe_do_not_touch_postgres() {
     assert_eq!(health["ledger_balance_mode"], "repaired_balanced_once");
     assert_eq!(health["caller_retry_mode"], "faulty_per_request");
     assert_eq!(health["reconciliation_mode"], "faulty_webhook_only");
+    assert_eq!(health["terminal_state_mode"], "faulty_arrival_order");
     assert_eq!(probe.status(), StatusCode::OK);
     let probe: serde_json::Value = probe.json().await.expect("the probe is JSON");
     assert_eq!(probe["reachable"], false);
@@ -70,6 +71,7 @@ async fn health_reports_the_process_selected_repaired_retry_key_mode() {
     assert_eq!(health["retry_key_mode"], "repaired_same_key");
     assert_eq!(health["caller_retry_mode"], "faulty_per_request");
     assert_eq!(health["reconciliation_mode"], "faulty_webhook_only");
+    assert_eq!(health["terminal_state_mode"], "faulty_arrival_order");
     assert_eq!(health["webhook_effect_mode"], "faulty_duplicate_effect");
     assert_eq!(health["ledger_balance_mode"], "repaired_balanced_once");
     await_server(server).await;

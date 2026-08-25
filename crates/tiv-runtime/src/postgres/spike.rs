@@ -648,6 +648,24 @@ impl TruthSpikePostgres {
                          operation_id text NOT NULL REFERENCES orders(operation_id), \
                          UNIQUE (provider_event_id, operation_id) \
                      ); \
+                     CREATE TABLE payment_status_history ( \
+                         history_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, \
+                         provider_event_id text NOT NULL UNIQUE, \
+                         operation_id text NOT NULL, \
+                         stripe_payment_intent_id text NOT NULL, \
+                         provider_created bigint NOT NULL CHECK (provider_created >= 0), \
+                         observed_status text NOT NULL \
+                             CHECK (observed_status IN ('requires_confirmation', 'succeeded')), \
+                         applied boolean NOT NULL, \
+                         local_status_after text NOT NULL \
+                             CHECK (local_status_after IN ('pending', 'succeeded')), \
+                         FOREIGN KEY (provider_event_id, operation_id) \
+                             REFERENCES processed_webhook_events \
+                                 (provider_event_id, operation_id), \
+                         FOREIGN KEY (operation_id, stripe_payment_intent_id) \
+                             REFERENCES payments \
+                                 (operation_id, stripe_payment_intent_id) \
+                     ); \
                      CREATE TABLE webhook_deliveries ( \
                          delivery_id uuid PRIMARY KEY, \
                          provider_event_id text NOT NULL, \
@@ -714,22 +732,27 @@ impl TruthSpikePostgres {
                      REVOKE ALL ON SCHEMA public FROM PUBLIC; \
                      GRANT USAGE ON SCHEMA public TO tiv_app, tiv_invariant; \
                      REVOKE ALL ON TABLE tiv_verifier_marker, orders, payments, \
-                         processed_webhook_events, webhook_deliveries, webhook_effects, \
+                         processed_webhook_events, payment_status_history, \
+                         webhook_deliveries, webhook_effects, \
                          ledger_entries, ledger_postings \
                          FROM PUBLIC, tiv_app, tiv_invariant; \
                      REVOKE ALL ON SEQUENCE orders_id_seq, payments_id_seq, \
+                         payment_status_history_history_id_seq, \
                          webhook_effects_id_seq, ledger_postings_posting_id_seq \
                          FROM PUBLIC, tiv_app, tiv_invariant; \
                      GRANT SELECT (operation_id, amount_minor, currency) ON TABLE orders TO tiv_app; \
                      GRANT INSERT ON TABLE payments TO tiv_app; \
-                     GRANT SELECT (operation_id, stripe_payment_intent_id), \
+                     GRANT SELECT (operation_id, stripe_payment_intent_id, status), \
                            UPDATE (status) ON TABLE payments TO tiv_app; \
-                     GRANT INSERT ON TABLE processed_webhook_events, webhook_deliveries, \
-                         webhook_effects, ledger_entries, ledger_postings TO tiv_app; \
-                     GRANT USAGE ON SEQUENCE payments_id_seq, webhook_effects_id_seq, \
+                     GRANT INSERT ON TABLE processed_webhook_events, payment_status_history, \
+                         webhook_deliveries, webhook_effects, ledger_entries, ledger_postings \
+                         TO tiv_app; \
+                     GRANT USAGE ON SEQUENCE payments_id_seq, \
+                         payment_status_history_history_id_seq, webhook_effects_id_seq, \
                          ledger_postings_posting_id_seq TO tiv_app; \
                      GRANT SELECT ON TABLE orders, payments, processed_webhook_events, \
-                         webhook_deliveries, webhook_effects, ledger_entries, ledger_postings \
+                         payment_status_history, webhook_deliveries, webhook_effects, \
+                         ledger_entries, ledger_postings \
                          TO tiv_invariant;",
                 )
                 .await?;
@@ -1992,6 +2015,20 @@ mod tests {
             )
             .await
             .expect("the app can claim one immutable provider event");
+        let status_history = app
+            .client()
+            .execute(
+                "INSERT INTO payment_status_history \
+                     (provider_event_id, operation_id, stripe_payment_intent_id, \
+                      provider_created, observed_status, applied, local_status_after) \
+                 VALUES ( \
+                     'evt_tiv_role_test', $1, 'pi_tiv_role_test', \
+                     1, 'succeeded', true, 'succeeded' \
+                 )",
+                &[&operation_id],
+            )
+            .await
+            .expect("the app can persist terminal-state history");
         let delivery = app
             .client()
             .execute(
@@ -2128,7 +2165,10 @@ mod tests {
                 &[],
             )
             .await;
-        let ungranted_payment_read = app.client().query("SELECT status FROM payments", &[]).await;
+        let ungranted_payment_read = app
+            .client()
+            .query("SELECT amount_minor FROM payments", &[])
+            .await;
         let ungranted_order_read = app.client().query("SELECT status FROM orders", &[]).await;
         let ungranted_event_read = app
             .client()
@@ -2136,6 +2176,10 @@ mod tests {
                 "SELECT provider_event_id FROM processed_webhook_events",
                 &[],
             )
+            .await;
+        let ungranted_history_read = app
+            .client()
+            .query("SELECT history_id FROM payment_status_history", &[])
             .await;
         let ungranted_delivery_read = app
             .client()
@@ -2163,6 +2207,7 @@ mod tests {
         assert_eq!(current_user, APPLICATION_ROLE);
         assert_eq!(inserted, 1);
         assert_eq!(processed_event, 1);
+        assert_eq!(status_history, 1);
         assert_eq!(delivery, 1);
         assert_eq!(effect, 1);
         assert_eq!(ledger_entry, 1);
@@ -2193,7 +2238,7 @@ mod tests {
         assert!(payment_delete.is_err(), "the app cannot delete payments");
         assert!(
             ungranted_payment_read.is_err(),
-            "the app cannot read columns outside its reconciliation predicate"
+            "the app cannot read payment value columns outside its state predicate"
         );
         assert!(
             ungranted_order_read.is_err(),
@@ -2202,6 +2247,10 @@ mod tests {
         assert!(
             ungranted_event_read.is_err(),
             "the app cannot enumerate processed event identities"
+        );
+        assert!(
+            ungranted_history_read.is_err(),
+            "the app cannot enumerate terminal-state history"
         );
         assert!(
             ungranted_delivery_read.is_err(),
@@ -2403,6 +2452,22 @@ mod tests {
         assert_eq!(order.get::<_, String>(2), "usd");
     }
 
+    async fn insert_status_history_after_reset(client: &Client, operation_id: &str) -> u64 {
+        client
+            .execute(
+                "INSERT INTO payment_status_history \
+                     (provider_event_id, operation_id, stripe_payment_intent_id, \
+                      provider_created, observed_status, applied, local_status_after) \
+                 VALUES ( \
+                     'evt_tiv_role_test_after_reset', $1, \
+                     'pi_tiv_role_test_after_reset', 1, 'succeeded', true, 'succeeded' \
+                 )",
+                &[&operation_id],
+            )
+            .await
+            .expect("the history grant survives a template reset")
+    }
+
     async fn assert_application_role_after_reset(
         postgres: &TruthSpikePostgres,
         case_name: &DatabaseName,
@@ -2431,6 +2496,8 @@ mod tests {
             )
             .await
             .expect("the event grant survives a template reset");
+        let reset_status_history =
+            insert_status_history_after_reset(reset_app.client(), &operation_id).await;
         let reset_delivery = reset_app
             .client()
             .execute(
@@ -2493,6 +2560,7 @@ mod tests {
             .expect("the reset application connection closes cleanly");
         assert_eq!(reset_insert, 1);
         assert_eq!(reset_processed_event, 1);
+        assert_eq!(reset_status_history, 1);
         assert_eq!(reset_delivery, 1);
         assert_eq!(reset_effect, 1);
         assert_eq!(reset_ledger_entry, 1);
@@ -2538,6 +2606,9 @@ mod tests {
                             'tiv_invariant', 'processed_webhook_events', 'SELECT' \
                         ), \
                         has_table_privilege( \
+                            'tiv_invariant', 'payment_status_history', 'SELECT' \
+                        ), \
+                        has_table_privilege( \
                             'tiv_invariant', 'webhook_deliveries', 'SELECT' \
                         ), \
                         has_table_privilege('tiv_invariant', 'webhook_effects', 'SELECT'), \
@@ -2563,9 +2634,10 @@ mod tests {
         assert!(grants.get::<_, bool>(6));
         assert!(grants.get::<_, bool>(7));
         assert!(grants.get::<_, bool>(8));
-        assert!(!grants.get::<_, bool>(9));
+        assert!(grants.get::<_, bool>(9));
         assert!(!grants.get::<_, bool>(10));
         assert!(!grants.get::<_, bool>(11));
+        assert!(!grants.get::<_, bool>(12));
 
         let transaction = admin
             .client()

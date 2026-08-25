@@ -353,6 +353,10 @@
         "allow_reorder": {
           "type": "boolean"
         },
+        "allow_stale_event": {
+          "default": false,
+          "type": "boolean"
+        },
         "delay_ms": {
           "items": {
             "format": "uint64",
