@@ -387,6 +387,22 @@ enumerate them. Duplicate-effect and one-sided-ledger faults are mutually
 exclusive at process startup, so health never advertises a fault hidden by
 branch precedence.
 
+The row-4 caller pair is independently selected once at process startup. After
+a successful checkout response is durably observed and the application is
+SIGKILLed before caller acknowledgement, faulty mode treats the caller retry as
+a new provider create. Repaired mode instead queries the synthetic fixture by
+the immutable operation metadata, creates only when the lookup is empty, fails
+closed on multiple or paginated matches, and reuses the one validated
+PaymentIntent.
+The local `payments` relation enforces uniqueness for the operation/provider
+pair and uses a conflict-safe insert, so recovery cannot duplicate the local
+representation. The temporary provider projection carries that validated
+operation ID, and `provider-object-unique` starts from provider state before it
+left-joins local payments, so duplicate provider objects remain visible even
+when no local row represents one. This operation search is a bounded fixture
+protocol for the reference proof, not a statement about a general Stripe
+metadata-search API.
+
 The implemented action-level control slice uses two exact, sequenced commands:
 `generate-event` confirms the PaymentIntent resolved from the compiled trace and
 captures its immutable event ID; `deliver-event` signs that exact event with a
@@ -402,10 +418,12 @@ After each successful effect it transfers the exact validated fixture command
 sequence to the other adapter, preventing a later webhook command from
 replaying a sequence already consumed by a provider-gate release. The
 reference application also exposes only the supported PaymentIntent confirm
-and retrieve routes as a bounded proxy to its internal fixture address. The
-proxy preserves provider status/body and propagates a real upstream transport
-close by ending the driver connection; the host does not receive a fixture
-data-plane port.
+and retrieve routes as a bounded proxy to its internal fixture address. Its
+repaired caller mode also uses the fixture's exact operation-metadata search
+route internally; that route is never exposed through the application proxy.
+The proxy preserves provider status/body and propagates a real upstream
+transport close by ending the driver connection; the host does not receive a
+fixture data-plane port.
 
 The reference planned-case runner validates the compiled plan before mutation,
 installs the exact flattened provider fault scripts, and executes the full
@@ -429,7 +447,9 @@ before the immediately following kill. Abstract placements remain unsupported
 and are rejected before stack inspection or database provisioning. The
 reference-only
 quiescence gate requires no held provider request, no queued webhook, no held
-fixture gate, no unused provider outcome, and a validated provider projection.
+fixture gate, no unexplained unused provider outcome, and a validated provider
+projection. A recovered caller request accounts exactly for its intentionally
+unconsumed planned create outcome; any other remainder is an execution error.
 The final checkpoint yields the unforgeable permit consumed by the existing
 five-query PostgreSQL oracle. Self-contained public runs allocate the next
 authenticated fixture sequence so multiple commands can run serially on the
@@ -955,7 +975,7 @@ One small synthetic checkout application exposes feature flags for these bugs:
 
 Each has a paired corrected mode. Acceptance requires the faulty mode to produce the named invariant and checkpoint, the minimized trace to reproduce at least 2/3, and the corrected mode to pass the same compiled regression.
 
-Current implementation status (2026-08-24): rows 1, 3, and 6 have explicit
+Current implementation status (2026-08-25): rows 1, 3, 4, and 6 have explicit
 startup-only faulty/repaired pairs. Row 1 uses campaign seed `1792` to deliver
 and duplicate one immutable event. Its faulty mode records two durable effect
 applications and violates `webhook-effect-at-most-once`; its repaired mode
@@ -968,14 +988,23 @@ Row 3 uses campaign seed `69` for one checkout script (`commit_then_close`, then
 `provider-object-unique`; its repaired mode preserves both planned attempt
 outputs while aliasing them to one provider object and immutable event. Each
 repaired execution finalizes a verified artifact with all five configured
-invariants held. Row 6 reuses seed `1792` with repaired retry/effect modes. Its
-faulty ledger mode records a balanced first entry and a debit-only duplicate,
-violating only `balanced-ledger`; its repaired mode records one balanced entry.
+invariants held. Row 4 uses campaign seed `422` to observe a successful checkout
+response, SIGKILL the application before caller acknowledgement, restart, and
+retry the business request. Its faulty per-request mode creates two provider
+objects and two local payment rows, violating only `provider-object-unique`.
+Its repaired mode searches by immutable operation metadata, recovers exactly
+one provider object without consuming the planned retry create outcome, and
+retains one local payment row with all five invariants held. Source replay and
+the minimized authority are stable 3/3; the bounded shrink retains both the
+response-observed kill and caller retry. Row 6 reuses seed `1792` with repaired
+retry/effect modes. Its faulty ledger mode records a balanced first entry and a
+debit-only duplicate, violating only `balanced-ledger`; its repaired mode
+records one balanced entry.
 The source, replay, shrink, minimized replay, and repaired artifacts are
 verified; each violation artifact retains the exact bounded ledger row plus its
 witness digest. Both replay forms are stable 3/3, the actual seven-action
 minimized authority retains the duplicate, and the duplicate-removal candidate
-is rejected. Rows 2, 4, and 5 remain unimplemented, so the six-row
+is rejected. Rows 2 and 5 remain unimplemented, so the six-row
 reference-app release gate is not closed.
 
 ## Implementation sequence

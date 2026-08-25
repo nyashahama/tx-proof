@@ -2065,4 +2065,62 @@ mod tests {
 
         assert_eq!(seed, 48);
     }
+
+    #[test]
+    fn row_four_campaign_seed_isolates_unacknowledged_checkout_and_caller_retry() {
+        let process_faults = ProcessFaultSpec::new(
+            [
+                ProcessCutPoint::ClientRequestForwarded,
+                ProcessCutPoint::ClientResponseObserved,
+                ProcessCutPoint::WebhookRequestForwarded,
+                ProcessCutPoint::WebhookResponseObserved,
+                ProcessCutPoint::SqlProbe,
+            ],
+            1,
+        )
+        .unwrap();
+        let campaign_seed = 422;
+        let spec = CampaignSpec::new_payment_intent_v1(
+            Seed::new(campaign_seed),
+            CaseCount::new(1).unwrap(),
+            ActionBudget::new(40).unwrap(),
+            [
+                ProviderOutcome::Normal,
+                ProviderOutcome::PreExecute429,
+                ProviderOutcome::PreExecute500,
+                ProviderOutcome::PostExecute500,
+                ProviderOutcome::CommitThenClose,
+                ProviderOutcome::CommitThenDelay,
+            ],
+            WebhookFaultSpec::new(3, [0, 10, 100, 1_000, 5_000], true, true).unwrap(),
+            process_faults,
+        )
+        .unwrap();
+        let campaign = CampaignPlanner::compile(&spec).unwrap();
+        let actions = campaign.cases()[0].plan().actions();
+        assert!(matches!(
+            actions.first().map(tiv_core::plan::PlannedAction::kind),
+            Some(tiv_core::plan::PlanActionKind::DriveCheckout {
+                provider_script
+            }) if provider_script.terminal_outcome() == ProviderOutcome::Normal
+        ));
+        assert!(matches!(
+            actions.get(1).map(tiv_core::plan::PlannedAction::kind),
+            Some(tiv_core::plan::PlanActionKind::KillApplication {
+                cut_point: ProcessCutPoint::ClientResponseObserved
+            })
+        ));
+        assert!(matches!(
+            actions.get(2).map(tiv_core::plan::PlannedAction::kind),
+            Some(tiv_core::plan::PlanActionKind::RestartAndAwaitHealth)
+        ));
+        assert!(matches!(
+            actions.get(3).map(tiv_core::plan::PlannedAction::kind),
+            Some(tiv_core::plan::PlanActionKind::RetryBusinessRequest {
+                provider_script
+            }) if provider_script.terminal_outcome() == ProviderOutcome::Normal
+        ));
+        preflight_reference_planned_case(campaign.cases()[0].plan(), true, true).unwrap();
+        assert_eq!(campaign_seed, 422);
+    }
 }

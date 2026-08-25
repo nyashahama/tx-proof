@@ -399,3 +399,44 @@ fn deserialization_rejects_a_tampered_or_state_invalid_plan() {
     obsolete["schema_version"] = serde_json::json!(2);
     assert!(serde_json::from_value::<PlannedCase>(obsolete).is_err());
 }
+
+#[test]
+fn response_observed_crash_makes_a_new_caller_request_eligible() {
+    let process_faults =
+        ProcessFaultSpec::new([ProcessCutPoint::ClientResponseObserved], 1).unwrap();
+    let plan = (0..512)
+        .find_map(|seed| {
+            let spec = PlanSpec::new_payment_intent_v1(
+                Seed::new(seed),
+                ActionBudget::new(40).unwrap(),
+                [ProviderOutcome::Normal],
+                WebhookFaultSpec::new(0, [], false, false).unwrap(),
+                process_faults.clone(),
+            )
+            .unwrap();
+            let plan = CasePlanCompiler::compile(&spec).ok()?;
+            let actions = plan.actions();
+            (matches!(
+                actions.first().map(PlannedAction::kind),
+                Some(PlanActionKind::DriveCheckout { provider_script })
+                    if provider_script.terminal_outcome() == ProviderOutcome::Normal
+            ) && matches!(
+                actions.get(1).map(PlannedAction::kind),
+                Some(PlanActionKind::KillApplication {
+                    cut_point: ProcessCutPoint::ClientResponseObserved
+                })
+            ) && matches!(
+                actions.get(2).map(PlannedAction::kind),
+                Some(PlanActionKind::RestartAndAwaitHealth)
+            ) && matches!(
+                actions.get(3).map(PlannedAction::kind),
+                Some(PlanActionKind::RetryBusinessRequest { provider_script })
+                    if provider_script.terminal_outcome() == ProviderOutcome::Normal
+            ))
+            .then_some(plan)
+        })
+        .expect("the bounded seed corpus reaches an unacknowledged caller retry");
+
+    assert!(plan.validate().is_ok());
+    assert_eq!(plan.seed().value(), 1);
+}

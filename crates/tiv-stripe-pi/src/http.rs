@@ -87,6 +87,15 @@ async fn handle_request(
     {
         return handle_webhook_request_forwarded(request, &backend).await;
     }
+    if request.method() == Method::GET && request.uri().path() == "/v1/payment_intents/search" {
+        let Some(operation_id) = search_operation_id(request.uri().query()) else {
+            return Ok(response(
+                StatusCode::BAD_REQUEST,
+                "invalid operation search",
+            ));
+        };
+        return immediate_provider_result(backend.search(&operation_id).await);
+    }
     if request.method() == Method::GET
         && let Some(payment_intent_id) = retrieve_payment_intent_id(request.uri().path())
     {
@@ -395,6 +404,35 @@ impl DataPlaneBackend {
                 .map_err(DataPlaneExecutionError::Fixture),
         }
     }
+
+    async fn search(
+        &self,
+        operation_id: &str,
+    ) -> Result<DataPlaneResponse, DataPlaneExecutionError> {
+        match self {
+            Self::Fixed { fixture, .. } => fixture
+                .lock()
+                .await
+                .search_data_plane(operation_id)
+                .map_err(DataPlaneExecutionError::Fixture),
+            Self::Managed(fixture) => fixture
+                .lock()
+                .await
+                .search_data_plane(operation_id)
+                .map_err(DataPlaneExecutionError::Fixture),
+        }
+    }
+}
+
+fn search_operation_id(query: Option<&str>) -> Option<String> {
+    let mut pairs = form_urlencoded::parse(query?.as_bytes());
+    let (name, value) = pairs.next()?;
+    if name != "operation_id" || pairs.next().is_some() {
+        return None;
+    }
+    OperationId::new(value.into_owned())
+        .ok()
+        .map(|operation_id| operation_id.as_str().to_owned())
 }
 
 fn fixed_disposition(disposition: DataPlaneDisposition) -> HttpDataPlaneDisposition {

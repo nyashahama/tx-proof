@@ -181,6 +181,50 @@ impl fmt::Display for InvalidRetryKeyMode {
 
 impl Error for InvalidRetryKeyMode {}
 
+/// Controls whether a new caller request blindly starts another provider
+/// create or first recovers an object already committed for the operation.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum CallerRetryMode {
+    /// Reproduces the bug by assigning every caller request a fresh scope.
+    #[default]
+    FaultyPerRequest,
+    /// Recovers an existing provider object by immutable operation metadata.
+    RepairedRecoverOperation,
+}
+
+impl CallerRetryMode {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::FaultyPerRequest => "faulty_per_request",
+            Self::RepairedRecoverOperation => "repaired_recover_operation",
+        }
+    }
+}
+
+impl FromStr for CallerRetryMode {
+    type Err = InvalidCallerRetryMode;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "faulty_per_request" => Ok(Self::FaultyPerRequest),
+            "repaired_recover_operation" => Ok(Self::RepairedRecoverOperation),
+            _ => Err(InvalidCallerRetryMode),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InvalidCallerRetryMode;
+
+impl fmt::Display for InvalidCallerRetryMode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("invalid reference-app caller-retry mode")
+    }
+}
+
+impl Error for InvalidCallerRetryMode {}
+
 /// Controls whether repeated delivery of one authenticated provider event
 /// applies its business effect again or is durably deduplicated.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -485,6 +529,13 @@ async fn decode_provider_response(
         .json::<PaymentIntentWire>()
         .await
         .map_err(|_| ReferenceAppError::ProviderResponse)?;
+    observed_payment_intent(response, operation)
+}
+
+fn observed_payment_intent(
+    response: PaymentIntentWire,
+    operation: &CheckoutOperation,
+) -> Result<ObservedPaymentIntent, ReferenceAppError> {
     if response.object != "payment_intent"
         || !response.id.starts_with("pi_tiv_")
         || response.amount != operation.amount_minor()
@@ -503,6 +554,42 @@ async fn decode_provider_response(
     })
 }
 
+async fn recover_payment_intent_by_operation(
+    client: &reqwest::Client,
+    fixture_base_url: &str,
+    operation: &CheckoutOperation,
+) -> Result<Option<ObservedPaymentIntent>, ReferenceAppError> {
+    let mut endpoint = reqwest::Url::parse(&format!(
+        "{}/v1/payment_intents/search",
+        fixture_base_url.trim_end_matches('/')
+    ))
+    .map_err(|_| ReferenceAppError::ProviderResponse)?;
+    endpoint
+        .query_pairs_mut()
+        .append_pair("operation_id", operation.operation_id());
+    let response = client
+        .get(endpoint)
+        .send()
+        .await
+        .map_err(|_| ReferenceAppError::ProviderTransport)?;
+    if response.status() != StatusCode::OK {
+        return Err(ReferenceAppError::ProviderResponse);
+    }
+    let response = response
+        .json::<PaymentIntentListWire>()
+        .await
+        .map_err(|_| ReferenceAppError::ProviderResponse)?;
+    if response.object != "list" || response.has_more || response.data.len() > 1 {
+        return Err(ReferenceAppError::ProviderResponse);
+    }
+    response
+        .data
+        .into_iter()
+        .next()
+        .map(|payment_intent| observed_payment_intent(payment_intent, operation))
+        .transpose()
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PaymentIntentWire {
@@ -518,6 +605,14 @@ struct PaymentIntentWire {
 #[serde(deny_unknown_fields)]
 struct PaymentIntentMetadataWire {
     operation_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PaymentIntentListWire {
+    object: String,
+    data: Vec<PaymentIntentWire>,
+    has_more: bool,
 }
 
 /// Verifies the fixture's narrow `t=...,v1=...` HMAC header over the exact raw
@@ -667,6 +762,7 @@ pub struct ReferenceAppConfig {
     webhook_secret: Vec<u8>,
     control_probe_address: String,
     retry_key_mode: RetryKeyMode,
+    caller_retry_mode: CallerRetryMode,
     webhook_effect_mode: WebhookEffectMode,
     ledger_balance_mode: LedgerBalanceMode,
 }
@@ -713,6 +809,7 @@ impl ReferenceAppConfig {
             webhook_secret,
             control_probe_address,
             retry_key_mode: RetryKeyMode::default(),
+            caller_retry_mode: CallerRetryMode::default(),
             webhook_effect_mode: WebhookEffectMode::default(),
             ledger_balance_mode: LedgerBalanceMode::default(),
         })
@@ -727,6 +824,17 @@ impl ReferenceAppConfig {
     #[must_use]
     pub const fn retry_key_mode(&self) -> RetryKeyMode {
         self.retry_key_mode
+    }
+
+    #[must_use]
+    pub const fn with_caller_retry_mode(mut self, caller_retry_mode: CallerRetryMode) -> Self {
+        self.caller_retry_mode = caller_retry_mode;
+        self
+    }
+
+    #[must_use]
+    pub const fn caller_retry_mode(&self) -> CallerRetryMode {
+        self.caller_retry_mode
     }
 
     #[must_use]
@@ -885,7 +993,8 @@ impl ReferenceApp {
             .execute(
                 "INSERT INTO payments \
                      (operation_id, stripe_payment_intent_id, amount_minor, currency, status) \
-                 VALUES ($1, $2, $3, $4, 'pending')",
+                 VALUES ($1, $2, $3, $4, 'pending') \
+                 ON CONFLICT DO NOTHING",
                 &[
                     &payment_intent.operation_id(),
                     &payment_intent.id(),
@@ -1102,6 +1211,7 @@ async fn handle_app_request(
             &serde_json::json!({
                 "status": "ok",
                 "retry_key_mode": app.config.retry_key_mode.as_str(),
+                "caller_retry_mode": app.config.caller_retry_mode.as_str(),
                 "webhook_effect_mode": app.config.webhook_effect_mode.as_str(),
                 "ledger_balance_mode": app.config.ledger_balance_mode.as_str(),
             }),
@@ -1234,14 +1344,31 @@ async fn handle_checkout(
     }
     let payment_intent = match business_request_id {
         Some(business_request_id) => {
-            create_with_retry_key_mode_for_business_request(
-                &app.http_client,
-                &app.config.fixture_base_url,
-                &operation,
-                business_request_id,
-                app.config.retry_key_mode,
-            )
-            .await
+            let recovered =
+                if app.config.caller_retry_mode == CallerRetryMode::RepairedRecoverOperation {
+                    recover_payment_intent_by_operation(
+                        &app.http_client,
+                        &app.config.fixture_base_url,
+                        &operation,
+                    )
+                    .await
+                } else {
+                    Ok(None)
+                };
+            match recovered {
+                Ok(Some(payment_intent)) => Ok(payment_intent),
+                Ok(None) => {
+                    create_with_retry_key_mode_for_business_request(
+                        &app.http_client,
+                        &app.config.fixture_base_url,
+                        &operation,
+                        business_request_id,
+                        app.config.retry_key_mode,
+                    )
+                    .await
+                }
+                Err(error) => Err(error),
+            }
         }
         None => {
             create_with_retry_key_mode(
@@ -1532,6 +1659,10 @@ mod tests {
         .expect("the synthetic config is valid");
         assert_eq!(config.retry_key_mode(), RetryKeyMode::FaultyChangedKey);
         assert_eq!(
+            config.caller_retry_mode(),
+            CallerRetryMode::FaultyPerRequest
+        );
+        assert_eq!(
             config.webhook_effect_mode(),
             WebhookEffectMode::RepairedDeduplicate
         );
@@ -1542,9 +1673,14 @@ mod tests {
 
         let repaired = config
             .with_retry_key_mode(RetryKeyMode::RepairedSameKey)
+            .with_caller_retry_mode(CallerRetryMode::RepairedRecoverOperation)
             .with_webhook_effect_mode(WebhookEffectMode::FaultyDuplicateEffect)
             .with_ledger_balance_mode(LedgerBalanceMode::FaultyOneSidedOnDuplicate);
         assert_eq!(repaired.retry_key_mode(), RetryKeyMode::RepairedSameKey);
+        assert_eq!(
+            repaired.caller_retry_mode(),
+            CallerRetryMode::RepairedRecoverOperation
+        );
         assert_eq!(
             repaired.webhook_effect_mode(),
             WebhookEffectMode::FaultyDuplicateEffect

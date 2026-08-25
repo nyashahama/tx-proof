@@ -32,6 +32,9 @@ const ARTIFACT_ROOT: &str = concat!(
 const RETRY_KEY_MODE_ENV: &str = "TIV_REFERENCE_APP_RETRY_KEY_MODE";
 const FAULTY_RETRY_KEY_MODE: &str = "faulty_changed_key";
 const REPAIRED_RETRY_KEY_MODE: &str = "repaired_same_key";
+const CALLER_RETRY_MODE_ENV: &str = "TIV_REFERENCE_APP_CALLER_RETRY_MODE";
+const FAULTY_CALLER_RETRY_MODE: &str = "faulty_per_request";
+const REPAIRED_CALLER_RETRY_MODE: &str = "repaired_recover_operation";
 const WEBHOOK_EFFECT_MODE_ENV: &str = "TIV_REFERENCE_APP_WEBHOOK_EFFECT_MODE";
 const FAULTY_WEBHOOK_EFFECT_MODE: &str = "faulty_duplicate_effect";
 const REPAIRED_WEBHOOK_EFFECT_MODE: &str = "repaired_deduplicate";
@@ -240,6 +243,263 @@ async fn row_three_changed_key_fault_violates_and_same_key_repair_holds() {
     cleanup_reference_databases().await;
     fs::remove_dir_all(ARTIFACT_ROOT).unwrap();
     recreate_reference_app_in_retry_mode("faulty_changed_key");
+    restore.disarm();
+}
+
+#[tokio::test]
+#[ignore = "requires the isolated reference-app Compose project"]
+#[allow(clippy::too_many_lines)]
+async fn row_four_lost_response_caller_retry_fault_violates_and_recovery_holds() {
+    let _guard = E2E_LOCK.lock().await;
+    let mut restore = ReferenceAppModeRestore::armed();
+    let _ = fs::remove_dir_all(ARTIFACT_ROOT);
+    let faulty_modes = (
+        REPAIRED_RETRY_KEY_MODE,
+        FAULTY_CALLER_RETRY_MODE,
+        REPAIRED_WEBHOOK_EFFECT_MODE,
+        REPAIRED_LEDGER_BALANCE_MODE,
+    );
+
+    recreate_reference_app_in_all_modes(
+        faulty_modes.0,
+        faulty_modes.1,
+        faulty_modes.2,
+        faulty_modes.3,
+    );
+    prepare_reference_baseline().await;
+    reset_fixture_process().await;
+    let faulty_output = run_configured_command_in_all_modes(
+        422,
+        faulty_modes.0,
+        faulty_modes.1,
+        faulty_modes.2,
+        faulty_modes.3,
+    );
+    assert_eq!(
+        faulty_output.status.code(),
+        Some(10),
+        "the per-request caller retry must violate: {}",
+        String::from_utf8_lossy(&faulty_output.stderr)
+    );
+    let faulty_receipt: serde_json::Value =
+        serde_json::from_slice(&faulty_output.stdout).expect("faulty stdout is JSON");
+    let faulty_path = Path::new(faulty_receipt["artifact_path"].as_str().unwrap());
+    verify_complete_run_artifact(faulty_path).expect("the faulty artifact verifies");
+    let faulty_summary: serde_json::Value =
+        serde_json::from_slice(&fs::read(faulty_path.join("summary.json")).unwrap()).unwrap();
+    assert_eq!(faulty_summary["cases"][0]["provider_object_count"], 2);
+    assert!(
+        faulty_summary["cases"][0]["invariants"]
+            .as_array()
+            .is_some_and(|invariants| {
+                invariants.len() == 5
+                    && invariants.iter().all(|invariant| {
+                        if invariant["invariant_id"] == "provider-object-unique" {
+                            invariant["verdict"] == "violated" && invariant["witness_count"] == 1
+                        } else {
+                            invariant["verdict"] == "held" && invariant["witness_count"] == 0
+                        }
+                    })
+            })
+    );
+    assert_row_four_trace(faulty_path);
+    assert_reference_payment_relation((2, 2)).await;
+
+    let replay_output = configured_replay_command_in_all_modes(
+        faulty_path,
+        faulty_modes.0,
+        faulty_modes.1,
+        faulty_modes.2,
+        faulty_modes.3,
+    )
+    .output()
+    .expect("the row-four configured replay executes");
+    assert_eq!(
+        replay_output.status.code(),
+        Some(10),
+        "row-four replay failed: {}",
+        String::from_utf8_lossy(&replay_output.stderr)
+    );
+    let replay_receipt: serde_json::Value =
+        serde_json::from_slice(&replay_output.stdout).expect("replay stdout is JSON");
+    assert_eq!(replay_receipt["attempt_count"], 3);
+    assert_eq!(replay_receipt["matching_failure_count"], 3);
+    assert_eq!(replay_receipt["classification"], "stable");
+    let replay_path = Path::new(replay_receipt["artifact_path"].as_str().unwrap());
+    verify_complete_run_artifact(replay_path).expect("the row-four replay artifact verifies");
+    let replay_summary: serde_json::Value =
+        serde_json::from_slice(&fs::read(replay_path.join("summary.json")).unwrap()).unwrap();
+    assert!(
+        replay_summary["attempts"]
+            .as_array()
+            .is_some_and(|attempts| {
+                attempts.len() == 3
+                    && attempts.iter().all(|attempt| {
+                        attempt["verdict"] == "expected_violation"
+                            && exact_invariant_vector(attempt, "provider-object-unique", true)
+                    })
+            })
+    );
+
+    let shrink_output = configured_shrink_command_in_all_modes(
+        replay_path,
+        faulty_modes.0,
+        faulty_modes.1,
+        faulty_modes.2,
+        faulty_modes.3,
+    )
+    .output()
+    .expect("the row-four configured shrink executes");
+    assert!(
+        matches!(shrink_output.status.code(), Some(10 | 11)),
+        "row-four shrink failed: {}",
+        String::from_utf8_lossy(&shrink_output.stderr)
+    );
+    let shrink_receipt: serde_json::Value =
+        serde_json::from_slice(&shrink_output.stdout).expect("shrink stdout is JSON");
+    assert!(
+        shrink_receipt["evaluated_candidates"]
+            .as_u64()
+            .is_some_and(|count| (1..=3).contains(&count))
+    );
+    assert!(
+        shrink_receipt["accepted_candidates"]
+            .as_u64()
+            .is_some_and(|count| count >= 1)
+    );
+    assert!(
+        shrink_receipt["best_action_count"].as_u64()
+            < shrink_receipt["original_action_count"].as_u64()
+    );
+    let shrink_path = Path::new(shrink_receipt["artifact_path"].as_str().unwrap());
+    verify_complete_run_artifact(shrink_path).expect("the row-four shrink artifact verifies");
+    let shrink_summary: serde_json::Value =
+        serde_json::from_slice(&fs::read(shrink_path.join("summary.json")).unwrap()).unwrap();
+    for candidate in shrink_summary["candidates"].as_array().unwrap() {
+        let candidate_id = candidate["candidate_id"].as_str().unwrap();
+        let candidate_trace: serde_json::Value = serde_json::from_slice(
+            &fs::read(
+                shrink_path
+                    .join("candidates")
+                    .join(candidate_id)
+                    .join("candidate.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let schedule = candidate_trace["schedule"].as_array().unwrap();
+        let retains_kill = schedule.iter().any(|action| {
+            action["kind"]["kind"] == "kill_application"
+                && action["kind"]["cut_point"] == "client_response_observed"
+        });
+        let retains_retry = schedule
+            .iter()
+            .any(|action| action["kind"]["kind"] == "retry_business_request");
+        if !retains_kill || !retains_retry {
+            assert_eq!(candidate["accepted"], false);
+        }
+    }
+    let minimized_authority: serde_json::Value =
+        serde_json::from_slice(&fs::read(shrink_path.join("trace.minimized.json")).unwrap())
+            .unwrap();
+    let minimized_schedule = minimized_authority["candidate"]["schedule"]
+        .as_array()
+        .expect("the row-four minimized authority retains a schedule");
+    assert!(minimized_schedule.iter().any(|action| {
+        action["kind"]["kind"] == "kill_application"
+            && action["kind"]["cut_point"] == "client_response_observed"
+    }));
+    assert!(
+        minimized_schedule
+            .iter()
+            .any(|action| action["kind"]["kind"] == "retry_business_request")
+    );
+
+    let minimized_output = configured_minimized_replay_command_in_all_modes(
+        shrink_path,
+        faulty_modes.0,
+        faulty_modes.1,
+        faulty_modes.2,
+        faulty_modes.3,
+    )
+    .output()
+    .expect("the row-four minimized replay executes");
+    assert_eq!(
+        minimized_output.status.code(),
+        Some(10),
+        "row-four minimized replay failed: {}",
+        String::from_utf8_lossy(&minimized_output.stderr)
+    );
+    let minimized_receipt: serde_json::Value =
+        serde_json::from_slice(&minimized_output.stdout).expect("minimized stdout is JSON");
+    assert_eq!(minimized_receipt["attempt_count"], 3);
+    assert_eq!(minimized_receipt["matching_failure_count"], 3);
+    assert_eq!(minimized_receipt["classification"], "stable");
+    let minimized_path = Path::new(minimized_receipt["artifact_path"].as_str().unwrap());
+    verify_complete_run_artifact(minimized_path)
+        .expect("the row-four minimized replay artifact verifies");
+    let minimized_summary: serde_json::Value =
+        serde_json::from_slice(&fs::read(minimized_path.join("summary.json")).unwrap()).unwrap();
+    assert!(
+        minimized_summary["attempts"]
+            .as_array()
+            .is_some_and(|attempts| {
+                attempts.len() == 3
+                    && attempts.iter().all(|attempt| {
+                        exact_invariant_vector(attempt, "provider-object-unique", true)
+                    })
+            })
+    );
+
+    recreate_reference_app_in_all_modes(
+        REPAIRED_RETRY_KEY_MODE,
+        REPAIRED_CALLER_RETRY_MODE,
+        REPAIRED_WEBHOOK_EFFECT_MODE,
+        REPAIRED_LEDGER_BALANCE_MODE,
+    );
+    prepare_reference_baseline().await;
+    reset_fixture_process().await;
+    let repaired_output = run_configured_command_in_all_modes(
+        422,
+        REPAIRED_RETRY_KEY_MODE,
+        REPAIRED_CALLER_RETRY_MODE,
+        REPAIRED_WEBHOOK_EFFECT_MODE,
+        REPAIRED_LEDGER_BALANCE_MODE,
+    );
+    assert_eq!(
+        repaired_output.status.code(),
+        Some(0),
+        "the operation recovery control must hold: {}",
+        String::from_utf8_lossy(&repaired_output.stderr)
+    );
+    let repaired_receipt: serde_json::Value =
+        serde_json::from_slice(&repaired_output.stdout).expect("repaired stdout is JSON");
+    let repaired_path = Path::new(repaired_receipt["artifact_path"].as_str().unwrap());
+    verify_complete_run_artifact(repaired_path).expect("the repaired artifact verifies");
+    let repaired_summary: serde_json::Value =
+        serde_json::from_slice(&fs::read(repaired_path.join("summary.json")).unwrap()).unwrap();
+    assert_eq!(repaired_summary["cases"][0]["provider_object_count"], 1);
+    assert!(
+        repaired_summary["cases"][0]["invariants"]
+            .as_array()
+            .is_some_and(|invariants| {
+                invariants.len() == 5
+                    && invariants
+                        .iter()
+                        .all(|invariant| invariant["verdict"] == "held")
+            })
+    );
+    assert_row_four_trace(repaired_path);
+    assert_reference_payment_relation((1, 1)).await;
+
+    cleanup_reference_databases().await;
+    fs::remove_dir_all(ARTIFACT_ROOT).unwrap();
+    recreate_reference_app_in_all_modes(
+        FAULTY_RETRY_KEY_MODE,
+        FAULTY_CALLER_RETRY_MODE,
+        REPAIRED_WEBHOOK_EFFECT_MODE,
+        REPAIRED_LEDGER_BALANCE_MODE,
+    );
     restore.disarm();
 }
 
@@ -466,15 +726,26 @@ async fn row_six_one_sided_ledger_fault_violates_and_balanced_repair_holds() {
     let _ = fs::remove_dir_all(ARTIFACT_ROOT);
     let faulty_modes = (
         REPAIRED_RETRY_KEY_MODE,
+        FAULTY_CALLER_RETRY_MODE,
         REPAIRED_WEBHOOK_EFFECT_MODE,
         FAULTY_LEDGER_BALANCE_MODE,
     );
 
-    recreate_reference_app_in_all_modes(faulty_modes.0, faulty_modes.1, faulty_modes.2);
+    recreate_reference_app_in_all_modes(
+        faulty_modes.0,
+        faulty_modes.1,
+        faulty_modes.2,
+        faulty_modes.3,
+    );
     prepare_reference_baseline().await;
     reset_fixture_process().await;
-    let faulty_output =
-        run_configured_command_in_all_modes(1_792, faulty_modes.0, faulty_modes.1, faulty_modes.2);
+    let faulty_output = run_configured_command_in_all_modes(
+        1_792,
+        faulty_modes.0,
+        faulty_modes.1,
+        faulty_modes.2,
+        faulty_modes.3,
+    );
     assert_eq!(
         faulty_output.status.code(),
         Some(10),
@@ -517,6 +788,7 @@ async fn row_six_one_sided_ledger_fault_violates_and_balanced_repair_holds() {
 
     recreate_reference_app_in_all_modes(
         REPAIRED_RETRY_KEY_MODE,
+        FAULTY_CALLER_RETRY_MODE,
         REPAIRED_WEBHOOK_EFFECT_MODE,
         REPAIRED_LEDGER_BALANCE_MODE,
     );
@@ -525,6 +797,7 @@ async fn row_six_one_sided_ledger_fault_violates_and_balanced_repair_holds() {
     let repaired_output = run_configured_command_in_all_modes(
         1_792,
         REPAIRED_RETRY_KEY_MODE,
+        FAULTY_CALLER_RETRY_MODE,
         REPAIRED_WEBHOOK_EFFECT_MODE,
         REPAIRED_LEDGER_BALANCE_MODE,
     );
@@ -567,6 +840,7 @@ async fn row_six_one_sided_ledger_fault_violates_and_balanced_repair_holds() {
     fs::remove_dir_all(ARTIFACT_ROOT).unwrap();
     recreate_reference_app_in_all_modes(
         FAULTY_RETRY_KEY_MODE,
+        FAULTY_CALLER_RETRY_MODE,
         REPAIRED_WEBHOOK_EFFECT_MODE,
         REPAIRED_LEDGER_BALANCE_MODE,
     );
@@ -680,6 +954,7 @@ async fn faulty_ledger_mode_records_one_sided_duplicate_after_a_balanced_effect(
     let mut restore = ReferenceAppModeRestore::armed();
     recreate_reference_app_in_all_modes(
         REPAIRED_RETRY_KEY_MODE,
+        FAULTY_CALLER_RETRY_MODE,
         REPAIRED_WEBHOOK_EFFECT_MODE,
         FAULTY_LEDGER_BALANCE_MODE,
     );
@@ -757,6 +1032,7 @@ async fn faulty_ledger_mode_records_one_sided_duplicate_after_a_balanced_effect(
     cleanup_reference_databases().await;
     recreate_reference_app_in_all_modes(
         FAULTY_RETRY_KEY_MODE,
+        FAULTY_CALLER_RETRY_MODE,
         REPAIRED_WEBHOOK_EFFECT_MODE,
         REPAIRED_LEDGER_BALANCE_MODE,
     );
@@ -770,6 +1046,7 @@ async fn rejected_credit_posting_rolls_back_the_entire_webhook_transaction() {
     let mut restore = ReferenceAppModeRestore::armed();
     recreate_reference_app_in_all_modes(
         REPAIRED_RETRY_KEY_MODE,
+        FAULTY_CALLER_RETRY_MODE,
         REPAIRED_WEBHOOK_EFFECT_MODE,
         REPAIRED_LEDGER_BALANCE_MODE,
     );
@@ -853,6 +1130,7 @@ async fn rejected_credit_posting_rolls_back_the_entire_webhook_transaction() {
     cleanup_reference_databases().await;
     recreate_reference_app_in_all_modes(
         FAULTY_RETRY_KEY_MODE,
+        FAULTY_CALLER_RETRY_MODE,
         REPAIRED_WEBHOOK_EFFECT_MODE,
         REPAIRED_LEDGER_BALANCE_MODE,
     );
@@ -1624,6 +1902,7 @@ fn run_configured_command_in_modes(
     run_configured_command_in_all_modes(
         seed,
         retry_key_mode,
+        FAULTY_CALLER_RETRY_MODE,
         webhook_effect_mode,
         REPAIRED_LEDGER_BALANCE_MODE,
     )
@@ -1632,12 +1911,19 @@ fn run_configured_command_in_modes(
 fn run_configured_command_in_all_modes(
     seed: u64,
     retry_key_mode: &str,
+    caller_retry_mode: &str,
     webhook_effect_mode: &str,
     ledger_balance_mode: &str,
 ) -> std::process::Output {
-    require_reference_app_all_modes(retry_key_mode, webhook_effect_mode, ledger_balance_mode);
+    require_reference_app_all_modes(
+        retry_key_mode,
+        caller_retry_mode,
+        webhook_effect_mode,
+        ledger_balance_mode,
+    );
     configured_command(seed, 1)
         .env(RETRY_KEY_MODE_ENV, retry_key_mode)
+        .env(CALLER_RETRY_MODE_ENV, caller_retry_mode)
         .env(WEBHOOK_EFFECT_MODE_ENV, webhook_effect_mode)
         .env(LEDGER_BALANCE_MODE_ENV, ledger_balance_mode)
         .output()
@@ -1683,6 +1969,7 @@ fn configured_replay_command_in_modes(
     configured_replay_command_in_all_modes(
         artifact,
         retry_key_mode,
+        FAULTY_CALLER_RETRY_MODE,
         webhook_effect_mode,
         REPAIRED_LEDGER_BALANCE_MODE,
     )
@@ -1691,13 +1978,20 @@ fn configured_replay_command_in_modes(
 fn configured_replay_command_in_all_modes(
     artifact: &Path,
     retry_key_mode: &str,
+    caller_retry_mode: &str,
     webhook_effect_mode: &str,
     ledger_balance_mode: &str,
 ) -> Command {
-    require_reference_app_all_modes(retry_key_mode, webhook_effect_mode, ledger_balance_mode);
+    require_reference_app_all_modes(
+        retry_key_mode,
+        caller_retry_mode,
+        webhook_effect_mode,
+        ledger_balance_mode,
+    );
     let mut command = configured_replay_command(artifact);
     command
         .env(RETRY_KEY_MODE_ENV, retry_key_mode)
+        .env(CALLER_RETRY_MODE_ENV, caller_retry_mode)
         .env(WEBHOOK_EFFECT_MODE_ENV, webhook_effect_mode)
         .env(LEDGER_BALANCE_MODE_ENV, ledger_balance_mode);
     command
@@ -1738,6 +2032,7 @@ fn configured_shrink_command_in_modes(
     configured_shrink_command_in_all_modes(
         artifact,
         retry_key_mode,
+        FAULTY_CALLER_RETRY_MODE,
         webhook_effect_mode,
         REPAIRED_LEDGER_BALANCE_MODE,
     )
@@ -1746,13 +2041,20 @@ fn configured_shrink_command_in_modes(
 fn configured_shrink_command_in_all_modes(
     artifact: &Path,
     retry_key_mode: &str,
+    caller_retry_mode: &str,
     webhook_effect_mode: &str,
     ledger_balance_mode: &str,
 ) -> Command {
-    require_reference_app_all_modes(retry_key_mode, webhook_effect_mode, ledger_balance_mode);
+    require_reference_app_all_modes(
+        retry_key_mode,
+        caller_retry_mode,
+        webhook_effect_mode,
+        ledger_balance_mode,
+    );
     let mut command = configured_shrink_command_with_limit(artifact, 3);
     command
         .env(RETRY_KEY_MODE_ENV, retry_key_mode)
+        .env(CALLER_RETRY_MODE_ENV, caller_retry_mode)
         .env(WEBHOOK_EFFECT_MODE_ENV, webhook_effect_mode)
         .env(LEDGER_BALANCE_MODE_ENV, ledger_balance_mode);
     command
@@ -1786,6 +2088,7 @@ fn configured_minimized_replay_command_in_modes(
     configured_minimized_replay_command_in_all_modes(
         artifact,
         retry_key_mode,
+        FAULTY_CALLER_RETRY_MODE,
         webhook_effect_mode,
         REPAIRED_LEDGER_BALANCE_MODE,
     )
@@ -1794,13 +2097,20 @@ fn configured_minimized_replay_command_in_modes(
 fn configured_minimized_replay_command_in_all_modes(
     artifact: &Path,
     retry_key_mode: &str,
+    caller_retry_mode: &str,
     webhook_effect_mode: &str,
     ledger_balance_mode: &str,
 ) -> Command {
-    require_reference_app_all_modes(retry_key_mode, webhook_effect_mode, ledger_balance_mode);
+    require_reference_app_all_modes(
+        retry_key_mode,
+        caller_retry_mode,
+        webhook_effect_mode,
+        ledger_balance_mode,
+    );
     let mut command = configured_minimized_replay_command(artifact);
     command
         .env(RETRY_KEY_MODE_ENV, retry_key_mode)
+        .env(CALLER_RETRY_MODE_ENV, caller_retry_mode)
         .env(WEBHOOK_EFFECT_MODE_ENV, webhook_effect_mode)
         .env(LEDGER_BALANCE_MODE_ENV, ledger_balance_mode);
     command
@@ -1856,6 +2166,33 @@ fn assert_row_three_trace(artifact: &Path) {
     );
 }
 
+fn assert_row_four_trace(artifact: &Path) {
+    let campaign: serde_json::Value =
+        serde_json::from_slice(&fs::read(artifact.join("campaign-plan.json")).unwrap())
+            .expect("the campaign plan is JSON");
+    assert_eq!(campaign["spec"]["campaign_seed"], 422);
+    let trace: serde_json::Value =
+        serde_json::from_slice(&fs::read(artifact.join("cases/case_0001/trace.json")).unwrap())
+            .expect("the configured case trace is JSON");
+    let actions = trace["planned_case"]["actions"]
+        .as_array()
+        .expect("planned actions are recorded");
+    assert_eq!(actions[0]["kind"]["kind"], "drive_checkout");
+    assert_eq!(actions[0]["kind"]["provider_script"]["first"], "normal");
+    assert_eq!(actions[1]["kind"]["kind"], "kill_application");
+    assert_eq!(actions[1]["kind"]["cut_point"], "client_response_observed");
+    assert_eq!(actions[2]["kind"]["kind"], "restart_and_await_health");
+    assert_eq!(actions[3]["kind"]["kind"], "retry_business_request");
+    assert_eq!(actions[3]["kind"]["provider_script"]["first"], "normal");
+    assert_eq!(
+        actions
+            .iter()
+            .filter(|action| action["kind"]["kind"] == "kill_application")
+            .count(),
+        1
+    );
+}
+
 fn assert_row_one_trace(artifact: &Path) {
     let campaign: serde_json::Value =
         serde_json::from_slice(&fs::read(artifact.join("campaign-plan.json")).unwrap())
@@ -1905,11 +2242,11 @@ fn assert_row_one_trace(artifact: &Path) {
 #[allow(clippy::too_many_lines)]
 fn prove_duplicate_fault_replay_shrink(
     source_path: &Path,
-    modes: (&str, &str, &str),
+    modes: (&str, &str, &str, &str),
     invariant_id: &str,
 ) {
     let replay_output =
-        configured_replay_command_in_all_modes(source_path, modes.0, modes.1, modes.2)
+        configured_replay_command_in_all_modes(source_path, modes.0, modes.1, modes.2, modes.3)
             .output()
             .expect("the duplicate-fault configured replay executes");
     assert_eq!(
@@ -1948,7 +2285,7 @@ fn prove_duplicate_fault_replay_shrink(
     }
 
     let shrink_output =
-        configured_shrink_command_in_all_modes(replay_path, modes.0, modes.1, modes.2)
+        configured_shrink_command_in_all_modes(replay_path, modes.0, modes.1, modes.2, modes.3)
             .output()
             .expect("the duplicate-fault configured shrink executes");
     assert!(
@@ -2043,10 +2380,15 @@ fn prove_duplicate_fault_replay_shrink(
         "the minimized authority must retain the causal duplicate"
     );
 
-    let minimized_output =
-        configured_minimized_replay_command_in_all_modes(shrink_path, modes.0, modes.1, modes.2)
-            .output()
-            .expect("the duplicate-fault minimized replay executes");
+    let minimized_output = configured_minimized_replay_command_in_all_modes(
+        shrink_path,
+        modes.0,
+        modes.1,
+        modes.2,
+        modes.3,
+    )
+    .output()
+    .expect("the duplicate-fault minimized replay executes");
     assert_eq!(
         minimized_output.status.code(),
         Some(10),
@@ -2137,6 +2479,26 @@ async fn assert_reference_webhook_effect_count(expected: i64) {
     drop(client);
     connection.await.unwrap().unwrap();
     assert_eq!(observed, expected);
+}
+
+async fn assert_reference_payment_relation(expected: (i64, i64)) {
+    let case_url = ADMIN_URL.replace("/postgres", "/tiv_case_deadbeef");
+    let (client, connection) = tokio_postgres::connect(&case_url, NoTls)
+        .await
+        .expect("the test admin connects to the generated case");
+    let connection = tokio::spawn(connection);
+    let row = client
+        .query_one(
+            "SELECT COUNT(*)::bigint, \
+                    COUNT(DISTINCT stripe_payment_intent_id)::bigint \
+             FROM payments",
+            &[],
+        )
+        .await
+        .expect("the local payment relation is readable");
+    drop(client);
+    connection.await.unwrap().unwrap();
+    assert_eq!((row.get::<_, i64>(0), row.get::<_, i64>(1)), expected);
 }
 
 async fn assert_reference_webhook_delivery_count(expected: i64) {
@@ -2419,6 +2781,7 @@ fn recreate_reference_app_in_retry_mode(retry_key_mode: &str) {
 fn recreate_reference_app_in_modes(retry_key_mode: &str, webhook_effect_mode: &str) {
     recreate_reference_app_in_all_modes(
         retry_key_mode,
+        FAULTY_CALLER_RETRY_MODE,
         webhook_effect_mode,
         REPAIRED_LEDGER_BALANCE_MODE,
     );
@@ -2426,11 +2789,13 @@ fn recreate_reference_app_in_modes(retry_key_mode: &str, webhook_effect_mode: &s
 
 fn recreate_reference_app_in_all_modes(
     retry_key_mode: &str,
+    caller_retry_mode: &str,
     webhook_effect_mode: &str,
     ledger_balance_mode: &str,
 ) {
     let output = reference_app_recreate_command_in_all_modes(
         retry_key_mode,
+        caller_retry_mode,
         webhook_effect_mode,
         ledger_balance_mode,
     )
@@ -2444,6 +2809,7 @@ fn recreate_reference_app_in_all_modes(
     assert_reference_app_healthy();
 
     let expected_retry = format!("{RETRY_KEY_MODE_ENV}={retry_key_mode}");
+    let expected_caller = format!("{CALLER_RETRY_MODE_ENV}={caller_retry_mode}");
     let expected_webhook = format!("{WEBHOOK_EFFECT_MODE_ENV}={webhook_effect_mode}");
     let expected_ledger = format!("{LEDGER_BALANCE_MODE_ENV}={ledger_balance_mode}");
     let conflicting_retry = format!(
@@ -2452,6 +2818,14 @@ fn recreate_reference_app_in_all_modes(
             REPAIRED_RETRY_KEY_MODE
         } else {
             FAULTY_RETRY_KEY_MODE
+        }
+    );
+    let conflicting_caller = format!(
+        "{CALLER_RETRY_MODE_ENV}={}",
+        if caller_retry_mode == FAULTY_CALLER_RETRY_MODE {
+            REPAIRED_CALLER_RETRY_MODE
+        } else {
+            FAULTY_CALLER_RETRY_MODE
         }
     );
     let conflicting_webhook = format!(
@@ -2471,7 +2845,7 @@ fn recreate_reference_app_in_all_modes(
         }
     );
     let template = format!(
-        "{{{{range .Config.Env}}}}{{{{if eq . \"{expected_retry}\"}}}}retry {{{{end}}}}{{{{if eq . \"{conflicting_retry}\"}}}}retry_conflict {{{{end}}}}{{{{if eq . \"{expected_webhook}\"}}}}webhook {{{{end}}}}{{{{if eq . \"{conflicting_webhook}\"}}}}webhook_conflict {{{{end}}}}{{{{if eq . \"{expected_ledger}\"}}}}ledger {{{{end}}}}{{{{if eq . \"{conflicting_ledger}\"}}}}ledger_conflict {{{{end}}}}{{{{end}}}}"
+        "{{{{range .Config.Env}}}}{{{{if eq . \"{expected_retry}\"}}}}retry {{{{end}}}}{{{{if eq . \"{conflicting_retry}\"}}}}retry_conflict {{{{end}}}}{{{{if eq . \"{expected_caller}\"}}}}caller {{{{end}}}}{{{{if eq . \"{conflicting_caller}\"}}}}caller_conflict {{{{end}}}}{{{{if eq . \"{expected_webhook}\"}}}}webhook {{{{end}}}}{{{{if eq . \"{conflicting_webhook}\"}}}}webhook_conflict {{{{end}}}}{{{{if eq . \"{expected_ledger}\"}}}}ledger {{{{end}}}}{{{{if eq . \"{conflicting_ledger}\"}}}}ledger_conflict {{{{end}}}}{{{{end}}}}"
     );
     let inspection = Command::new("docker")
         .args([
@@ -2490,7 +2864,7 @@ fn recreate_reference_app_in_all_modes(
     observed.sort_unstable();
     assert_eq!(
         observed,
-        ["ledger", "retry", "webhook"],
+        ["caller", "ledger", "retry", "webhook"],
         "all selected reference-app modes must be present"
     );
 }
@@ -2498,6 +2872,7 @@ fn recreate_reference_app_in_all_modes(
 fn reference_app_recreate_command(retry_key_mode: &str, webhook_effect_mode: &str) -> Command {
     reference_app_recreate_command_in_all_modes(
         retry_key_mode,
+        FAULTY_CALLER_RETRY_MODE,
         webhook_effect_mode,
         REPAIRED_LEDGER_BALANCE_MODE,
     )
@@ -2505,10 +2880,16 @@ fn reference_app_recreate_command(retry_key_mode: &str, webhook_effect_mode: &st
 
 fn reference_app_recreate_command_in_all_modes(
     retry_key_mode: &str,
+    caller_retry_mode: &str,
     webhook_effect_mode: &str,
     ledger_balance_mode: &str,
 ) -> Command {
-    require_reference_app_all_modes(retry_key_mode, webhook_effect_mode, ledger_balance_mode);
+    require_reference_app_all_modes(
+        retry_key_mode,
+        caller_retry_mode,
+        webhook_effect_mode,
+        ledger_balance_mode,
+    );
     let repository_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let compose_file = repository_root.join("spike/reference-app.compose.yaml");
     let mut command = Command::new("docker");
@@ -2536,6 +2917,7 @@ fn reference_app_recreate_command_in_all_modes(
             "reference-app",
         ])
         .env(RETRY_KEY_MODE_ENV, retry_key_mode)
+        .env(CALLER_RETRY_MODE_ENV, caller_retry_mode)
         .env(WEBHOOK_EFFECT_MODE_ENV, webhook_effect_mode)
         .env(LEDGER_BALANCE_MODE_ENV, ledger_balance_mode)
         .env_remove("DOCKER_HOST")
@@ -2547,12 +2929,17 @@ fn reference_app_recreate_command_in_all_modes(
 
 fn require_reference_app_all_modes(
     retry_key_mode: &str,
+    caller_retry_mode: &str,
     webhook_effect_mode: &str,
     ledger_balance_mode: &str,
 ) {
     assert!(matches!(
         retry_key_mode,
         "faulty_changed_key" | "repaired_same_key"
+    ));
+    assert!(matches!(
+        caller_retry_mode,
+        "faulty_per_request" | "repaired_recover_operation"
     ));
     assert!(matches!(
         webhook_effect_mode,
@@ -2662,7 +3049,8 @@ async fn prepare_reference_baseline() {
                  stripe_payment_intent_id text NOT NULL, \
                  amount_minor bigint NOT NULL CHECK (amount_minor > 0), \
                  currency text NOT NULL CHECK (currency ~ '^[a-z]{3}$'), \
-                 status text NOT NULL CHECK (status IN ('pending', 'succeeded')) \
+                 status text NOT NULL CHECK (status IN ('pending', 'succeeded')), \
+                 UNIQUE (operation_id, stripe_payment_intent_id) \
              ); \
              CREATE TABLE processed_webhook_events ( \
                  provider_event_id text PRIMARY KEY \

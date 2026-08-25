@@ -167,6 +167,7 @@ jobs:
             --file spike/reference-app.compose.yaml \
             config --hash '*' > ci-evidence/reference-app.compose.hash
           TIV_REFERENCE_APP_RETRY_KEY_MODE=faulty_changed_key \
+          TIV_REFERENCE_APP_CALLER_RETRY_MODE=faulty_per_request \
           TIV_REFERENCE_APP_WEBHOOK_EFFECT_MODE=repaired_deduplicate \
           TIV_REFERENCE_APP_LEDGER_MODE=repaired_balanced_once \
             docker compose \
@@ -175,6 +176,7 @@ jobs:
             --file spike/reference-app.compose.yaml \
             config --hash reference-app > ci-evidence/reference-app.retry-faulty.hash
           TIV_REFERENCE_APP_RETRY_KEY_MODE=repaired_same_key \
+          TIV_REFERENCE_APP_CALLER_RETRY_MODE=faulty_per_request \
           TIV_REFERENCE_APP_WEBHOOK_EFFECT_MODE=repaired_deduplicate \
           TIV_REFERENCE_APP_LEDGER_MODE=repaired_balanced_once \
             docker compose \
@@ -189,6 +191,22 @@ jobs:
             exit 1
           fi
           TIV_REFERENCE_APP_RETRY_KEY_MODE=repaired_same_key \
+          TIV_REFERENCE_APP_CALLER_RETRY_MODE=repaired_recover_operation \
+          TIV_REFERENCE_APP_WEBHOOK_EFFECT_MODE=repaired_deduplicate \
+          TIV_REFERENCE_APP_LEDGER_MODE=repaired_balanced_once \
+            docker compose \
+            --project-name tiv-reference-app-spike \
+            --project-directory "$PWD" \
+            --file spike/reference-app.compose.yaml \
+            config --hash reference-app > ci-evidence/reference-app.caller-repaired.hash
+          if cmp --silent \
+              ci-evidence/reference-app.caller-repaired.hash \
+              ci-evidence/reference-app.retry-repaired.hash; then
+            echo "caller-retry modes resolved to the same reference-app image" >&2
+            exit 1
+          fi
+          TIV_REFERENCE_APP_RETRY_KEY_MODE=repaired_same_key \
+          TIV_REFERENCE_APP_CALLER_RETRY_MODE=faulty_per_request \
           TIV_REFERENCE_APP_WEBHOOK_EFFECT_MODE=faulty_duplicate_effect \
           TIV_REFERENCE_APP_LEDGER_MODE=repaired_balanced_once \
             docker compose \
@@ -203,6 +221,7 @@ jobs:
             exit 1
           fi
           TIV_REFERENCE_APP_RETRY_KEY_MODE=repaired_same_key \
+          TIV_REFERENCE_APP_CALLER_RETRY_MODE=faulty_per_request \
           TIV_REFERENCE_APP_WEBHOOK_EFFECT_MODE=repaired_deduplicate \
           TIV_REFERENCE_APP_LEDGER_MODE=faulty_one_sided_duplicate \
             docker compose \
@@ -239,6 +258,7 @@ jobs:
         if: always()
         run: |
           TIV_REFERENCE_APP_RETRY_KEY_MODE=faulty_changed_key \
+          TIV_REFERENCE_APP_CALLER_RETRY_MODE=faulty_per_request \
           TIV_REFERENCE_APP_WEBHOOK_EFFECT_MODE=repaired_deduplicate \
           TIV_REFERENCE_APP_LEDGER_MODE=repaired_balanced_once \
             docker compose \
@@ -251,6 +271,11 @@ jobs:
             tiv-reference-app-spike-reference-app-1 \
             | grep --fixed-strings --line-regexp \
               'TIV_REFERENCE_APP_RETRY_KEY_MODE=faulty_changed_key'
+          docker inspect \
+            --format '{{range .Config.Env}}{{println .}}{{end}}' \
+            tiv-reference-app-spike-reference-app-1 \
+            | grep --fixed-strings --line-regexp \
+              'TIV_REFERENCE_APP_CALLER_RETRY_MODE=faulty_per_request'
           docker inspect \
             --format '{{range .Config.Env}}{{println .}}{{end}}' \
             tiv-reference-app-spike-reference-app-1 \

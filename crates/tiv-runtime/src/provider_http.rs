@@ -169,6 +169,7 @@ pub struct ProviderHttpAdapter {
     pending_client_response: Option<PendingClientResponse>,
     client_response_cut_points: BTreeSet<ActionId>,
     known_payment_intents: BTreeSet<String>,
+    recovered_business_outcomes: usize,
     driver_producer_sequence: u64,
     fixture_producer_sequence: u64,
 }
@@ -195,6 +196,7 @@ impl ProviderHttpAdapter {
             pending_client_response: None,
             client_response_cut_points: BTreeSet::new(),
             known_payment_intents: BTreeSet::new(),
+            recovered_business_outcomes: 0,
             driver_producer_sequence: 0,
             fixture_producer_sequence: 0,
         })
@@ -292,7 +294,7 @@ impl ProviderHttpAdapter {
             .map(|payment_intent| payment_intent.id.as_str())
             .collect::<BTreeSet<_>>();
         if !state.held_gates.is_empty()
-            || state.remaining_outcomes != 0
+            || state.remaining_outcomes != self.recovered_business_outcomes
             || observed.len() != self.known_payment_intents.len()
             || !observed
                 .iter()
@@ -308,8 +310,12 @@ impl ProviderHttpAdapter {
             .payment_intents
             .into_iter()
             .map(|payment_intent| {
+                let operation_id = payment_intent
+                    .operation_id
+                    .ok_or(ProviderHttpError::UnexpectedFixtureState)?;
                 ProviderPaymentIntent::new(
                     payment_intent.id,
+                    operation_id,
                     payment_intent.amount_minor,
                     payment_intent.currency,
                     payment_intent.status,
@@ -348,7 +354,17 @@ impl ProviderHttpAdapter {
 
         let state = self.fixture_state().await?;
         self.validate_control_sequence(&state)?;
-        let consumed = provider_script.outcomes().count();
+        let recovered_payment_intent_id = self.recovered_business_payment_intent_id(
+            request.action().kind(),
+            driver.as_ref(),
+            &known,
+            &state,
+        );
+        let consumed = if recovered_payment_intent_id.is_some() {
+            0
+        } else {
+            provider_script.outcomes().count()
+        };
         if !state.held_gates.is_empty()
             || baseline.remaining_outcomes.checked_sub(consumed) != Some(state.remaining_outcomes)
         {
@@ -365,7 +381,21 @@ impl ProviderHttpAdapter {
         {
             return Err(ProviderHttpError::UnexpectedFixtureState);
         }
-        let payment_intent_ids = payment_intent_attempt_ids(provider_script, &new_payment_intents)?;
+        let payment_intent_ids = match recovered_payment_intent_id {
+            Some(payment_intent_id)
+                if provider_script.committed_count() == 1 && new_payment_intents.is_empty() =>
+            {
+                vec![payment_intent_id.to_owned()]
+            }
+            Some(_) => return Err(ProviderHttpError::UnexpectedFixtureState),
+            None => payment_intent_attempt_ids(provider_script, &new_payment_intents)?,
+        };
+        if recovered_payment_intent_id.is_some() {
+            self.recovered_business_outcomes = self
+                .recovered_business_outcomes
+                .checked_add(provider_script.outcomes().count())
+                .ok_or(ProviderHttpError::SequenceExhausted)?;
+        }
         if let Some(driver) = driver
             && (payment_intent_ids.last() != Some(&driver.payment_intent_id)
                 || driver.operation_id != self.config.expected_operation_id)
@@ -395,6 +425,29 @@ impl ProviderHttpAdapter {
             self.pending_client_response = Some(pending_client_response);
         }
         Ok(captured)
+    }
+
+    fn recovered_business_payment_intent_id<'driver>(
+        &self,
+        action: &PlanActionKind,
+        driver: Option<&'driver DriverCheckoutResponse>,
+        known: &BTreeSet<&str>,
+        state: &FixtureState,
+    ) -> Option<&'driver str> {
+        let driver =
+            driver.filter(|_| matches!(action, PlanActionKind::RetryBusinessRequest { .. }))?;
+        let payment_intent_id = driver.payment_intent_id.as_str();
+        known
+            .contains(payment_intent_id)
+            .then_some(())
+            .and_then(|()| {
+                state
+                    .payment_intents
+                    .iter()
+                    .find(|payment_intent| payment_intent.id == payment_intent_id)
+            })
+            .filter(|payment_intent| self.valid_created_payment_intent(payment_intent))
+            .map(|_| payment_intent_id)
     }
 
     async fn request_checkout_at_cut_point(

@@ -493,12 +493,19 @@ struct PaymentIntentMetadataWire<'a> {
     operation_id: Option<&'a str>,
 }
 
-fn payment_intent_json(payment_intent: &PaymentIntent) -> Result<Vec<u8>, FixtureError> {
+#[derive(Serialize)]
+struct PaymentIntentListWire<'a> {
+    object: &'static str,
+    data: Vec<PaymentIntentWire<'a>>,
+    has_more: bool,
+}
+
+fn payment_intent_wire(payment_intent: &PaymentIntent) -> PaymentIntentWire<'_> {
     let status = match payment_intent.status {
         PaymentIntentStatus::RequiresConfirmation => "requires_confirmation",
         PaymentIntentStatus::Succeeded => "succeeded",
     };
-    serde_json::to_vec(&PaymentIntentWire {
+    PaymentIntentWire {
         id: &payment_intent.id,
         object: "payment_intent",
         amount: payment_intent.amount_minor,
@@ -507,8 +514,12 @@ fn payment_intent_json(payment_intent: &PaymentIntent) -> Result<Vec<u8>, Fixtur
         metadata: PaymentIntentMetadataWire {
             operation_id: payment_intent.operation_id(),
         },
-    })
-    .map_err(|_| FixtureError::Serialization)
+    }
+}
+
+fn payment_intent_json(payment_intent: &PaymentIntent) -> Result<Vec<u8>, FixtureError> {
+    serde_json::to_vec(&payment_intent_wire(payment_intent))
+        .map_err(|_| FixtureError::Serialization)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -850,6 +861,13 @@ impl ManagedFixture {
         payment_intent_id: &str,
     ) -> Result<DataPlaneResponse, FixtureError> {
         self.fixture.retrieve_data_plane(payment_intent_id)
+    }
+
+    pub(crate) fn search_data_plane(
+        &self,
+        operation_id: &str,
+    ) -> Result<DataPlaneResponse, FixtureError> {
+        self.fixture.search_data_plane(operation_id)
     }
 
     /// Confirms every provider object and returns signed, losslessly encoded
@@ -1514,6 +1532,22 @@ impl PaymentIntentFixture {
             200,
             payment_intent_json(&payment_intent)?,
         ))
+    }
+
+    fn search_data_plane(&self, operation_id: &str) -> Result<DataPlaneResponse, FixtureError> {
+        let data = self
+            .payment_intents
+            .iter()
+            .filter(|payment_intent| payment_intent.operation_id() == Some(operation_id))
+            .map(payment_intent_wire)
+            .collect();
+        let raw_body = serde_json::to_vec(&PaymentIntentListWire {
+            object: "list",
+            data,
+            has_more: false,
+        })
+        .map_err(|_| FixtureError::Serialization)?;
+        Ok(DataPlaneResponse::json(200, raw_body))
     }
 
     #[must_use]

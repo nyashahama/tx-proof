@@ -14,7 +14,10 @@ use hyper::{
 use hyper_util::rt::TokioIo;
 use tiv_core::{
     decision::Seed,
-    plan::{ActionBudget, CasePlanCompiler, PlanActionKind, PlanSpec},
+    plan::{
+        ActionBudget, CasePlanCompiler, PlanActionKind, PlanSpec, ProcessFaultSpec,
+        ProviderOutcome, WebhookFaultSpec,
+    },
     trace::{CaseCapturedValue, CaseOutputSlot},
 };
 use tiv_runtime::{
@@ -255,7 +258,7 @@ async fn a_nonzero_planned_delay_defers_the_next_real_delivery() {
         webhook_http: WebhookHttpAdapter::new(config).unwrap(),
         payment_intent_ids,
     };
-    let plan = seeded_plan(7);
+    let plan = delayed_webhook_plan();
     let delay_index = plan
         .actions()
         .iter()
@@ -358,7 +361,7 @@ async fn an_application_rejection_fails_the_delivery_action() {
         webhook_http: WebhookHttpAdapter::new(config).unwrap(),
         payment_intent_ids,
     };
-    let plan = seeded_plan(7);
+    let plan = delayed_webhook_plan();
     let journal_path = journal_path();
 
     let error = execute_planned_case("run_7", "case_7", &plan, &journal_path, &mut adapter)
@@ -428,6 +431,18 @@ fn seeded_plan(seed: u64) -> tiv_core::plan::PlannedCase {
         ActionBudget::new(40).unwrap(),
     ))
     .unwrap()
+}
+
+fn delayed_webhook_plan() -> tiv_core::plan::PlannedCase {
+    let spec = PlanSpec::new_payment_intent_v1(
+        Seed::new(0),
+        ActionBudget::new(40).unwrap(),
+        [ProviderOutcome::Normal],
+        WebhookFaultSpec::new(0, [100], false, false).unwrap(),
+        ProcessFaultSpec::new([], 0).unwrap(),
+    )
+    .unwrap();
+    CasePlanCompiler::compile(&spec).unwrap()
 }
 
 struct ObservedDelivery {

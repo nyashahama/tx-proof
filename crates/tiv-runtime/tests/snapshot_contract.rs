@@ -137,6 +137,18 @@ fn configured_balanced_ledger_query_is_entry_scoped_and_scalar_bounded() {
     );
 }
 
+#[test]
+fn provider_uniqueness_query_is_led_by_provider_operation_metadata() {
+    let query = include_str!(
+        "../../../tests/configured-run-project/invariants/01_provider_object_unique.sql"
+    );
+
+    assert!(query.contains("FROM tiv_provider_state AS provider"));
+    assert!(query.contains("LEFT JOIN payments"));
+    assert!(query.contains("GROUP BY provider.operation_id"));
+    assert!(query.contains("COUNT(DISTINCT provider.payment_intent_id)"));
+}
+
 fn valid_queries() -> Vec<InvariantQuery> {
     V1_INVARIANT_IDS
         .into_iter()

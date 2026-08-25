@@ -13,9 +13,10 @@ use tiv_core::{
     },
 };
 use tiv_reference_app::{
-    CheckoutOperation, LedgerBalanceMode, ReferenceDatabaseName, RetryKeyMode, WebhookEffectMode,
-    create_with_changed_retry_key, create_with_changed_retry_key_for_business_request,
-    create_with_retry_key_mode, parse_succeeded_webhook_event, verify_webhook_signature,
+    CallerRetryMode, CheckoutOperation, LedgerBalanceMode, ReferenceDatabaseName, RetryKeyMode,
+    WebhookEffectMode, create_with_changed_retry_key,
+    create_with_changed_retry_key_for_business_request, create_with_retry_key_mode,
+    parse_succeeded_webhook_event, verify_webhook_signature,
 };
 use tiv_stripe_pi::{
     CreatePaymentIntent, FaultOutcome, IdempotencyKey, ManagedFixture, OperationId,
@@ -89,6 +90,30 @@ fn retry_key_mode_accepts_only_the_two_explicit_contract_values() {
         assert!(
             invalid.parse::<RetryKeyMode>().is_err(),
             "{invalid:?} must not select a retry mode"
+        );
+    }
+}
+
+#[test]
+fn caller_retry_mode_accepts_only_the_fault_and_repaired_contract_values() {
+    assert_eq!(
+        "faulty_per_request".parse::<CallerRetryMode>(),
+        Ok(CallerRetryMode::FaultyPerRequest)
+    );
+    assert_eq!(
+        "repaired_recover_operation".parse::<CallerRetryMode>(),
+        Ok(CallerRetryMode::RepairedRecoverOperation)
+    );
+    for invalid in [
+        "",
+        "faulty",
+        "repaired",
+        "FAULTY_PER_REQUEST",
+        "repaired_recover_operation ",
+    ] {
+        assert!(
+            invalid.parse::<CallerRetryMode>().is_err(),
+            "{invalid:?} must not select a caller-retry mode"
         );
     }
 }

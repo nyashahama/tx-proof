@@ -1,8 +1,8 @@
 use std::{env, error::Error, sync::Arc};
 
 use tiv_reference_app::{
-    LedgerBalanceMode, ReferenceApp, ReferenceAppConfig, RetryKeyMode, WebhookEffectMode,
-    serve_http1_connection,
+    CallerRetryMode, LedgerBalanceMode, ReferenceApp, ReferenceAppConfig, RetryKeyMode,
+    WebhookEffectMode, serve_http1_connection,
 };
 use tokio::net::TcpListener;
 
@@ -18,6 +18,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .parse::<u16>()
         .map_err(|_| "invalid TIV_POSTGRES_PORT")?;
     let retry_key_mode = retry_key_mode_from_env()?;
+    let caller_retry_mode = caller_retry_mode_from_env()?;
     let webhook_effect_mode = webhook_effect_mode_from_env()?;
     let ledger_balance_mode = ledger_balance_mode_from_env()?;
     let config = ReferenceAppConfig::new(
@@ -30,6 +31,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         required_env("TIV_FIXTURE_CONTROL_PROBE")?,
     )?
     .with_retry_key_mode(retry_key_mode)
+    .with_caller_retry_mode(caller_retry_mode)
     .with_webhook_effect_mode(webhook_effect_mode)
     .with_ledger_balance_mode(ledger_balance_mode);
     config.validate_modes()?;
@@ -50,6 +52,16 @@ fn retry_key_mode_from_env() -> Result<RetryKeyMode, Box<dyn Error>> {
         Ok(value) => value.parse().map_err(Into::into),
         Err(env::VarError::NotPresent) => Ok(RetryKeyMode::default()),
         Err(env::VarError::NotUnicode(_)) => Err("invalid TIV_REFERENCE_APP_RETRY_KEY_MODE".into()),
+    }
+}
+
+fn caller_retry_mode_from_env() -> Result<CallerRetryMode, Box<dyn Error>> {
+    match env::var("TIV_REFERENCE_APP_CALLER_RETRY_MODE") {
+        Ok(value) => value.parse().map_err(Into::into),
+        Err(env::VarError::NotPresent) => Ok(CallerRetryMode::default()),
+        Err(env::VarError::NotUnicode(_)) => {
+            Err("invalid TIV_REFERENCE_APP_CALLER_RETRY_MODE".into())
+        }
     }
 }
 

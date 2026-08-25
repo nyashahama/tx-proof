@@ -899,7 +899,15 @@ const fn cut_point_is_observable(phase: Phase, cut_point: ProcessCutPoint) -> bo
 
 fn apply_action(mut state: ModelState, action: PlanActionKind) -> Option<ModelState> {
     match action {
-        PlanActionKind::KillApplication { .. } if state.application_healthy => {
+        PlanActionKind::KillApplication { cut_point } if state.application_healthy => {
+            if cut_point == ProcessCutPoint::ClientResponseObserved
+                && state.phase == Phase::PaymentIntentKnown
+            {
+                state.phase = Phase::CheckoutRetryable {
+                    attempts: 0,
+                    ambiguous: false,
+                };
+            }
             state.application_healthy = false;
             state.process_kills += 1;
             return Some(state);

@@ -16,6 +16,9 @@ fn reference_stack_routes_fixture_webhooks_only_over_the_shared_data_network() {
         "TIV_REFERENCE_APP_RETRY_KEY_MODE: ${TIV_REFERENCE_APP_RETRY_KEY_MODE:-faulty_changed_key}"
     ));
     assert!(compose.contains(
+        "TIV_REFERENCE_APP_CALLER_RETRY_MODE: ${TIV_REFERENCE_APP_CALLER_RETRY_MODE:-faulty_per_request}"
+    ));
+    assert!(compose.contains(
         "TIV_REFERENCE_APP_WEBHOOK_EFFECT_MODE: ${TIV_REFERENCE_APP_WEBHOOK_EFFECT_MODE:-repaired_deduplicate}"
     ));
     assert!(compose.contains(
@@ -47,10 +50,13 @@ fn webhook_identity_is_validated_before_any_payment_mutation() {
 }
 
 #[test]
-fn reference_workflow_fingerprints_and_restores_the_ledger_mode() {
+fn reference_workflow_fingerprints_and_restores_the_reference_modes() {
     let workflow = include_str!("../../../.github/workflows/rust.yml");
 
     assert!(workflow.contains("reference-app.ledger-faulty.hash"));
+    assert!(workflow.contains("reference-app.caller-repaired.hash"));
+    assert!(workflow.contains("TIV_REFERENCE_APP_CALLER_RETRY_MODE=repaired_recover_operation"));
+    assert!(workflow.contains("'TIV_REFERENCE_APP_CALLER_RETRY_MODE=faulty_per_request'"));
     assert!(workflow.contains("TIV_REFERENCE_APP_LEDGER_MODE=faulty_one_sided_duplicate"));
     assert!(workflow.contains("TIV_REFERENCE_APP_LEDGER_MODE=repaired_balanced_once"));
     assert!(workflow.contains("'TIV_REFERENCE_APP_LEDGER_MODE=repaired_balanced_once'"));

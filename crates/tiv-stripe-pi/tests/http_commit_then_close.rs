@@ -17,10 +17,12 @@ async fn a_stripe_shaped_client_can_create_confirm_and_retrieve() {
     let address = listener.local_addr().expect("the listener has an address");
     let server_fixture = Arc::clone(&fixture);
     let server = tokio::spawn(async move {
-        let (stream, _) = listener.accept().await.expect("a client connects");
-        serve_http1_connection(stream, server_fixture, FaultOutcome::Normal)
-            .await
-            .expect("the Stripe-shaped connection is served");
+        for _ in 0..3 {
+            let (stream, _) = listener.accept().await.expect("a client connects");
+            serve_http1_connection(stream, Arc::clone(&server_fixture), FaultOutcome::Normal)
+                .await
+                .expect("the Stripe-shaped connection is served");
+        }
     });
     let client = reqwest::Client::new();
     let collection_url = format!("http://{address}/v1/payment_intents");
@@ -28,6 +30,7 @@ async fn a_stripe_shaped_client_can_create_confirm_and_retrieve() {
     let created: serde_json::Value = client
         .post(&collection_url)
         .header("Idempotency-Key", "checkout-order-42")
+        .header("Connection", "close")
         .form(&[("amount", "2500"), ("currency", "usd")])
         .send()
         .await
@@ -43,6 +46,7 @@ async fn a_stripe_shaped_client_can_create_confirm_and_retrieve() {
     let instance_url = format!("{collection_url}/{payment_intent_id}");
     let confirmed: serde_json::Value = client
         .post(format!("{instance_url}/confirm"))
+        .header("Connection", "close")
         .header("Content-Type", "application/x-www-form-urlencoded")
         .body("")
         .send()
@@ -55,6 +59,7 @@ async fn a_stripe_shaped_client_can_create_confirm_and_retrieve() {
         .expect("the confirm response is JSON");
     let retrieved: serde_json::Value = client
         .get(instance_url)
+        .header("Connection", "close")
         .send()
         .await
         .expect("the retrieve receives a response")
@@ -305,6 +310,74 @@ async fn a_post_execution_500_replays_the_exact_cached_http_response() {
         .expect("the two-connection server stops")
         .expect("the server task does not panic");
     assert_eq!(fixture.lock().await.payment_intent_count(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn operation_search_recovers_an_object_hidden_by_post_execution_500() {
+    let fixture = Arc::new(Mutex::new(PaymentIntentFixture::new(Seed::new(42))));
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("a loopback port is available");
+    let address = listener.local_addr().expect("the listener has an address");
+    let server_fixture = Arc::clone(&fixture);
+    let server = tokio::spawn(async move {
+        for _ in 0..3 {
+            let (stream, _) = listener.accept().await.expect("a client connects");
+            let _result = serve_http1_connection(
+                stream,
+                Arc::clone(&server_fixture),
+                FaultOutcome::PostExecute500,
+            )
+            .await;
+        }
+    });
+    let client = reqwest::Client::new();
+    let collection_url = format!("http://{address}/v1/payment_intents");
+    let first = client
+        .post(&collection_url)
+        .header("Idempotency-Key", "checkout-order-42")
+        .header("Connection", "close")
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .body("amount=2500&currency=usd&metadata%5Boperation_id%5D=op_1")
+        .send()
+        .await
+        .expect("the injected failure is an HTTP response");
+    assert_eq!(first.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+    let recovered: serde_json::Value = client
+        .get(format!("{collection_url}/search?operation_id=op_1"))
+        .header("Connection", "close")
+        .send()
+        .await
+        .expect("the operation lookup receives a response")
+        .error_for_status()
+        .expect("the operation lookup succeeds")
+        .json()
+        .await
+        .expect("the operation lookup is JSON");
+    let missing: serde_json::Value = client
+        .get(format!("{collection_url}/search?operation_id=op_missing"))
+        .header("Connection", "close")
+        .send()
+        .await
+        .expect("the empty operation lookup receives a response")
+        .error_for_status()
+        .expect("the empty operation lookup succeeds")
+        .json()
+        .await
+        .expect("the empty operation lookup is JSON");
+
+    assert_eq!(recovered["object"], "list");
+    assert_eq!(recovered["has_more"], false);
+    assert_eq!(recovered["data"].as_array().map(Vec::len), Some(1));
+    assert_eq!(recovered["data"][0]["metadata"]["operation_id"], "op_1");
+    assert_eq!(missing["data"], serde_json::json!([]));
+    assert_eq!(fixture.lock().await.payment_intent_count(), 1);
+    drop(client);
+    timeout(Duration::from_secs(2), server)
+        .await
+        .expect("the search connection stops")
+        .expect("the server task does not panic");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -96,22 +96,25 @@ docker compose \
 The reference application selects its retry behavior once at process startup
 through `TIV_REFERENCE_APP_RETRY_KEY_MODE`. The only accepted values are
 `faulty_changed_key` and `repaired_same_key`; the Compose default is the faulty
-mode. Webhook business-effect behavior is likewise startup-only through
+mode. Caller retry behavior is independently startup-only through
+`TIV_REFERENCE_APP_CALLER_RETRY_MODE`, with exact values
+`faulty_per_request` and `repaired_recover_operation`; the faulty mode is the
+default. Webhook business-effect behavior is likewise startup-only through
 `TIV_REFERENCE_APP_WEBHOOK_EFFECT_MODE`, with exact values
 `faulty_duplicate_effect` and `repaired_deduplicate`; the repaired mode is the
 default. Ledger posting behavior is startup-only through
 `TIV_REFERENCE_APP_LEDGER_MODE`, with exact values
 `faulty_one_sided_duplicate` and `repaired_balanced_once`; the repaired mode is
 the default. There is no request header or route parameter that can switch any
-behavior inside a run. `/health` reports all three non-secret modes, and the
+behavior inside a run. `/health` reports all four non-secret modes, and the
 direct `reference-app-evidence` command additionally attests the exact
-faulty-retry, repaired-effect, repaired-ledger mode set before it labels a
-changed-key counterexample. The duplicate-effect and one-sided-ledger faults
-are mutually exclusive; selecting both fails process startup rather than
-reporting a mode whose behavior is hidden by branch precedence.
+faulty-key, faulty-caller, repaired-effect, repaired-ledger mode set before it
+labels a changed-key counterexample. The duplicate-effect and one-sided-ledger
+faults are mutually exclusive; selecting both fails process startup rather
+than reporting a mode whose behavior is hidden by branch precedence.
 
 The resolved Compose configuration, and therefore its configuration hash,
-includes all three modes. A command inspecting a non-default stack must receive
+includes all four modes. A command inspecting a non-default stack must receive
 the same environment values; evidence from one mode set is intentionally not
 compatible with a stack resolved under another set.
 
@@ -165,6 +168,29 @@ objects and violates `provider-object-unique`; the repaired app reuses one
 provider object, aliases both attempt outputs to that identity, and all five
 configured invariants hold. This is a bounded paired regression for reference
 fault row 3, not a proof over arbitrary schedules or customer applications.
+
+The row-four pair uses campaign seed `422`. The compiled trace completes one
+checkout, observes its successful application response, SIGKILLs the app before
+that logical response is acknowledged to the caller, restarts it, and issues a
+new caller business request. The faulty caller mode creates one provider object
+per request, leaving two provider objects and two distinct local payment rows;
+only `provider-object-unique` fails. The repaired caller mode first performs the
+fixture's bounded operation-metadata lookup, accepts exactly one matching
+PaymentIntent, and persists the recovered provider/local pair without issuing
+another create. It therefore leaves one provider object, one local payment row,
+and all five invariants held. Source replay and the minimized authority are
+stable 3/3; shrink rejects candidates that remove either the response-observed
+crash or the caller retry:
+
+```sh
+CARGO_INCREMENTAL=0 cargo test -p tiv-cli --test configured_run \
+  row_four_lost_response_caller_retry_fault_violates_and_recovery_holds \
+  -- --ignored --exact --nocapture
+```
+
+This is a bounded synthetic recovery contract. The operation lookup is a
+fixture-only Stripe-shaped endpoint, not a claim that the public Stripe API
+supports arbitrary PaymentIntent lookup by metadata.
 
 Then run the real application path:
 

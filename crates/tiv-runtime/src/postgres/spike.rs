@@ -639,7 +639,8 @@ impl TruthSpikePostgres {
                          stripe_payment_intent_id text NOT NULL, \
                          amount_minor bigint NOT NULL CHECK (amount_minor > 0), \
                          currency text NOT NULL CHECK (currency ~ '^[a-z]{3}$'), \
-                         status text NOT NULL CHECK (status IN ('pending', 'succeeded')) \
+                         status text NOT NULL CHECK (status IN ('pending', 'succeeded')), \
+                         UNIQUE (operation_id, stripe_payment_intent_id) \
                      ); \
                      CREATE TABLE processed_webhook_events ( \
                          provider_event_id text PRIMARY KEY \
@@ -1453,8 +1454,8 @@ mod tests {
         let baseline_target = provisioned.baseline_target().clone();
         let case_name = provisioned.case_name().clone();
         let original_oid = provisioned.case_target().identity().database_oid();
-        let provider_objects = provider_objects();
         let operation_id = format!("op_{suffix}");
+        let provider_objects = provider_objects(&operation_id);
 
         let stale_case_target = DatabaseTarget::new(provisioned.case_target().identity().clone());
         let dirty_case_target = postgres
@@ -1480,9 +1481,9 @@ mod tests {
             .expect("a fresh identity check authorizes the template reset");
         assert_ne!(reset_target.identity().database_oid(), original_oid);
         let clean_report = postgres
-            .check_reference_invariants(&case_name, &provider_objects, quiescence())
+            .check_reference_invariants(&case_name, &[], quiescence())
             .await
-            .expect("the clean baseline snapshot completes");
+            .expect("the reset database and provider baseline snapshot completes");
         assert!(matches!(
             clean_report
                 .outcome("provider-object-unique")
@@ -1501,9 +1502,9 @@ mod tests {
             )))
         ));
         let still_clean_report = postgres
-            .check_reference_invariants(&case_name, &provider_objects, quiescence())
+            .check_reference_invariants(&case_name, &[], quiescence())
             .await
-            .expect("the rejected stale write leaves the reset baseline inspectable");
+            .expect("the rejected stale write leaves both reset projections inspectable");
         assert!(matches!(
             still_clean_report
                 .outcome("provider-object-unique")
@@ -1549,8 +1550,8 @@ mod tests {
         );
         assert!(archive_metadata.len() > 0, "the archive is not empty");
         let original_oid = first_case_target.identity().database_oid();
-        let provider_objects = provider_objects();
         let operation_id = format!("op_{suffix}");
+        let provider_objects = provider_objects(&operation_id);
         let dirty_case_target = postgres
             .insert_buggy_payment_pair(first_case_target, &operation_id, &provider_objects)
             .await
@@ -1568,9 +1569,9 @@ mod tests {
 
         assert_ne!(reset_target.identity().database_oid(), original_oid);
         let clean_report = postgres
-            .check_reference_invariants(&case_name, &provider_objects, quiescence())
+            .check_reference_invariants(&case_name, &[], quiescence())
             .await
-            .expect("the restored case is inspectable");
+            .expect("the restored database and provider baseline are inspectable");
         assert!(matches!(
             clean_report
                 .outcome("provider-object-unique")
@@ -2741,12 +2742,24 @@ mod tests {
         ComposeProjectId::new(project).expect("the test project name is valid")
     }
 
-    fn provider_objects() -> [ProviderPaymentIntent; 2] {
+    fn provider_objects(operation_id: &str) -> [ProviderPaymentIntent; 2] {
         [
-            ProviderPaymentIntent::new("pi_tiv_first", 2_500, "usd", "requires_confirmation")
-                .expect("the first provider projection is valid"),
-            ProviderPaymentIntent::new("pi_tiv_retry", 2_500, "usd", "requires_confirmation")
-                .expect("the retry provider projection is valid"),
+            ProviderPaymentIntent::new(
+                "pi_tiv_first",
+                operation_id,
+                2_500,
+                "usd",
+                "requires_confirmation",
+            )
+            .expect("the first provider projection is valid"),
+            ProviderPaymentIntent::new(
+                "pi_tiv_retry",
+                operation_id,
+                2_500,
+                "usd",
+                "requires_confirmation",
+            )
+            .expect("the retry provider projection is valid"),
         ]
     }
 
@@ -2858,6 +2871,7 @@ mod tests {
                 .map(|payment_intent| {
                     ProviderPaymentIntent::new(
                         payment_intent.id(),
+                        &operation_id,
                         2_500,
                         "usd",
                         "requires_confirmation",
@@ -2906,6 +2920,9 @@ mod tests {
             .map(|payment_intent| {
                 ProviderPaymentIntent::new(
                     payment_intent.id(),
+                    payment_intent
+                        .operation_id()
+                        .expect("the fixture object retains operation metadata"),
                     payment_intent.amount_minor(),
                     payment_intent.currency(),
                     payment_intent.status(),

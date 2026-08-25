@@ -991,15 +991,16 @@ fn plan_starting_normal_with_confirm(
     confirm_script: ProviderOutcomeScript,
 ) -> tiv_core::plan::PlannedCase {
     let outcome = confirm_script.outcomes().next().unwrap();
-    let seed = match outcome {
-        ProviderOutcome::Normal => 101,
-        ProviderOutcome::PreExecute429 => 18,
-        ProviderOutcome::PreExecute500 => 10,
-        ProviderOutcome::PostExecute500 => 20,
-        ProviderOutcome::CommitThenClose => 6,
-        ProviderOutcome::CommitThenDelay => 138,
-    };
-    let plan = compile_plan(seed);
+    let seed = u64::from(outcome != ProviderOutcome::Normal);
+    let spec = PlanSpec::new_payment_intent_v1(
+        Seed::new(seed),
+        ActionBudget::new(40).unwrap(),
+        [ProviderOutcome::Normal, outcome],
+        WebhookFaultSpec::new(0, [], false, false).unwrap(),
+        ProcessFaultSpec::new([], 0).unwrap(),
+    )
+    .unwrap();
+    let plan = CasePlanCompiler::compile(&spec).unwrap();
     assert!(matches!(
         plan.actions().first().map(tiv_core::plan::PlannedAction::kind),
         Some(PlanActionKind::DriveCheckout { provider_script })
