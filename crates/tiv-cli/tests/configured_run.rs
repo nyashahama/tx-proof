@@ -1384,6 +1384,7 @@ async fn configured_replay_reproduces_one_verified_failure_three_times() {
         "configured_campaign",
         "counterexample",
         "tiv replay configured",
+        2,
     );
 
     let replay_output = configured_replay_command(source_path)
@@ -1410,6 +1411,7 @@ async fn configured_replay_reproduces_one_verified_failure_three_times() {
         "configured_replay",
         "counterexample",
         "tiv replay configured",
+        1,
     );
     let replay_manifest: serde_json::Value =
         serde_json::from_slice(&fs::read(replay_path.join("manifest.json")).unwrap()).unwrap();
@@ -1499,6 +1501,7 @@ async fn configured_shrink_evaluates_one_replayed_candidate_and_finalizes_eviden
         "configured_campaign",
         "counterexample",
         "tiv replay configured",
+        2,
     );
 
     let replay_output = configured_replay_command(source_path)
@@ -1520,6 +1523,7 @@ async fn configured_shrink_evaluates_one_replayed_candidate_and_finalizes_eviden
         "configured_replay",
         "counterexample",
         "tiv replay configured",
+        1,
     );
 
     let shrink_output = configured_shrink_command(replay_path)
@@ -1563,6 +1567,7 @@ async fn configured_shrink_evaluates_one_replayed_candidate_and_finalizes_eviden
             "counterexample"
         },
         "tiv replay minimized",
+        1,
     );
     let shrink_manifest: serde_json::Value =
         serde_json::from_slice(&fs::read(shrink_path.join("manifest.json")).unwrap()).unwrap();
@@ -1708,6 +1713,7 @@ async fn configured_shrink_evaluates_one_replayed_candidate_and_finalizes_eviden
         "configured_minimized_replay",
         "counterexample",
         "tiv replay minimized",
+        1,
     );
     let minimized_replay_manifest: serde_json::Value =
         serde_json::from_slice(&fs::read(minimized_replay_path.join("manifest.json")).unwrap())
@@ -3703,6 +3709,7 @@ fn assert_complete_report_bundle(
     expected_kind: &str,
     expected_result: &str,
     expected_command: &str,
+    expected_failures: usize,
 ) {
     let manifest: serde_json::Value =
         serde_json::from_slice(&fs::read(artifact.join("manifest.json")).unwrap()).unwrap();
@@ -3732,7 +3739,7 @@ fn assert_complete_report_bundle(
     assert!(junit.starts_with("<?xml version=\"1.0\" encoding=\"UTF-8\"?>"));
     assert!(junit.contains(&format!("value=\"{expected_kind}\"")));
     assert!(junit.contains(&format!("value=\"{expected_result}\"")));
-    assert!(junit.contains("failures=\"1\""));
+    assert!(junit.contains(&format!("failures=\"{expected_failures}\"")));
 }
 
 fn assert_partial_report_bundle(
