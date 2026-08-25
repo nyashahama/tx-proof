@@ -290,24 +290,24 @@ fn client_response_observed_kill_restarts_and_finishes_the_live_case() {
             .as_u64()
             .is_some_and(|count| count >= (plan.actions().len() * 2 + 1) as u64)
     );
-    assert!(
-        value["invariant_outcomes"]
-            .as_array()
-            .is_some_and(|outcomes| {
-                outcomes.len() == 5
-                    && outcomes.iter().all(|outcome| {
-                        if outcome["invariant_id"] == "provider-object-unique" {
-                            outcome["verdict"] == "violated" && outcome["witness_count"] == 1
-                        } else {
-                            outcome["verdict"] == "held" && outcome["witness_count"] == 0
-                        }
-                    })
-            })
-    );
+    assert_provider_uniqueness_only(&value["invariant_outcomes"]);
     assert!(journal_path.exists());
     std::fs::remove_file(journal_path).unwrap();
     std::fs::remove_file(plan_path).unwrap();
     assert!(!String::from_utf8_lossy(&output.stdout).contains("password"));
+}
+
+fn assert_provider_uniqueness_only(value: &serde_json::Value) {
+    assert!(value.as_array().is_some_and(|outcomes| {
+        outcomes.len() == 5
+            && outcomes.iter().all(|outcome| {
+                if outcome["invariant_id"] == "provider-object-unique" {
+                    outcome["verdict"] == "violated" && outcome["witness_count"] == 1
+                } else {
+                    outcome["verdict"] == "held" && outcome["witness_count"] == 0
+                }
+            })
+    }));
 }
 
 #[test]
