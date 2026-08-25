@@ -367,7 +367,14 @@ jobs:
             .journal_record_count >= 30 and
             (.journal_last_record_hash | length) == 64 and
             (.invariant_outcomes | length) == 5 and
-            all(.invariant_outcomes[]; .verdict == "held")
+            all(
+              .invariant_outcomes[];
+              if .invariant_id == "provider-object-unique" then
+                .verdict == "violated" and .witness_count == 1
+              else
+                .verdict == "held" and .witness_count == 0
+              end
+            )
           ' ci-evidence/reference-app-process-case.json
 
       - name: Prove a lost client response at an attested SIGKILL boundary

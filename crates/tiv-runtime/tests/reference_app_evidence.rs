@@ -55,6 +55,7 @@ fn reference_workflow_fingerprints_and_restores_the_reference_modes() {
 
     assert!(workflow.contains("reference-app.ledger-faulty.hash"));
     assert!(workflow.contains("reference-app.caller-repaired.hash"));
+    assert!(workflow.contains("if .invariant_id == \"provider-object-unique\" then"));
     assert!(workflow.contains("TIV_REFERENCE_APP_CALLER_RETRY_MODE=repaired_recover_operation"));
     assert!(workflow.contains("'TIV_REFERENCE_APP_CALLER_RETRY_MODE=faulty_per_request'"));
     assert!(workflow.contains("TIV_REFERENCE_APP_LEDGER_MODE=faulty_one_sided_duplicate"));
