@@ -125,7 +125,8 @@ export function TraceInstrument({ pinnedScenario }: { pinnedScenario?: ScenarioI
       <div
         className={styles.scenarioPanel}
         id="trace-scenario-panel"
-        role="tabpanel"
+        role={pinnedScenario ? "region" : "tabpanel"}
+        aria-labelledby={pinnedScenario ? titleId : undefined}
         aria-live="off"
       >
         <div className={styles.scenarioHeading}>

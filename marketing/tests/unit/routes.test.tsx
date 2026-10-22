@@ -30,6 +30,7 @@ describe("supporting marketing routes", () => {
     const user = userEvent.setup();
     render(<CounterexamplePage />);
     expect(screen.queryByRole("tablist")).not.toBeInTheDocument();
+    expect(screen.queryByRole("tabpanel")).not.toBeInTheDocument();
     expect(screen.getByText("9 recorded events")).toBeVisible();
     await user.click(screen.getByRole("button", { name: "Minimize trace" }));
     expect(screen.getByRole("list", { name: "Minimized counterexample" }).children).toHaveLength(5);
