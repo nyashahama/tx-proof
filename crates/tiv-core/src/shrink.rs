@@ -9,8 +9,8 @@ use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 
 use crate::{
     plan::{
-        Checkpoint, PlanActionKind, PlanValidationError, PlannedAction, PlannedCase,
-        ProcessCutPoint, ProviderOutcome, ProviderOutcomeScript, SCHEDULER_ALGORITHM,
+        Checkpoint, LEGACY_SCHEDULER_ALGORITHM, PlanActionKind, PlanValidationError, PlannedAction,
+        PlannedCase, ProcessCutPoint, ProviderOutcome, ProviderOutcomeScript, SCHEDULER_ALGORITHM,
         normalize_replay_action_kinds, validate_replay_action_kinds,
     },
     trace::ActionId,
@@ -206,8 +206,9 @@ impl ShrinkCandidate {
         }
         validate_lineage(&source, &schedule)?;
         let kinds = schedule.iter().map(|entry| entry.kind).collect::<Vec<_>>();
-        let eligible_counts = validate_replay_action_kinds(source.spec(), &kinds)
-            .map_err(ShrinkError::InvalidSchedule)?;
+        let eligible_counts =
+            validate_replay_action_kinds(source.spec(), &kinds, source.scheduler_algorithm())
+                .map_err(ShrinkError::InvalidSchedule)?;
         if !reference_cut_points_are_supported(&kinds) {
             return Err(ShrinkError::InvalidReferenceCutPoint);
         }
@@ -509,7 +510,11 @@ impl CandidateGenerator {
             return;
         }
         let kinds = proposal.iter().map(|entry| entry.kind).collect::<Vec<_>>();
-        let Some(retained) = normalize_replay_action_kinds(self.source.spec(), &kinds) else {
+        let Some(retained) = normalize_replay_action_kinds(
+            self.source.spec(),
+            &kinds,
+            self.source.scheduler_algorithm(),
+        ) else {
             return;
         };
         let normalized = retained
@@ -531,7 +536,10 @@ impl CandidateGenerator {
 
 fn validate_seeded_source(source: &PlannedCase) -> Result<(), ShrinkError> {
     source.validate().map_err(ShrinkError::InvalidSource)?;
-    if source.scheduler_algorithm() != SCHEDULER_ALGORITHM {
+    if !matches!(
+        source.scheduler_algorithm(),
+        SCHEDULER_ALGORITHM | LEGACY_SCHEDULER_ALGORITHM
+    ) {
         return Err(ShrinkError::SourceIsNotSeeded);
     }
     Ok(())

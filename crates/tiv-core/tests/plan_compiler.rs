@@ -3,9 +3,10 @@ use std::collections::BTreeSet;
 use tiv_core::{
     decision::Seed,
     plan::{
-        ActionBudget, CasePlanCompiler, Checkpoint, PlanActionKind, PlanCompileError, PlanSpec,
-        PlanValidationError, PlannedAction, PlannedCase, ProcessCutPoint, ProcessFaultSpec,
-        ProviderOutcome, ProviderOutcomeScript, SCHEDULER_ALGORITHM, WebhookFaultSpec,
+        ActionBudget, CasePlanCompiler, Checkpoint, LEGACY_SCHEDULER_ALGORITHM, PlanActionKind,
+        PlanCompileError, PlanSpec, PlanValidationError, PlannedAction, PlannedCase,
+        ProcessCutPoint, ProcessFaultSpec, ProviderOutcome, ProviderOutcomeScript,
+        SCHEDULER_ALGORITHM, WebhookFaultSpec,
     },
     trace::ActionId,
 };
@@ -95,17 +96,46 @@ fn the_same_seed_and_spec_compile_to_the_same_plan() {
 
 #[test]
 fn the_v3_plan_artifact_matches_its_golden_contract() {
-    let spec = PlanSpec::payment_intent_v1(Seed::new(42), ActionBudget::new(40).unwrap());
-    let plan = CasePlanCompiler::compile(&spec).expect("the v1 plan is feasible");
-    let actual = format!("{}\n", serde_json::to_string_pretty(&plan).unwrap());
+    let encoded = include_str!("golden/planned-case-v3.json");
+    let legacy: PlannedCase =
+        serde_json::from_str(encoded).expect("the original v3 plan revalidates");
+    assert_eq!(legacy.scheduler_algorithm(), LEGACY_SCHEDULER_ALGORITHM);
+    assert_eq!(
+        format!("{}\n", serde_json::to_string_pretty(&legacy).unwrap()),
+        encoded
+    );
+    let generator = tiv_core::shrink::CandidateGenerator::new(&legacy)
+        .expect("legacy sources remain shrinkable");
+    for candidate in generator
+        .candidates(None, tiv_core::shrink::CandidateLimit::default())
+        .unwrap()
+    {
+        candidate
+            .validate()
+            .expect("legacy shrink eligibility remains stable");
+        let encoded = serde_json::to_vec(&candidate).unwrap();
+        let decoded: tiv_core::shrink::ShrinkCandidate = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded, candidate);
+    }
+}
 
+#[test]
+fn the_reference_cutpoint_plan_matches_its_golden_contract() {
+    let spec = PlanSpec::payment_intent_v1(Seed::new(42), ActionBudget::new(40).unwrap());
+    let plan = CasePlanCompiler::compile(&spec).unwrap();
+    let actual = format!("{}\n", serde_json::to_string_pretty(&plan).unwrap());
     assert_eq!(
         actual,
-        include_str!("golden/planned-case-v3.json"),
-        "intentional plan wire changes require an explicit golden update"
+        include_str!("golden/planned-case-reference-cutpoints-v1.json")
     );
-    let decoded: PlannedCase = serde_json::from_str(&actual).expect("the golden plan revalidates");
+    let decoded: PlannedCase = serde_json::from_str(&actual).unwrap();
     assert_eq!(decoded, plan);
+    let mut relabeled = serde_json::to_value(&plan).unwrap();
+    relabeled["scheduler_algorithm"] = serde_json::json!(LEGACY_SCHEDULER_ALGORITHM);
+    assert!(
+        serde_json::from_value::<PlannedCase>(relabeled).is_err(),
+        "eligibility revisions cannot be relabeled"
+    );
 }
 
 #[test]

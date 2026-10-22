@@ -302,6 +302,19 @@ Additional controls:
 
 The compiler contains the minimal PaymentIntent state machine and enumerates only currently eligible actions. It samples from that ordered set; it never generates invalid actions and rejects invalid externally supplied traces.
 
+New plans record the scheduler policy suffix `+reference-cutpoints/v1`. A process
+cut must follow the exact application or webhook action that the runtime can
+observe; reaching a later lifecycle phase does not keep an earlier cut eligible.
+The original scheduler identifier remains supported when validating and shrinking
+persisted artifacts. Replay uses the policy recorded in the artifact, and a
+campaign cannot mix policies. Runtime preflight still rejects unsupported cuts
+in older or externally supplied schedules.
+
+The compiler/runtime regression corpus covers all five cut points, all six
+provider outcomes, and action budgets of 6, 10, 20, and 40. The ignored
+`configured_run_completes_the_default_twenty_case_campaign` test exercises seed
+`424242` and twenty serial cases against the disposable reference stack.
+
 The action vocabulary is intentionally closed in v0:
 
 - drive checkout;
@@ -1022,7 +1035,7 @@ Row 3 uses campaign seed `69` for one checkout script (`commit_then_close`, then
 `provider-object-unique`; its repaired mode preserves both planned attempt
 outputs while aliasing them to one provider object and immutable event. Each
 repaired execution finalizes a verified artifact with all five configured
-invariants held. Row 4 uses campaign seed `422` to observe a successful checkout
+invariants held. Row 4 uses campaign seed `153423` to observe a successful checkout
 response, SIGKILL the application before caller acknowledgement, restart, and
 retry the business request. Its faulty per-request mode creates two provider
 objects and two local payment rows, violating only `provider-object-unique`.

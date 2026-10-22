@@ -15,8 +15,11 @@ pub const MAX_ACTIONS_PER_CASE: u32 = 40;
 pub const MAX_CASES: u32 = 500;
 pub const PAYMENT_INTENT_V1_API_VERSION: &str = "2026-02-25.clover";
 pub const CASE_SEED_DERIVATION: &str = "blake3/1.8.6/derive_key:dev.txproof.case-seed.v1/le-u64";
-pub const SCHEDULER_ALGORITHM: &str =
+/// Original v3 eligibility policy, retained for persisted artifact replay.
+pub const LEGACY_SCHEDULER_ALGORITHM: &str =
     "rand/0.10.2/random_range+rand_chacha/0.10.0/ChaCha20Rng-seed_from_u64";
+pub const SCHEDULER_ALGORITHM: &str =
+    "rand/0.10.2/random_range+rand_chacha/0.10.0/ChaCha20Rng-seed_from_u64+reference-cutpoints/v1";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InvalidActionBudget {
@@ -562,12 +565,16 @@ impl PlannedCase {
         if self.schema_version != PLAN_SCHEMA_VERSION {
             return Err(PlanValidationError::UnsupportedSchemaVersion);
         }
-        if self.scheduler_algorithm != SCHEDULER_ALGORITHM {
+        if !matches!(
+            self.scheduler_algorithm.as_str(),
+            SCHEDULER_ALGORITHM | LEGACY_SCHEDULER_ALGORITHM
+        ) {
             return Err(PlanValidationError::UnsupportedSchedulerAlgorithm);
         }
         self.spec.validate()?;
-        let expected = CasePlanCompiler::compile(&self.spec)
-            .map_err(|_| PlanValidationError::PlanIsNotFeasible)?;
+        let expected =
+            CasePlanCompiler::compile_with_scheduler(&self.spec, &self.scheduler_algorithm)
+                .map_err(|_| PlanValidationError::PlanIsNotFeasible)?;
         if self != &expected {
             return Err(PlanValidationError::PlanDoesNotMatchDecisionStream);
         }
@@ -633,8 +640,15 @@ impl CasePlanCompiler {
     /// Returns [`PlanCompileError`] when the specification is outside the v1
     /// contract or its action budget cannot reach the final checkpoint.
     pub fn compile(spec: &PlanSpec) -> Result<PlannedCase, PlanCompileError> {
+        Self::compile_with_scheduler(spec, SCHEDULER_ALGORITHM)
+    }
+
+    fn compile_with_scheduler(
+        spec: &PlanSpec,
+        scheduler: &str,
+    ) -> Result<PlannedCase, PlanCompileError> {
         spec.validate().map_err(PlanCompileError::InvalidSpec)?;
-        let initial = ModelState::default();
+        let initial = ModelState::for_scheduler(scheduler);
         let mut minimum_cache = BTreeMap::new();
         let minimum = minimum_actions_to_complete(initial, spec, &mut minimum_cache)
             .ok_or(PlanCompileError::NoEligibleAction)?;
@@ -684,7 +698,7 @@ impl CasePlanCompiler {
 
         Ok(PlannedCase {
             schema_version: PLAN_SCHEMA_VERSION,
-            scheduler_algorithm: SCHEDULER_ALGORITHM.to_owned(),
+            scheduler_algorithm: scheduler.to_owned(),
             spec: spec.clone(),
             decision_count: actions.len() as u64,
             actions,
@@ -698,6 +712,8 @@ struct ModelState {
     provider_objects: u8,
     application_healthy: bool,
     process_kills: u8,
+    legacy_cut_points: bool,
+    observation: CutPointObservation,
 }
 
 impl Default for ModelState {
@@ -707,11 +723,20 @@ impl Default for ModelState {
             provider_objects: 0,
             application_healthy: true,
             process_kills: 0,
+            legacy_cut_points: false,
+            observation: CutPointObservation::None,
         }
     }
 }
 
 impl ModelState {
+    fn for_scheduler(scheduler: &str) -> Self {
+        Self {
+            legacy_cut_points: scheduler == LEGACY_SCHEDULER_ALGORITHM,
+            ..Self::default()
+        }
+    }
+
     const fn is_complete(self) -> bool {
         matches!(self.phase, Phase::Complete)
     }
@@ -810,7 +835,13 @@ fn eligible_actions(state: ModelState, spec: &PlanSpec) -> Vec<PlanActionKind> {
                 .cut_points
                 .iter()
                 .copied()
-                .filter(|cut_point| cut_point_is_observable(state.phase, *cut_point))
+                .filter(|cut_point| {
+                    if state.legacy_cut_points {
+                        cut_point_is_observable(state.phase, *cut_point)
+                    } else {
+                        state.observation.supports(*cut_point)
+                    }
+                })
                 .map(|cut_point| PlanActionKind::KillApplication { cut_point }),
         );
     }
@@ -890,6 +921,59 @@ fn event_actions(events: EventState, provider_objects: u8, spec: &PlanSpec) -> V
     actions
 }
 
+// A process fault belongs to the immediately preceding runtime effect. A
+// lifecycle phase alone cannot prove that the adapter can observe that effect.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum CutPointObservation {
+    None,
+    InitialCheckoutResponse,
+    CheckoutResponse,
+    CheckoutRequestHeld,
+    WebhookDelivery,
+}
+
+impl CutPointObservation {
+    fn after(action: PlanActionKind) -> Self {
+        match action {
+            PlanActionKind::DriveCheckout { provider_script }
+                if provider_script.terminal_outcome() == ProviderOutcome::Normal =>
+            {
+                Self::InitialCheckoutResponse
+            }
+            PlanActionKind::DriveCheckout { provider_script }
+            | PlanActionKind::RetryBusinessRequest { provider_script } => {
+                if provider_script.terminal_outcome() == ProviderOutcome::CommitThenDelay {
+                    Self::CheckoutRequestHeld
+                } else {
+                    Self::CheckoutResponse
+                }
+            }
+            PlanActionKind::DeliverWebhook | PlanActionKind::DuplicateWebhook => {
+                Self::WebhookDelivery
+            }
+            _ => Self::None,
+        }
+    }
+
+    const fn supports(self, cut_point: ProcessCutPoint) -> bool {
+        matches!(
+            (self, cut_point),
+            (
+                Self::CheckoutRequestHeld,
+                ProcessCutPoint::ClientRequestForwarded
+            ) | (
+                Self::InitialCheckoutResponse | Self::CheckoutResponse,
+                ProcessCutPoint::ClientResponseObserved
+            ) | (Self::InitialCheckoutResponse, ProcessCutPoint::SqlProbe)
+                | (
+                    Self::WebhookDelivery,
+                    ProcessCutPoint::WebhookRequestForwarded
+                        | ProcessCutPoint::WebhookResponseObserved
+                )
+        )
+    }
+}
+
 const fn cut_point_is_observable(phase: Phase, cut_point: ProcessCutPoint) -> bool {
     match cut_point {
         ProcessCutPoint::ClientRequestForwarded => matches!(
@@ -924,6 +1008,9 @@ const fn cut_point_is_observable(phase: Phase, cut_point: ProcessCutPoint) -> bo
 }
 
 fn apply_action(mut state: ModelState, action: PlanActionKind) -> Option<ModelState> {
+    if !state.legacy_cut_points && state.process_kills == 0 {
+        state.observation = CutPointObservation::after(action);
+    }
     match action {
         PlanActionKind::KillApplication { cut_point } if state.application_healthy => {
             if cut_point == ProcessCutPoint::ClientResponseObserved
@@ -982,13 +1069,14 @@ fn apply_action(mut state: ModelState, action: PlanActionKind) -> Option<ModelSt
 pub(crate) fn validate_replay_action_kinds(
     spec: &PlanSpec,
     actions: &[PlanActionKind],
+    scheduler: &str,
 ) -> Result<Vec<usize>, PlanValidationError> {
     spec.validate()?;
     if actions.len() > usize::try_from(MAX_ACTIONS_PER_CASE).expect("the v1 bound fits usize") {
         return Err(PlanValidationError::CapabilityOutsideV1Bounds);
     }
 
-    let mut state = ModelState::default();
+    let mut state = ModelState::for_scheduler(scheduler);
     let mut eligible_counts = Vec::with_capacity(actions.len());
     for action in actions {
         let eligible = eligible_actions(state, spec);
@@ -1007,9 +1095,10 @@ pub(crate) fn validate_replay_action_kinds(
 pub(crate) fn normalize_replay_action_kinds(
     spec: &PlanSpec,
     actions: &[PlanActionKind],
+    scheduler: &str,
 ) -> Option<Vec<usize>> {
     spec.validate().ok()?;
-    let mut state = ModelState::default();
+    let mut state = ModelState::for_scheduler(scheduler);
     let mut retained = Vec::with_capacity(actions.len());
     for (index, action) in actions.iter().enumerate() {
         let eligible = eligible_actions(state, spec);
@@ -1396,7 +1485,12 @@ impl CampaignPlan {
         self.spec
             .validate()
             .map_err(|_| CampaignValidationError::InvalidSpec)?;
-        let expected = CampaignPlanner::compile(&self.spec)
+        let scheduler = self
+            .cases
+            .first()
+            .map(|case| case.plan.scheduler_algorithm.as_str())
+            .ok_or(CampaignValidationError::CampaignDoesNotMatchSpec)?;
+        let expected = CampaignPlanner::compile_with_scheduler(&self.spec, scheduler)
             .map_err(|_| CampaignValidationError::CampaignIsNotFeasible)?;
         if self != &expected {
             return Err(CampaignValidationError::CampaignDoesNotMatchSpec);
@@ -1461,12 +1555,19 @@ impl CampaignPlanner {
     /// Returns [`CampaignCompileError`] when the campaign specification or any
     /// derived case cannot reach its final checkpoint within budget.
     pub fn compile(spec: &CampaignSpec) -> Result<CampaignPlan, CampaignCompileError> {
+        Self::compile_with_scheduler(spec, SCHEDULER_ALGORITHM)
+    }
+
+    fn compile_with_scheduler(
+        spec: &CampaignSpec,
+        scheduler: &str,
+    ) -> Result<CampaignPlan, CampaignCompileError> {
         spec.validate().map_err(CampaignCompileError::InvalidSpec)?;
         let mut cases = Vec::with_capacity(spec.case_count.value() as usize);
         for value in 1..=spec.case_count.value() {
             let case_id = CaseId(value);
             let seed = derive_case_seed(spec.campaign_seed, case_id);
-            let plan = CasePlanCompiler::compile(&spec.case_spec(seed))
+            let plan = CasePlanCompiler::compile_with_scheduler(&spec.case_spec(seed), scheduler)
                 .map_err(|source| CampaignCompileError::InvalidCase { case_id, source })?;
             cases.push(CampaignCase { case_id, plan });
         }
@@ -1488,4 +1589,35 @@ fn derive_case_seed(campaign_seed: Seed, case_id: CaseId) -> Seed {
     let mut seed = [0_u8; 8];
     seed.copy_from_slice(&digest[..8]);
     Seed::new(u64::from_le_bytes(seed))
+}
+
+#[cfg(test)]
+mod scheduler_compatibility_tests {
+    use super::*;
+
+    #[test]
+    fn persisted_legacy_campaigns_replay_the_original_eligibility_policy() {
+        let spec = CampaignSpec::payment_intent_v1(
+            Seed::new(424_242),
+            CaseCount::new(2).unwrap(),
+            ActionBudget::new(40).unwrap(),
+        );
+        let legacy =
+            CampaignPlanner::compile_with_scheduler(&spec, LEGACY_SCHEDULER_ALGORITHM).unwrap();
+        let encoded = serde_json::to_string(&legacy).unwrap();
+        let decoded: CampaignPlan = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, legacy);
+        assert_eq!(serde_json::to_string(&decoded).unwrap(), encoded);
+
+        let current = CampaignPlanner::compile(&spec).unwrap();
+        let mut mixed = legacy;
+        mixed.cases[1] = current.cases[1].clone();
+        assert_eq!(
+            mixed.validate(),
+            Err(CampaignValidationError::CampaignDoesNotMatchSpec)
+        );
+        assert!(
+            serde_json::from_str::<CampaignPlan>(&serde_json::to_string(&mixed).unwrap()).is_err()
+        );
+    }
 }
