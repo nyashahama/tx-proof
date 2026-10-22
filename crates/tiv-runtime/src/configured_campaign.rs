@@ -1758,43 +1758,16 @@ mod tests {
     }
 
     #[test]
-    fn configured_fault_model_has_a_one_case_seed_supported_by_current_adapters() {
-        let process_faults = ProcessFaultSpec::new(
-            [
-                ProcessCutPoint::ClientRequestForwarded,
-                ProcessCutPoint::ClientResponseObserved,
-                ProcessCutPoint::WebhookRequestForwarded,
-                ProcessCutPoint::WebhookResponseObserved,
-                ProcessCutPoint::SqlProbe,
-            ],
-            1,
-        )
+    fn configured_fault_model_preflights_fixed_seed_zero_case() {
+        let campaign = CampaignPlanner::compile(&CampaignSpec::payment_intent_v1(
+            Seed::new(0),
+            CaseCount::new(1).unwrap(),
+            ActionBudget::new(40).unwrap(),
+        ))
         .unwrap();
-        let seed = (0..1_024)
-            .find(|seed| {
-                let spec = CampaignSpec::new_payment_intent_v1(
-                    Seed::new(*seed),
-                    CaseCount::new(1).unwrap(),
-                    ActionBudget::new(40).unwrap(),
-                    [
-                        ProviderOutcome::Normal,
-                        ProviderOutcome::PreExecute429,
-                        ProviderOutcome::PreExecute500,
-                        ProviderOutcome::PostExecute500,
-                        ProviderOutcome::CommitThenClose,
-                        ProviderOutcome::CommitThenDelay,
-                    ],
-                    WebhookFaultSpec::new(3, [0, 10, 100, 1_000, 5_000], true, true).unwrap(),
-                    process_faults.clone(),
-                )
-                .unwrap();
-                CampaignPlanner::compile(&spec).is_ok_and(|campaign| {
-                    preflight_reference_planned_case(campaign.cases()[0].plan(), true, true).is_ok()
-                })
-            })
-            .expect("the bounded corpus contains an adapter-supported one-case campaign");
-
-        assert_eq!(seed, 4);
+        assert_eq!(campaign.cases().len(), 1);
+        preflight_reference_planned_case(campaign.cases()[0].plan(), true, true)
+            .expect("the fixed configured case must be executable without searching for a seed");
     }
 
     #[test]
@@ -1993,7 +1966,7 @@ mod tests {
             })
             .expect("the bounded corpus reaches two persisted provider objects");
 
-        assert_eq!(seed, 8);
+        assert_eq!(seed, 2);
     }
 
     #[test]
@@ -2087,65 +2060,22 @@ mod tests {
             })
             .expect("the bounded full-config corpus reaches the instrumented ingress handshake");
 
-        assert_eq!(seed, 67);
+        assert_eq!(seed, 1);
     }
 
     #[test]
-    fn full_configured_fault_model_has_a_supported_two_case_seed() {
-        let process_faults = ProcessFaultSpec::new(
-            [
-                ProcessCutPoint::ClientRequestForwarded,
-                ProcessCutPoint::ClientResponseObserved,
-                ProcessCutPoint::WebhookRequestForwarded,
-                ProcessCutPoint::WebhookResponseObserved,
-                ProcessCutPoint::SqlProbe,
-            ],
-            1,
-        )
+    fn full_configured_fault_model_preflights_two_fixed_seed_zero_cases() {
+        let campaign = CampaignPlanner::compile(&CampaignSpec::payment_intent_v1(
+            Seed::new(0),
+            CaseCount::new(2).unwrap(),
+            ActionBudget::new(40).unwrap(),
+        ))
         .unwrap();
-        let seed = (0..4_096)
-            .find(|seed| {
-                let spec = CampaignSpec::new_payment_intent_v1(
-                    Seed::new(*seed),
-                    CaseCount::new(2).unwrap(),
-                    ActionBudget::new(40).unwrap(),
-                    [
-                        ProviderOutcome::Normal,
-                        ProviderOutcome::PreExecute429,
-                        ProviderOutcome::PreExecute500,
-                        ProviderOutcome::PostExecute500,
-                        ProviderOutcome::CommitThenClose,
-                        ProviderOutcome::CommitThenDelay,
-                    ],
-                    WebhookFaultSpec::new(3, [0, 10, 100, 1_000, 5_000], true, true).unwrap(),
-                    process_faults.clone(),
-                )
-                .unwrap();
-                CampaignPlanner::compile(&spec).is_ok_and(|campaign| {
-                    campaign.cases().iter().all(|case| {
-                        preflight_reference_planned_case(case.plan(), true, true).is_ok()
-                            && case.plan().actions().windows(2).all(|actions| {
-                                if !matches!(
-                                    actions[1].kind(),
-                                    tiv_core::plan::PlanActionKind::KillApplication {
-                                        cut_point: ProcessCutPoint::SqlProbe
-                                    }
-                                ) {
-                                    return true;
-                                }
-                                matches!(
-                                    actions[0].kind(),
-                                    tiv_core::plan::PlanActionKind::DriveCheckout {
-                                        provider_script
-                                    } if provider_script.terminal_outcome() == ProviderOutcome::Normal
-                                )
-                            })
-                    })
-                })
-            })
-            .expect("the bounded full-config corpus contains two supported serial cases");
-
-        assert_eq!(seed, 48);
+        assert_eq!(campaign.cases().len(), 2);
+        for case in campaign.cases() {
+            preflight_reference_planned_case(case.plan(), true, true)
+                .expect("each fixed serial case must be executable without searching for a seed");
+        }
     }
 
     #[test]
@@ -2161,7 +2091,7 @@ mod tests {
             1,
         )
         .unwrap();
-        let campaign_seed = 422;
+        let campaign_seed = 153_423;
         let spec = CampaignSpec::new_payment_intent_v1(
             Seed::new(campaign_seed),
             CaseCount::new(1).unwrap(),
@@ -2203,7 +2133,7 @@ mod tests {
             }) if provider_script.terminal_outcome() == ProviderOutcome::Normal
         ));
         preflight_reference_planned_case(campaign.cases()[0].plan(), true, true).unwrap();
-        assert_eq!(campaign_seed, 422);
+        assert_eq!(campaign_seed, 153_423);
     }
 
     #[test]

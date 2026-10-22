@@ -27,10 +27,11 @@ export default function ProductPage() {
           <div className={styles.heroGrid}>
             <div className={styles.heroCopy}>
               <h1>Control the boundary. Preserve the evidence.</h1>
+              <p>Current runnable integration: the repository-owned synthetic reference app and fixture provider. Customer integration requires a fit review; live Stripe and customer deployments are not demonstrated here.</p>
               <p>
-                TxProof attaches to one disposable Stripe + PostgreSQL checkout flow. It controls
-                the external schedule, evaluates your database, and returns an executable
-                counterexample—not a dashboard and never a proof claim.
+                The current synthetic reference stack models a disposable PaymentIntent + PostgreSQL checkout flow.
+                TxProof controls its external schedule, evaluates the reference database, and emits
+                bounded failure evidence. The UI example below illustrates that product contract.
               </p>
               <div className={styles.heroLinks}>
                 <Link className="button button-primary" href="/counterexamples/commit-then-close">Open the canonical counterexample <span>↘</span></Link>
@@ -38,7 +39,7 @@ export default function ProductPage() {
               </div>
             </div>
             <div className={styles.commandCard}>
-              <div className={styles.cardBar}><span>TIV / RUN</span><code>seed 424242</code></div>
+              <div className={styles.cardBar}><span>ILLUSTRATIVE / RUN</span><code>seed 424242</code></div>
               <div className={styles.commandPrompt}><span>$</span><code>tiv run --seed 424242 --cases 20 --ci</code></div>
               <dl>
                 <div><dt>Invariant</dt><dd>webhook-effect-at-most-once</dd></div>
@@ -56,13 +57,13 @@ export default function ProductPage() {
         <div className="site-shell">
           <header className={styles.sectionHeading}>
             <span>01 / CONTROLLED SYSTEM</span>
-            <h2>One operation. Three controlled surfaces. Your application remains real.</h2>
-            <p>The harness coordinates a narrow provider fixture, your Compose application, and an exact disposable database identity.</p>
+            <h2>One reference operation. Three controlled surfaces.</h2>
+            <p>The harness coordinates a narrow provider fixture, the synthetic reference Compose application, and an exact disposable database identity.</p>
           </header>
           <div className={styles.systemMap}>
             <div className={styles.systemNode}><span>CONTROL PLANE</span><strong>tiv CLI</strong><small>schedule · replay · shrink</small></div>
             <i aria-hidden="true">→</i>
-            <div className={`${styles.systemNode} ${styles.nodeAccent}`}><span>YOUR CODE</span><strong>Compose backend</strong><small>real handlers · workers · schema</small></div>
+            <div className={`${styles.systemNode} ${styles.nodeAccent}`}><span>REFERENCE APP</span><strong>Compose backend</strong><small>synthetic handlers · workers · schema</small></div>
             <i aria-hidden="true">↔</i>
             <div className={styles.systemStack}>
               <div className={styles.systemNode}><span>PROVIDER FIXTURE</span><strong>PaymentIntent</strong><small>stateful · idempotent · signed events</small></div>

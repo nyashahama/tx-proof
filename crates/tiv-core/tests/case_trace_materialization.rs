@@ -46,11 +46,8 @@ fn one_business_action_reserves_each_committed_provider_object_separately() {
 }
 
 fn golden_case() -> tiv_core::plan::PlannedCase {
-    CasePlanCompiler::compile(&PlanSpec::payment_intent_v1(
-        Seed::new(42),
-        ActionBudget::new(40).unwrap(),
-    ))
-    .expect("the pinned case is feasible")
+    serde_json::from_str(include_str!("golden/planned-case-v3.json"))
+        .expect("the persisted original v3 case remains replayable")
 }
 
 fn complete_captures() -> Vec<(CaseOutputRef, CaseCapturedValue)> {

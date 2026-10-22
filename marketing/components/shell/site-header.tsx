@@ -30,13 +30,13 @@ export function SiteHeader() {
           {links.map(([label, href]) => <Link href={href} key={href}>{label}</Link>)}
           <Link className={styles.traceLink} href="/counterexamples/commit-then-close">Counterexample <span>↘</span></Link>
         </nav>
-        <Link className={styles.headerCta} href="/audit">Book an audit <span aria-hidden="true">↗</span></Link>
+        <Link className={styles.headerCta} href="/audit">Discuss audit fit <span aria-hidden="true">↗</span></Link>
         <details className={styles.mobileNav}>
           <summary aria-label="Open navigation"><span /><span /></summary>
           <nav aria-label="Mobile navigation">
             {links.map(([label, href]) => <Link href={href} key={href}>{label}</Link>)}
             <Link href="/counterexamples/commit-then-close">Counterexample</Link>
-            <Link href="/audit">Book an audit</Link>
+            <Link href="/audit">Discuss audit fit</Link>
           </nav>
         </details>
       </div>

@@ -1156,28 +1156,87 @@ mod tests {
         plan::{ActionBudget, CasePlanCompiler, PlanSpec, ProcessFaultSpec, WebhookFaultSpec},
     };
 
+    // External replay schedules still require strict runtime validation, even
+    // though the current compiler no longer emits these unsupported pairs.
+    fn external_cut_point_actions(
+        predecessor: PlanActionKind,
+        cut_point: ProcessCutPoint,
+    ) -> Vec<PlannedAction> {
+        [predecessor, PlanActionKind::KillApplication { cut_point }]
+            .into_iter()
+            .enumerate()
+            .map(|(index, kind)| {
+                serde_json::from_value(serde_json::json!({
+                    "id": index + 1,
+                    "logical_sequence": index + 1,
+                    "dependencies": if index == 0 { vec![] } else { vec![index] },
+                    "decision_number": index,
+                    "eligible_count": 1,
+                    "kind": kind,
+                }))
+                .unwrap()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn generated_seed_corpus_is_executable_with_all_reference_capabilities() {
+        let mut cut_points = std::collections::BTreeSet::new();
+        let mut outcomes = std::collections::BTreeSet::new();
+        for budget in [6, 10, 20, 40] {
+            for seed in 0..64 {
+                let plan = CasePlanCompiler::compile(&PlanSpec::payment_intent_v1(
+                    Seed::new(seed),
+                    ActionBudget::new(budget).unwrap(),
+                ))
+                .unwrap();
+                preflight_reference_planned_case(&plan, true, true).unwrap_or_else(|error| {
+                    panic!("seed {seed}, budget {budget} is not executable: {error:?}")
+                });
+                assert!(plan.actions().len() <= budget as usize);
+                for action in plan.actions() {
+                    if let PlanActionKind::KillApplication { cut_point } = action.kind() {
+                        cut_points.insert(*cut_point);
+                    }
+                }
+                outcomes.extend(provider_outcomes(plan.actions()));
+            }
+        }
+        assert_eq!(
+            cut_points.len(),
+            5,
+            "the corpus must exercise every cut point"
+        );
+        assert_eq!(outcomes.len(), 6, "the corpus must exercise every outcome");
+    }
+
+    #[test]
+    fn default_twenty_case_campaign_passes_reference_preflight() {
+        use tiv_core::plan::{CampaignPlanner, CampaignSpec, CaseCount};
+        let campaign = CampaignPlanner::compile(&CampaignSpec::payment_intent_v1(
+            Seed::new(424_242),
+            CaseCount::new(20).unwrap(),
+            ActionBudget::new(40).unwrap(),
+        ))
+        .unwrap();
+        for case in campaign.cases() {
+            preflight_reference_planned_case(case.plan(), true, true)
+                .unwrap_or_else(|error| panic!("case {:?}: {error:?}", case.id()));
+        }
+    }
+
     #[test]
     fn unsupported_cut_points_fail_preflight_even_when_process_control_exists() {
-        let plan = (0..512)
-            .find_map(|seed| {
-                let spec = PlanSpec::new_payment_intent_v1(
-                    Seed::new(seed),
-                    ActionBudget::new(40).unwrap(),
-                    [ProviderOutcome::Normal, ProviderOutcome::CommitThenDelay],
-                    WebhookFaultSpec::new(0, [], false, false).unwrap(),
-                    ProcessFaultSpec::new([ProcessCutPoint::SqlProbe], 1).unwrap(),
-                )
-                .unwrap();
-                let plan = CasePlanCompiler::compile(&spec).unwrap();
-                plan.actions()
-                    .iter()
-                    .any(|action| matches!(action.kind(), PlanActionKind::KillApplication { .. }))
-                    .then_some(plan)
-            })
-            .expect("the bounded seed corpus contains a SQL-probe kill");
-
+        let actions = external_cut_point_actions(
+            PlanActionKind::ConfirmPaymentIntent {
+                provider_script: tiv_core::plan::ProviderOutcomeScript::single(
+                    ProviderOutcome::Normal,
+                ),
+            },
+            ProcessCutPoint::SqlProbe,
+        );
         assert!(matches!(
-            preflight_reference_planned_case(&plan, true, true),
+            preflight_reference_actions(&actions, true, true),
             Err(ReferenceCaseRunError::UnsupportedProcessFault)
         ));
     }
@@ -1208,74 +1267,28 @@ mod tests {
 
     #[test]
     fn client_request_forwarded_rejects_a_provider_confirmation_predecessor() {
-        let plan = (0..1_024)
-            .find_map(|seed| {
-                let spec = PlanSpec::new_payment_intent_v1(
-                    Seed::new(seed),
-                    ActionBudget::new(40).unwrap(),
-                    [ProviderOutcome::Normal, ProviderOutcome::CommitThenDelay],
-                    WebhookFaultSpec::new(0, [], false, false).unwrap(),
-                    ProcessFaultSpec::new([ProcessCutPoint::ClientRequestForwarded], 1).unwrap(),
-                )
-                .unwrap();
-                let plan = CasePlanCompiler::compile(&spec).unwrap();
-                plan.actions()
-                    .windows(2)
-                    .any(|actions| {
-                        matches!(
-                            actions[0].kind(),
-                            PlanActionKind::ConfirmPaymentIntent { .. }
-                                | PlanActionKind::RetryProviderRequest { .. }
-                        ) && matches!(
-                            actions[1].kind(),
-                            PlanActionKind::KillApplication {
-                                cut_point: ProcessCutPoint::ClientRequestForwarded
-                            }
-                        )
-                    })
-                    .then_some(plan)
-            })
-            .expect("the bounded seed corpus contains a confirmation-owned request cut point");
-
+        let actions = external_cut_point_actions(
+            PlanActionKind::ConfirmPaymentIntent {
+                provider_script: tiv_core::plan::ProviderOutcomeScript::single(
+                    ProviderOutcome::CommitThenDelay,
+                ),
+            },
+            ProcessCutPoint::ClientRequestForwarded,
+        );
         assert!(matches!(
-            preflight_reference_planned_case(&plan, true, false),
+            preflight_reference_actions(&actions, true, true),
             Err(ReferenceCaseRunError::UnsupportedProcessFault)
         ));
     }
 
     #[test]
     fn client_response_observed_rejects_a_non_application_predecessor() {
-        let plan = (0..4_096)
-            .find_map(|seed| {
-                let spec = PlanSpec::new_payment_intent_v1(
-                    Seed::new(seed),
-                    ActionBudget::new(40).unwrap(),
-                    [ProviderOutcome::Normal],
-                    WebhookFaultSpec::new(0, [], false, false).unwrap(),
-                    ProcessFaultSpec::new([ProcessCutPoint::ClientResponseObserved], 1).unwrap(),
-                )
-                .unwrap();
-                let plan = CasePlanCompiler::compile(&spec).unwrap();
-                plan.actions()
-                    .windows(2)
-                    .any(|actions| {
-                        matches!(
-                            actions[1].kind(),
-                            PlanActionKind::KillApplication {
-                                cut_point: ProcessCutPoint::ClientResponseObserved
-                            }
-                        ) && !matches!(
-                            actions[0].kind(),
-                            PlanActionKind::DriveCheckout { .. }
-                                | PlanActionKind::RetryBusinessRequest { .. }
-                        )
-                    })
-                    .then_some(plan)
-            })
-            .expect("the seed corpus reaches an abstract non-application response cut point");
-
+        let actions = external_cut_point_actions(
+            PlanActionKind::RetrievePaymentIntent,
+            ProcessCutPoint::ClientResponseObserved,
+        );
         assert!(matches!(
-            preflight_reference_planned_case(&plan, true, false),
+            preflight_reference_actions(&actions, true, true),
             Err(ReferenceCaseRunError::UnsupportedProcessFault)
         ));
     }
@@ -1386,38 +1399,16 @@ mod tests {
 
     #[test]
     fn sql_probe_rejects_a_checkout_whose_response_is_still_held() {
-        let plan = (0..4_096)
-            .find_map(|seed| {
-                let spec = PlanSpec::new_payment_intent_v1(
-                    Seed::new(seed),
-                    ActionBudget::new(40).unwrap(),
-                    [ProviderOutcome::Normal, ProviderOutcome::CommitThenDelay],
-                    WebhookFaultSpec::new(0, [], false, false).unwrap(),
-                    ProcessFaultSpec::new([ProcessCutPoint::SqlProbe], 1).unwrap(),
-                )
-                .unwrap();
-                let plan = CasePlanCompiler::compile(&spec).unwrap();
-                plan.actions()
-                    .windows(2)
-                    .any(|actions| {
-                        matches!(
-                            actions[0].kind(),
-                            PlanActionKind::DriveCheckout { provider_script }
-                                if provider_script.terminal_outcome()
-                                    == ProviderOutcome::CommitThenDelay
-                        ) && matches!(
-                            actions[1].kind(),
-                            PlanActionKind::KillApplication {
-                                cut_point: ProcessCutPoint::SqlProbe
-                            }
-                        )
-                    })
-                    .then_some(plan)
-            })
-            .expect("the seed corpus reaches the held checkout SQL-probe shape");
-
+        let actions = external_cut_point_actions(
+            PlanActionKind::DriveCheckout {
+                provider_script: tiv_core::plan::ProviderOutcomeScript::single(
+                    ProviderOutcome::CommitThenDelay,
+                ),
+            },
+            ProcessCutPoint::SqlProbe,
+        );
         assert!(matches!(
-            preflight_reference_planned_case(&plan, true, true),
+            preflight_reference_actions(&actions, true, true),
             Err(ReferenceCaseRunError::UnsupportedProcessFault)
         ));
     }

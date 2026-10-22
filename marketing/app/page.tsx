@@ -71,14 +71,14 @@ export default function Home() {
                   <span aria-hidden="true">↘</span>
                 </Link>
                 <Link className="button button-quiet" href="/audit">
-                  Book a correctness audit
+                  Discuss audit fit
                   <span aria-hidden="true">↗</span>
                 </Link>
               </div>
             </div>
             <p className={styles.qualifier}>
               <span aria-hidden="true">◎</span>
-              Counterexample search, not proof.
+              Current integration: synthetic reference app. Customer audits subject to fit.
             </p>
           </div>
         </div>
@@ -105,7 +105,7 @@ export default function Home() {
             href="/counterexamples/commit-then-close"
           >
             <span>Replay class</span>
-            <strong>Modeled fixture · 3 / 3</strong>
+            <strong>Illustrative · 3 / 3</strong>
           </Link>
           <Link className={`${styles.evidenceItem} ${styles.evidenceLink}`} href="/audit">
             <span>Handoff</span>
@@ -118,13 +118,13 @@ export default function Home() {
         <div className="site-shell">
           <header className={styles.traceShowcaseHeader}>
             <div className={styles.traceLabelBlock}>
-              <p className="section-index">02 / LIVE COUNTEREXAMPLE</p>
-              <span><i aria-hidden="true" /> INTERACTIVE MODELED EVIDENCE</span>
+              <p className="section-index">02 / ILLUSTRATIVE COUNTEREXAMPLE</p>
+              <span><i aria-hidden="true" /> SIMULATED UI · NOT MEASURED RESULTS</span>
             </div>
             <div className={styles.traceStory}>
               <h2>From one intent to an owned counterexample.</h2>
               <p>
-                Change the injected boundary, watch durable truth diverge, then remove every
+                This simulated UI illustrates failure boundaries and shrinking. Its counts and outcomes are not measured results. Change the boundary, then remove every
                 action that is not required to reproduce the same invariant failure.
               </p>
               <dl>
@@ -232,10 +232,10 @@ export default function Home() {
 
           <div className={styles.artifactWorkbench}>
             <div className={styles.fileTree}>
-              <div className={styles.panelLabel}><span>RUN ARTIFACT</span><code>run_7f31</code></div>
+              <div className={styles.panelLabel}><span>ILLUSTRATIVE ARTIFACT</span><code>run_7f31</code></div>
               <ul>
                 <li><span>◫</span><strong>manifest.json</strong><small>compatibility fingerprint</small></li>
-                <li><span>⌁</span><strong>trace.original.json</strong><small>14 actions · retained</small></li>
+                <li><span>⌁</span><strong>trace.original.json</strong><small>9 events · illustrative</small></li>
                 <li className={styles.selectedFile}><span>⌁</span><strong>trace.minimized.json</strong><small>5 decisive actions</small></li>
                 <li><span>≡</span><strong>summary.md</strong><small>redacted evidence</small></li>
                 <li><span>✓</span><strong>junit.xml</strong><small>CI-compatible result</small></li>
@@ -253,7 +253,7 @@ export default function Home() {
               </div>
               <div className={styles.replayCommand}>
                 <span>$</span>
-                <code>tiv replay .tiv/runs/run_7f31/trace.minimized.json</code>
+                <code>tiv replay minimized --artifact SHRINK_PATH</code>
                 <span className={styles.commandTag} aria-hidden="true">REPLAY</span>
               </div>
             </div>
@@ -349,13 +349,13 @@ export default function Home() {
               <p className="section-index">09 / MONEY CORRECTNESS AUDIT</p>
               <h2>Bring one money flow. Leave with an owned regression.</h2>
               <p>
-                A fixed-scope, local-only engagement for Stripe + PostgreSQL teams. Together we
+                A proposed fixed-scope, local-only engagement for Stripe + PostgreSQL teams. Subject to fit, we
                 declare five invariants, run a bounded adversarial campaign, replay every credible
                 finding, and hand the minimized regressions to your CI.
               </p>
               <div className={styles.auditActions}>
                 <Link className="button button-primary" href="/audit">Qualify your repository <span aria-hidden="true">↗</span></Link>
-                <span>5–10 business days · no production access</span>
+                <span>Proposed 5–10 business days · subject to fit</span>
               </div>
             </div>
             <div className={styles.auditReceipt}>

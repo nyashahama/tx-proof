@@ -279,7 +279,7 @@ async fn row_four_lost_response_caller_retry_fault_violates_and_recovery_holds()
     prepare_reference_baseline().await;
     reset_fixture_process().await;
     let faulty_output = run_configured_command_in_all_modes(
-        422,
+        153_423,
         faulty_modes.0,
         faulty_modes.1,
         faulty_modes.2,
@@ -470,7 +470,7 @@ async fn row_four_lost_response_caller_retry_fault_violates_and_recovery_holds()
     prepare_reference_baseline().await;
     reset_fixture_process().await;
     let repaired_output = run_configured_command_in_all_modes(
-        422,
+        153_423,
         REPAIRED_RETRY_KEY_MODE,
         REPAIRED_CALLER_RETRY_MODE,
         REPAIRED_WEBHOOK_EFFECT_MODE,
@@ -2215,7 +2215,7 @@ async fn configured_run_kills_at_webhook_ingress_and_never_acknowledges_it() {
     reset_fixture_process().await;
     let _ = fs::remove_dir_all(ARTIFACT_ROOT);
 
-    let output = run_configured_command(67);
+    let output = run_configured_command(1);
     let code = output.status.code();
     assert!(
         matches!(code, Some(0 | 10)),
@@ -2244,6 +2244,42 @@ async fn configured_run_kills_at_webhook_ingress_and_never_acknowledges_it() {
         records[forwarded]["payload"]["gate_id"],
         records[discarded]["payload"]["gate_id"]
     );
+
+    cleanup_reference_databases().await;
+    fs::remove_dir_all(ARTIFACT_ROOT).unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires the isolated reference-app Compose project"]
+async fn configured_run_completes_the_default_twenty_case_campaign() {
+    let _guard = E2E_LOCK.lock().await;
+    prepare_reference_baseline().await;
+    reset_fixture_process().await;
+    let _ = fs::remove_dir_all(ARTIFACT_ROOT);
+
+    let output = run_configured_command_with_cases(424_242, 20);
+    let code = output.status.code();
+    assert!(
+        matches!(code, Some(0 | 10)),
+        "default twenty-case configured run failed with {code:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let receipt: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(receipt["status"], "campaign_complete");
+    assert_eq!(receipt["completed_cases"], 20);
+    let artifact_path = Path::new(receipt["artifact_path"].as_str().unwrap());
+    let summary: serde_json::Value =
+        serde_json::from_slice(&fs::read(artifact_path.join("summary.json")).unwrap()).unwrap();
+    let cases = summary["cases"].as_array().unwrap();
+    assert_eq!(cases.len(), 20);
+    for index in 1..=20 {
+        assert!(
+            artifact_path
+                .join(format!("cases/case_{index:04}/trace.json"))
+                .is_file()
+        );
+    }
+    assert_reference_app_healthy();
 
     cleanup_reference_databases().await;
     fs::remove_dir_all(ARTIFACT_ROOT).unwrap();
@@ -2294,7 +2330,7 @@ async fn configured_run_interrupts_with_recovery_and_finalized_partial_evidence(
     reset_fixture_process().await;
     let _ = fs::remove_dir_all(ARTIFACT_ROOT);
 
-    let mut child = configured_command(67, 1)
+    let mut child = configured_command(1, 1)
         .spawn()
         .expect("the configured campaign command starts");
     let staging = wait_for_observation(&mut child, "webhook_request_forwarded").await;
@@ -2824,7 +2860,7 @@ fn assert_row_four_trace(artifact: &Path) {
     let campaign: serde_json::Value =
         serde_json::from_slice(&fs::read(artifact.join("campaign-plan.json")).unwrap())
             .expect("the campaign plan is JSON");
-    assert_eq!(campaign["spec"]["campaign_seed"], 422);
+    assert_eq!(campaign["spec"]["campaign_seed"], 153_423);
     let trace: serde_json::Value =
         serde_json::from_slice(&fs::read(artifact.join("cases/case_0001/trace.json")).unwrap())
             .expect("the configured case trace is JSON");

@@ -20,7 +20,7 @@ import {
   sourceRecords,
 } from "@/content/claims";
 import { openGraphCards } from "@/content/open-graph";
-import { homeMetadata } from "@/lib/site";
+import { absoluteSiteUrl, homeMetadata } from "@/lib/site";
 
 const pages = [
   ["/", homeMetadata],
@@ -56,7 +56,7 @@ describe("publishable site contract", () => {
     const sitemapPaths = sitemap().map((entry) => new URL(entry.url).pathname);
 
     expect(sitemapPaths).toEqual(pages.map(([path]) => path));
-    expect(robots().sitemap).toBe("http://localhost:3000/sitemap.xml");
+    expect(robots().sitemap).toBe(absoluteSiteUrl("/sitemap.xml"));
   });
 
   it("defines original, route-specific social artwork for every primary route", () => {
@@ -122,7 +122,7 @@ describe("publishable site contract", () => {
   it("keeps approved claims current, sourced, scoped, and free of prohibited language", () => {
     const approvedClaims = claimRecords.filter((claim) => claim.status === "approved");
 
-    expect(findExpiredClaims(approvedClaims, new Date("2026-08-10T00:00:00Z"))).toEqual([]);
+    expect(findExpiredClaims(approvedClaims, new Date())).toEqual([]);
     expect(sourceRecords.length).toBeGreaterThan(0);
 
     for (const claim of approvedClaims) {
@@ -135,14 +135,20 @@ describe("publishable site contract", () => {
     }
   });
 
+  it("expires a dated claim only after its complete UTC expiry day", () => {
+    const dated = [{ ...claimRecords[0], expiresAt: "2026-11-10" }];
+    expect(findExpiredClaims(dated, new Date("2026-11-10T23:59:59.999Z"))).toEqual([]);
+    expect(findExpiredClaims(dated, new Date("2026-11-11T00:00:00Z"))).toEqual(dated);
+  });
+
   it("registers the homepage quantified evidence claims", () => {
     const approvedCopy = claimRecords
       .filter((claim) => claim.status === "approved")
       .map((claim) => claim.copy);
 
     expect(approvedCopy).toContain("The configured product contract uses exactly five approved SQL invariants.");
-    expect(approvedCopy).toContain("The canonical modeled counterexample preserves its failure identity on three of three fresh baselines.");
-    expect(approvedCopy).toContain("The audit handoff includes JSON, Markdown, and JUnit artifacts.");
+    expect(approvedCopy).toContain("The illustrative counterexample shows a three-of-three replay outcome; it is not a measured run result.");
+    expect(approvedCopy).toContain("The proposed audit handoff includes JSON, Markdown, and JUnit artifacts.");
   });
 
   it.each([

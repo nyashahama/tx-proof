@@ -1,3 +1,4 @@
+import userEvent from "@testing-library/user-event";
 import { render, screen } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 
@@ -23,6 +24,23 @@ describe("supporting marketing routes", () => {
     const evidenceMatches = screen.getAllByText(evidence, { exact: false });
     expect(evidenceMatches.length).toBeGreaterThan(0);
     expect(evidenceMatches[0]).toBeVisible();
+  });
+
+  it("keeps the canonical story fixed while the trace is minimized", async () => {
+    const user = userEvent.setup();
+    render(<CounterexamplePage />);
+    expect(screen.queryByRole("tablist")).not.toBeInTheDocument();
+    expect(screen.queryByRole("tabpanel")).not.toBeInTheDocument();
+    expect(screen.getByText("9 recorded events")).toBeVisible();
+    await user.click(screen.getByRole("button", { name: "Minimize trace" }));
+    expect(screen.getByRole("list", { name: "Minimized counterexample" }).children).toHaveLength(5);
+    expect(screen.getByText("event evt_tiv_019 created 2 fulfilment rows")).toBeVisible();
+  });
+
+  it("offers an actionable public inquiry after qualification", () => {
+    render(<AuditPage />);
+    const inquiry = screen.getByRole("link", { name: /Open a public audit inquiry/i });
+    expect(inquiry).toHaveAttribute("href", "https://github.com/nyashahama/tx-proof/issues/new");
   });
 
   it("keeps the counterexample and audit routes connected to the product story", () => {

@@ -23,7 +23,7 @@ export default function ResearchPage() {
           <div className={styles.heroGrid}>
             <div className={styles.heroCopy}>
               <h1>Trust the method because every claim has a boundary.</h1>
-              <p>TxProof separates documented provider behavior, prior art, competitive hypotheses, and prohibited language. Every factual statement carries a source, scope, date, and status.</p>
+              <p>TxProof separates documented provider behavior, prior art, competitive hypotheses, and prohibited language. The ledger below records selected claims with a source, scope, review date, and status. It is not a complete independent audit of every statement on this site.</p>
               <div className={styles.heroLinks}><Link className="button button-primary" href="#ledger">Open the source ledger <span>↘</span></Link></div>
             </div>
             <div className={styles.claimCard}>
@@ -36,7 +36,7 @@ export default function ResearchPage() {
       </section>
 
       <section className="section" id="ledger"><div className="site-shell">
-        <header className={styles.sectionHeading}><span>01 / SOURCE LEDGER</span><h2>Research cut-off: 10 August 2026.</h2><p>Claims that may drift are dated and reviewed again before publication. Source IDs keep the marketing surface tied to the engineering blueprint.</p></header>
+        <header className={styles.sectionHeading}><span>01 / SOURCE LEDGER</span><h2>Research cut-off: 10 August 2026.</h2><p>The dates below belong to the original research record. They do not imply a fresh review of every external page. The interactive traces and their counts are illustrations, not benchmark evidence.</p></header>
         <div className={styles.sourceLedger}>
           <div className={styles.ledgerHeader}><span>ID</span><span>Authority</span><span>Evidence</span><span>Status</span></div>
           {sources.map((source) => (
@@ -55,13 +55,13 @@ export default function ResearchPage() {
             </article>
           ))}
         </div>
-        <p className={styles.researchNote}>Primary links were rechecked on 10 August 2026. The fuller URL register and evidence excerpts remain in the product blueprint; no unsourced competitor assertion ships.</p>
+        <p className={styles.researchNote}>The ledger retains its original 10 August 2026 review dates. External documentation can change. For executable synthetic reference-app evidence and its limits, read the repository walkthrough.</p>
       </div></section>
 
       <section className={`${styles.darkSection} section`}><div className="site-shell">
         <header className={`${styles.sectionHeading} ${styles.headingDark}`}><span>02 / CLAIM CLASSES</span><h2>Documented fact is not the same thing as benchmark evidence.</h2><p>The interface makes uncertainty visible instead of laundering it through confident copy.</p></header>
         <div className={styles.claimClasses}>
-          <article><span className={styles.statusPrimary}>DOCUMENTED</span><h3>Provider behavior</h3><p>Directly supported by current primary documentation and stated within its exact scope.</p></article>
+          <article><span className={styles.statusPrimary}>DOCUMENTED</span><h3>Provider behavior</h3><p>Linked to primary documentation and scoped to the recorded review date.</p></article>
           <article><span className={styles.statusEvidence}>MEASURED</span><h3>Benchmark result</h3><p>Produced by a dated, reproducible head-to-head protocol with environment and limitations.</p></article>
           <article><span className={styles.statusHypothesis}>HYPOTHESIS</span><h3>Competitive gap</h3><p>Public material does not show the capability; hands-on validation is still required.</p></article>
           <article><span className={styles.statusProhibited}>PROHIBITED</span><h3>Universal guarantee</h3><p>“Proves correctness,” “exactly-once payments,” and “perfect deterministic replay” never ship.</p></article>

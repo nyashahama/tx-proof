@@ -22,9 +22,9 @@ const timeline = [
 export default function AuditPage() {
   return (
     <main className={styles.page}>
-      <section className={`${styles.hero} ${styles.auditHero}`}><div className="site-shell"><p className={styles.kicker}>FIXED-SCOPE / LOCAL-ONLY</p><div className={styles.heroGrid}>
-        <div className={styles.heroCopy}><h1>A correctness audit for one money flow.</h1><p>Pair with TxProof inside your environment. Declare <strong>Five approved invariants</strong>, run a bounded campaign, inspect every reproducible counterexample, and leave the minimized failures in CI.</p><div className={styles.heroLinks}><Link className="button button-primary" href="#qualification">Check repository fit <span>↘</span></Link><Link className="button button-quiet" href="/safety">Review the safety boundary <span>↗</span></Link></div></div>
-        <div className={styles.scopeReceipt}><div className={styles.cardBar}><span>ENGAGEMENT / 01</span><code>5–10 DAYS</code></div><dl><div><dt>Repository</dt><dd>one</dd></div><div><dt>Money flow</dt><dd>one</dd></div><div><dt>Invariants</dt><dd>five</dd></div><div><dt>Campaign</dt><dd>≤500 cases</dd></div><div><dt>Findings</dt><dd>≤3 verified</dd></div><div><dt>Production access</dt><dd>none</dd></div></dl><p>Promise: rigorous search and evidence—not a guaranteed defect and never proof.</p></div>
+      <section className={`${styles.hero} ${styles.auditHero}`}><div className="site-shell"><p className={styles.kicker}>PROPOSED SCOPE / LOCAL-ONLY</p><div className={styles.heroGrid}>
+        <div className={styles.heroCopy}><h1>A correctness audit for one money flow.</h1><p>Current runnable integration: the repository-owned synthetic reference app. A customer audit is proposed, subject to repository fit and agreed scope. Declare <strong>Five approved invariants</strong>, run a bounded campaign, inspect every reproducible counterexample, and leave the minimized failures in CI.</p><div className={styles.heroLinks}><Link className="button button-primary" href="#qualification">Check repository fit <span>↘</span></Link><Link className="button button-quiet" href="/safety">Review the safety boundary <span>↗</span></Link></div></div>
+        <div className={styles.scopeReceipt}><div className={styles.cardBar}><span>ENGAGEMENT / 01</span><code>5–10 DAYS</code></div><dl><div><dt>Repository</dt><dd>one</dd></div><div><dt>Money flow</dt><dd>one</dd></div><div><dt>Invariants</dt><dd>five</dd></div><div><dt>Campaign</dt><dd>≤500 cases</dd></div><div><dt>Findings</dt><dd>≤3 verified</dd></div><div><dt>Production access</dt><dd>none</dd></div></dl><p>Proposed scope, timing, and deliverables require a fit review. Findings are not guaranteed; passing is not proof.</p></div>
       </div></div></section>
 
       <section className="section"><div className="site-shell">
@@ -54,10 +54,10 @@ export default function AuditPage() {
           <div><span>05</span><strong>Repair workshop</strong><small>customer-owned fix against the smallest trace</small></div>
           <div><span>06</span><strong>CI handoff</strong><small>JUnit, exit codes, replay, and scheduled search</small></div>
         </div>
-        <div className={styles.intakeNote}><span>INTAKE STATUS</span><div><strong>The public contact channel is intentionally not fabricated.</strong><p>Connect the confirmed founder-led audit address before publication. Until then, this build documents qualification and scope without presenting a dead form.</p></div></div>
+        <div className={styles.intakeNote}><span>INTAKE STATUS</span><div><strong>Discuss repository fit in a public GitHub issue.</strong><p>Describe only your stack and the money flow at a high level. Do not post credentials, source code, customer data, database dumps, or raw artifacts. This is an inquiry, not a booking or an agreed engagement.</p><a className="text-link" href="https://github.com/nyashahama/tx-proof/issues/new">Open a public audit inquiry ↗</a></div></div>
       </div></section>
 
-      <section className={styles.routeCta}><div className="site-shell"><div><span>BEFORE CONTACT</span><h2>See the exact kind of regression the audit returns.</h2></div><Link className="button button-primary" href="/counterexamples/commit-then-close">View the canonical result <span>↘</span></Link></div></section>
+      <section className={styles.routeCta}><div className="site-shell"><div><span>BEFORE CONTACT</span><h2>Explore an illustrative regression story.</h2></div><Link className="button button-primary" href="/counterexamples/commit-then-close">View the canonical result <span>↘</span></Link></div></section>
     </main>
   );
 }

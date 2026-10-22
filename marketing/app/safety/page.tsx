@@ -49,7 +49,7 @@ export default function SafetyPage() {
       </div></section>
 
       <section className="section"><div className="site-shell">
-        <header className={styles.sectionHeading}><span>03 / LOCAL DATA BOUNDARY</span><h2>Your repository and database stay where they are.</h2><p>Early audits pair inside the customer environment. Source code, database dumps, raw environments, and production data are not collected.</p></header>
+        <header className={styles.sectionHeading}><span>03 / LOCAL DATA BOUNDARY</span><h2>Your repository and database stay where they are.</h2><p>Proposed audits would pair inside an agreed disposable customer environment; current runnable integration is the synthetic reference app. Source code, database dumps, raw environments, and production data are not collected.</p></header>
         <div className={styles.dataBoundary}>
           <div className={styles.localCircle}><span>LOCAL HOST</span><strong>source<br/>database<br/>artifacts</strong><small>mode 0600</small></div>
           <div className={styles.blockedArrow}><span>×</span><strong>NO DEFAULT EXPORT</strong></div>
