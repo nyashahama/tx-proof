@@ -121,16 +121,16 @@ export const claimRecords: ClaimRecord[] = [
   },
   {
     id: "CL-016",
-    copy: "The canonical modeled counterexample preserves its failure identity on three of three fresh baselines.",
-    scope: "The bundled commit-then-close fixture; not a customer benchmark or universal replay guarantee",
+    copy: "The illustrative counterexample shows a three-of-three replay outcome; it is not a measured run result.",
+    scope: "Static marketing simulation; not the executable reference-app regression or a customer benchmark",
     sourceIds: ["B01"],
     reviewedAt: "2026-08-10",
     status: "approved",
   },
   {
     id: "CL-017",
-    copy: "The audit handoff includes JSON, Markdown, and JUnit artifacts.",
-    scope: "The fixed-scope money correctness audit deliverable contract",
+    copy: "The proposed audit handoff includes JSON, Markdown, and JUnit artifacts.",
+    scope: "Proposed audit scope, subject to repository fit and agreement",
     sourceIds: ["B01"],
     reviewedAt: "2026-08-10",
     status: "approved",
@@ -158,6 +158,6 @@ export function findProhibitedPhrase(copy: string) {
 
 export function findExpiredClaims(records: ClaimRecord[], now = new Date()) {
   return records.filter(
-    (claim) => claim.expiresAt && new Date(`${claim.expiresAt}T23:59:59Z`) < now,
+    (claim) => claim.expiresAt && new Date(`${claim.expiresAt}T23:59:59.999Z`) < now,
   );
 }

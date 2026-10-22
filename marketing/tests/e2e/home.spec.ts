@@ -11,7 +11,7 @@ test("homepage explains TxProof and exposes a working counterexample", async ({ 
       name: "Find the schedule that makes your database lie about money.",
     }),
   ).toBeVisible();
-  await expect(page.getByText("Counterexample search, not proof.")).toBeVisible();
+  await expect(page.getByText(/Current integration: synthetic reference app/)).toBeVisible();
 
   await page.getByRole("tab", { name: "02 Duplicate webhook" }).click();
   await expect(

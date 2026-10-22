@@ -2,7 +2,7 @@
 
 Research-backed Next.js marketing surface for TxProof, a bounded counterexample-search product for money-moving backends.
 
-This checkpoint preserves the first visual direction: an editorial evidence system built around a real modeled commit-then-close failure. Passing language is intentionally bounded: no violation found under the configured model and budget is not proof of correctness.
+This checkpoint preserves the first visual direction: an editorial evidence system built around an illustrative commit-then-close failure story. Passing language is intentionally bounded: no violation found under the configured model and budget is not proof of correctness.
 
 ## Routes
 
@@ -25,7 +25,7 @@ pnpm dev
 
 Open [http://localhost:3000](http://localhost:3000).
 
-Set `NEXT_PUBLIC_SITE_URL` to the confirmed deployment origin before release. Copy `.env.example` as the starting contract; the local fallback is `http://localhost:3000` so no unverified production domain is published from source.
+Set `NEXT_PUBLIC_SITE_URL=https://tx-proof.vercel.app` for the confirmed deployment origin before release. Copy `.env.example` as the starting contract; the local fallback is `http://localhost:3000` so no unverified production domain is published from source.
 
 ## Verification
 
@@ -36,3 +36,5 @@ pnpm verify
 The gate runs ESLint, TypeScript, Vitest, a production Next.js build, and Playwright against Chromium, Firefox, and WebKit. Browser checks cover interaction, primary-route contracts, 390px reflow, serious/critical Axe findings, canonical and social metadata, generated Open Graph images, crawler endpoints, and the custom 404 state.
 
 Asset and reference provenance is recorded in [`public/provenance.json`](public/provenance.json). Claims and review dates live in [`content/claims.ts`](content/claims.ts).
+
+The trace UI is a static simulation. Its counts, timings, SQL rows, shrink history, and replay outcomes are illustrative, not measured run results. The canonical route pins that story while the homepage permits scenario exploration. For executable synthetic reference-app evidence, see [the reviewer walkthrough](../docs/reviewer-proof.md). Customer audits are proposed subject to fit; the public inquiry route is a GitHub issue and must contain no secrets, customer data, source code, or raw artifacts.

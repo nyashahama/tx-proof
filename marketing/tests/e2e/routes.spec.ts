@@ -1,3 +1,5 @@
+import { absoluteSiteUrl } from "../../lib/site";
+
 import AxeBuilder from "@axe-core/playwright";
 import { expect, test } from "@playwright/test";
 
@@ -89,10 +91,10 @@ test("crawler endpoints expose the primary route set", async ({ request }) => {
   expect(sitemapResponse.ok()).toBe(true);
   expect(robotsResponse.ok()).toBe(true);
   for (const [path] of routes) {
-    expect(sitemap).toContain(path === "/" ? "http://localhost:3000/</loc>" : `${path}</loc>`);
+    expect(sitemap).toContain(path === "/" ? `${absoluteSiteUrl("/")}</loc>` : `${path}</loc>`);
   }
   expect(robots).toContain("Allow: /");
-  expect(robots).toContain("Sitemap: http://localhost:3000/sitemap.xml");
+  expect(robots).toContain(`Sitemap: ${absoluteSiteUrl("/sitemap.xml")}`);
 });
 
 test("an unknown route returns a deliberate and accessible 404", async ({ page }) => {

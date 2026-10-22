@@ -27,6 +27,7 @@ export default function ProductPage() {
           <div className={styles.heroGrid}>
             <div className={styles.heroCopy}>
               <h1>Control the boundary. Preserve the evidence.</h1>
+              <p>Current runnable integration: the repository-owned synthetic reference app and fixture provider. Customer integration requires a fit review; live Stripe and customer deployments are not demonstrated here.</p>
               <p>
                 TxProof attaches to one disposable Stripe + PostgreSQL checkout flow. It controls
                 the external schedule, evaluates your database, and returns an executable

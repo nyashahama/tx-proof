@@ -22,11 +22,11 @@ function shouldCompactTrace() {
   );
 }
 
-export function TraceInstrument() {
+export function TraceInstrument({ pinnedScenario }: { pinnedScenario?: ScenarioId }) {
   const [activeId, setActiveId] = useState<ScenarioId>("lost-response");
   const [isMinimized, setIsMinimized] = useState(false);
   const titleId = useId();
-  const activeScenario = getScenario(activeId);
+  const activeScenario = getScenario(pinnedScenario ?? activeId);
   const minimized = minimizeScenario(activeScenario);
 
   useEffect(() => {
@@ -58,7 +58,7 @@ export function TraceInstrument() {
       <div className={styles.instrumentBar}>
         <div className={styles.runIdentity}>
           <span className={styles.pulse} aria-hidden="true" />
-          <span>ADVERSARIAL RUN</span>
+          <span>SIMULATED RUN</span>
           <span className={styles.muted}>seed 424242</span>
         </div>
         <div className={styles.runMeta} aria-label="Run metadata">
@@ -68,7 +68,7 @@ export function TraceInstrument() {
         </div>
       </div>
 
-      <div className={styles.scenarioRail}>
+      {!pinnedScenario && <div className={styles.scenarioRail}>
         <span className={styles.railLabel}>Inject one boundary</span>
         <div className={styles.tabs} role="tablist" aria-label="Failure scenario">
           {scenarios.map((scenario, index) => {
@@ -120,7 +120,7 @@ export function TraceInstrument() {
             );
           })}
         </div>
-      </div>
+      </div>}
 
       <div
         className={styles.scenarioPanel}

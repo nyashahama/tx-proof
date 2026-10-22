@@ -13,12 +13,12 @@ describe("marketing homepage", () => {
         name: "Find the schedule that makes your database lie about money.",
       }),
     ).toBeVisible();
-    expect(screen.getByText("Counterexample search, not proof.")).toBeVisible();
+    expect(screen.getByText(/Current integration: synthetic reference app/)).toBeVisible();
     expect(screen.getByRole("link", { name: "View a failing trace" })).toHaveAttribute(
       "href",
       "/counterexamples/commit-then-close",
     );
-    expect(screen.getByRole("link", { name: "Book a correctness audit" })).toHaveAttribute(
+    expect(screen.getByRole("link", { name: "Discuss audit fit" })).toHaveAttribute(
       "href",
       "/audit",
     );
@@ -83,8 +83,8 @@ describe("marketing homepage", () => {
 
     const evidence = screen.getByRole("complementary", { name: "Product evidence" });
     expect(within(evidence).getAllByRole("link")).toHaveLength(5);
-    expect(within(evidence).getByText("Modeled fixture · 3 / 3")).toBeVisible();
-    expect(screen.getByText("INTERACTIVE MODELED EVIDENCE")).toBeVisible();
+    expect(within(evidence).getByText("Illustrative · 3 / 3")).toBeVisible();
+    expect(screen.getByText("SIMULATED UI · NOT MEASURED RESULTS")).toBeVisible();
 
     for (const href of [
       "/safety",
